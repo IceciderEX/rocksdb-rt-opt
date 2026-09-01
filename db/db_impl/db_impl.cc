@@ -1682,6 +1682,7 @@ Status DBImpl::SetOptions(
       for (const auto& cfd_opts : column_family_datas) {
         InstallSuperVersionForConfigChange(cfd_opts.first, &sv_context);
       }
+      RefreshRangeTombstoneControllerEnabled();
 
       persist_options_status =
           WriteOptionsFile(write_options, true /*db_mutex_already_held*/);
@@ -1749,6 +1750,19 @@ Status DBImpl::SetOptions(
   }
   LogFlush(immutable_db_options_.info_log);
   return s;
+}
+
+void DBImpl::RefreshRangeTombstoneControllerEnabled() {
+  mutex_.AssertHeld();
+  bool enabled = false;
+  for (auto* cfd : *versions_->GetColumnFamilySet()) {
+    if (!cfd->IsDropped() &&
+        cfd->GetLatestMutableCFOptions().enable_range_tombstone_controller) {
+      enabled = true;
+      break;
+    }
+  }
+  range_tombstone_controller_enabled_.store(enabled, std::memory_order_relaxed);
 }
 
 Status DBImpl::SetDBOptions(
@@ -3923,6 +3937,7 @@ Status DBImpl::CreateColumnFamilyImpl(const ReadOptions& read_options,
       }
 
       cfd->set_initialized();
+      RefreshRangeTombstoneControllerEnabled();
 
       *handle = new ColumnFamilyHandleImpl(cfd, this, &mutex_);
       ROCKS_LOG_INFO(immutable_db_options_.info_log,

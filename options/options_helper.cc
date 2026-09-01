@@ -324,6 +324,16 @@ void UpdateColumnFamilyOptions(const MutableCFOptions& moptions,
   cf_opts->last_level_temperature = moptions.last_level_temperature;
   cf_opts->default_write_temperature = moptions.default_write_temperature;
   cf_opts->memtable_max_range_deletions = moptions.memtable_max_range_deletions;
+  cf_opts->enable_range_tombstone_controller =
+      moptions.enable_range_tombstone_controller;
+  cf_opts->range_tombstone_controller_observe_only =
+      moptions.range_tombstone_controller_observe_only;
+  cf_opts->range_tombstone_controller_min_range_deletions =
+      moptions.range_tombstone_controller_min_range_deletions;
+  cf_opts->range_tombstone_controller_min_memtable_bytes =
+      moptions.range_tombstone_controller_min_memtable_bytes;
+  cf_opts->range_tombstone_controller_cooldown_micros =
+      moptions.range_tombstone_controller_cooldown_micros;
   cf_opts->uncache_aggressiveness = moptions.uncache_aggressiveness;
   cf_opts->memtable_op_scan_flush_trigger =
       moptions.memtable_op_scan_flush_trigger;

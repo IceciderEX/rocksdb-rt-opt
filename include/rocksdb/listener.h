@@ -186,6 +186,7 @@ enum class FlushReason : int {
   // SwitchMemtable will not be called for this flush reason.
   kCatchUpAfterErrorRecovery = 0xe,
   kMemtableMaxRangeDeletions = 0xf,
+  kRangeTombstoneController = 0x10,
 
   // When adding flush reason, make sure to also add it to FlushReason in Java.
 };

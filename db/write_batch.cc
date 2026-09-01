@@ -2993,6 +2993,7 @@ class MemTableInserter : public WriteBatch::Handler {
         // should take action, so no need to dedup further
         flush_scheduler_->ScheduleWork(cfd);
       }
+      db_->MaybeScheduleRangeTombstoneControllerFlush(cfd);
     }
     // check if memtable_list size exceeds max_write_buffer_size_to_maintain
     if (trim_history_scheduler_ != nullptr) {

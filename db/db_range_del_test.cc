@@ -4,6 +4,7 @@
 //  (found in the LICENSE.Apache file in the root directory).
 
 #include "db/db_test_util.h"
+#include "db/range_tombstone_controller.h"
 #include "db/version_set.h"
 #include "port/stack_trace.h"
 #include "rocksdb/utilities/write_batch_with_index.h"
@@ -3591,6 +3592,111 @@ TEST_F(DBRangeDelTest, FlushReasonStatsMemtableMaxRangeDeletions) {
   EXPECT_EQ(0, TestGetTickerCount(options, ATOMIC_FLUSH_REQUEST_REASON_OTHER));
   EXPECT_EQ(range_delete_flushes,
             static_cast<uint64_t>(flush_listener->count.load()));
+}
+
+TEST_F(DBRangeDelTest, RangeTombstoneControllerFlush) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.enable_range_tombstone_controller = true;
+  options.range_tombstone_controller_observe_only = false;
+  options.range_tombstone_controller_min_range_deletions = 1;
+  options.range_tombstone_controller_min_memtable_bytes = 0;
+  options.range_tombstone_controller_cooldown_micros = 0;
+
+  auto flush_listener = std::make_shared<FlushCounterListener>();
+  flush_listener->expected_flush_reason =
+      FlushReason::kRangeTombstoneController;
+  options.listeners.push_back(flush_listener);
+
+  DestroyAndReopen(options);
+
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), Key(0),
+                             Key(10)));
+  // The controller schedules a normal flush after the range deletion. The next
+  // write processes that request in the existing foreground scheduling path.
+  ASSERT_OK(Put(Key(0), "value"));
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+
+  EXPECT_EQ(1, NumTableFilesAtLevel(0));
+  EXPECT_EQ(1, flush_listener->count.load());
+}
+
+TEST_F(DBRangeDelTest, RangeTombstoneControllerObserveOnly) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.enable_range_tombstone_controller = true;
+  options.range_tombstone_controller_observe_only = true;
+  options.range_tombstone_controller_min_range_deletions = 1;
+  options.range_tombstone_controller_min_memtable_bytes = 0;
+
+  DestroyAndReopen(options);
+
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), Key(0),
+                             Key(10)));
+  ASSERT_OK(Put(Key(0), "value"));
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+
+  EXPECT_EQ(0, NumTableFilesAtLevel(0));
+}
+
+TEST_F(DBRangeDelTest, RangeTombstoneControllerSetOptions) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+
+  auto flush_listener = std::make_shared<FlushCounterListener>();
+  flush_listener->expected_flush_reason =
+      FlushReason::kRangeTombstoneController;
+  options.listeners.push_back(flush_listener);
+
+  DestroyAndReopen(options);
+  ASSERT_OK(
+      db_->SetOptions({{"enable_range_tombstone_controller", "true"},
+                       {"range_tombstone_controller_observe_only", "false"},
+                       {"range_tombstone_controller_min_range_deletions", "1"},
+                       {"range_tombstone_controller_min_memtable_bytes", "0"},
+                       {"range_tombstone_controller_cooldown_micros", "0"}}));
+
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), Key(0),
+                             Key(10)));
+  ASSERT_OK(Put(Key(0), "value"));
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+
+  EXPECT_EQ(1, NumTableFilesAtLevel(0));
+  EXPECT_EQ(1, flush_listener->count.load());
+}
+
+TEST_F(DBRangeDelTest, RangeTombstoneControllerRespectsLevel0Pressure) {
+  Options options = CurrentOptions();
+  options.enable_range_tombstone_controller = true;
+  options.range_tombstone_controller_observe_only = false;
+  options.range_tombstone_controller_min_range_deletions = 1;
+  options.range_tombstone_controller_min_memtable_bytes = 0;
+  options.level0_slowdown_writes_trigger = 1;
+  options.level0_stop_writes_trigger = 2;
+
+  MutableCFOptions mutable_options(options);
+  RangeTombstoneController controller;
+  const RangeTombstoneControllerSnapshot snapshot{
+      1,     // memtable_id
+      1,     // num_range_deletions
+      1024,  // memtable_bytes
+      0,     // pending_compaction_bytes
+      1000,  // now_micros
+      1,     // num_level0_files
+      options.level0_slowdown_writes_trigger,
+      options.level0_stop_writes_trigger,
+      false,  // atomic_flush
+      false,  // empty_memtable
+      false,  // flush_scheduled
+  };
+
+  // The controller yields to normal write-stall behavior once L0 reaches the
+  // slowdown threshold; it does not add a proactive flush request.
+  EXPECT_EQ(
+      RangeTombstoneControllerDecision::kLevel0Pressure,
+      controller.Evaluate(/*column_family_id=*/0, mutable_options, snapshot));
 }
 
 TEST_F(DBRangeDelTest, AtomicFlushReasonStatsMemtableMaxRangeDeletions) {

@@ -2875,6 +2875,9 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       }
     }
   }
+  if (s.ok()) {
+    impl->RefreshRangeTombstoneControllerEnabled();
+  }
   TEST_SYNC_POINT("DBImpl::Open:Opened");
   Status persist_options_status;
   bool cleanup_obsolete_options_files = false;

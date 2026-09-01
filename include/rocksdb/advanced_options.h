@@ -373,6 +373,52 @@ struct AdvancedColumnFamilyOptions {
   // [experimental]
   double experimental_mempurge_threshold = 0.0;
 
+  // EXPERIMENTAL: enable a range tombstone-aware foreground maintenance
+  // controller. The controller observes the active memtable at write safe
+  // points and may request a regular background flush before the memtable is
+  // full. It never changes range deletion visibility or read semantics.
+  //
+  // Default: false
+  //
+  // Dynamically changeable through SetOptions() API
+  bool enable_range_tombstone_controller = false;
+
+  // EXPERIMENTAL: when the range tombstone controller is enabled, retain
+  // observation and decision accounting but do not request a flush. This is
+  // useful for validating a workload's controller pressure signals before
+  // enabling its actions.
+  //
+  // Default: true
+  //
+  // Dynamically changeable through SetOptions() API
+  bool range_tombstone_controller_observe_only = true;
+
+  // EXPERIMENTAL: minimum number of range tombstones in the active memtable
+  // before the range tombstone controller considers a flush request.
+  //
+  // Default: 512
+  //
+  // Dynamically changeable through SetOptions() API
+  uint32_t range_tombstone_controller_min_range_deletions = 512;
+
+  // EXPERIMENTAL: minimum allocated bytes in the active memtable before the
+  // range tombstone controller considers a flush request. This prevents the
+  // controller from creating very small SSTs for sparse range-delete bursts.
+  //
+  // Default: 8 MiB
+  //
+  // Dynamically changeable through SetOptions() API
+  uint64_t range_tombstone_controller_min_memtable_bytes = 8ULL * 1024 * 1024;
+
+  // EXPERIMENTAL: minimum interval between two flush requests issued by the
+  // range tombstone controller for the same column family. The interval is in
+  // microseconds and limits controller-induced flush oscillation.
+  //
+  // Default: 1000000 (one second)
+  //
+  // Dynamically changeable through SetOptions() API
+  uint64_t range_tombstone_controller_cooldown_micros = 1000000;
+
   // existing_value - pointer to previous value (from both memtable and sst).
   //                  nullptr if key doesn't exist
   // existing_value_size - pointer to size of existing_value).

@@ -3029,6 +3029,7 @@ Status DBImpl::TrimMemtableHistory(WriteContext* context) {
 
 Status DBImpl::ScheduleFlushes(WriteContext* context) {
   autovector<ColumnFamilyData*> cfds;
+  autovector<uint8_t> range_tombstone_controller_flushes;
   FlushReason atomic_flush_reason = FlushReason::kWriteBufferFull;
   if (immutable_db_options_.atomic_flush) {
     // Atomic flush has one request-level reason. Derive it only from CFs that
@@ -3049,9 +3050,13 @@ Status DBImpl::ScheduleFlushes(WriteContext* context) {
   } else {
     ColumnFamilyData* tmp_cfd;
     while ((tmp_cfd = flush_scheduler_.TakeNextColumnFamily()) != nullptr) {
+      range_tombstone_controller_flushes.push_back(
+          range_tombstone_controller_.ConsumeFlushRequest(
+              tmp_cfd->GetID(), tmp_cfd->mem()->GetID()));
       cfds.push_back(tmp_cfd);
     }
     MaybeFlushStatsCF(&cfds);
+    range_tombstone_controller_flushes.resize(cfds.size());
   }
   Status status;
   WriteThread::Writer nonmem_w;
@@ -3063,10 +3068,14 @@ Status DBImpl::ScheduleFlushes(WriteContext* context) {
                            nullptr);
   autovector<FlushReason> flush_reasons;
   flush_reasons.reserve(cfds.size());
-  for (auto& cfd : cfds) {
+  for (size_t i = 0; i < cfds.size(); ++i) {
+    auto& cfd = cfds[i];
     FlushReason flush_reason = FlushReason::kWriteBufferFull;
     if (status.ok() && !cfd->mem()->IsEmpty()) {
-      flush_reason = cfd->mem()->GetFlushReason();
+      flush_reason = !immutable_db_options_.atomic_flush &&
+                             range_tombstone_controller_flushes[i] != 0
+                         ? FlushReason::kRangeTombstoneController
+                         : cfd->mem()->GetFlushReason();
       status = SwitchMemtable(cfd, context);
     }
     flush_reasons.push_back(flush_reason);
@@ -3097,6 +3106,62 @@ Status DBImpl::ScheduleFlushes(WriteContext* context) {
     MaybeScheduleFlushOrCompaction();
   }
   return status;
+}
+
+void DBImpl::MaybeScheduleRangeTombstoneControllerFlush(ColumnFamilyData* cfd) {
+  if (!range_tombstone_controller_enabled_.load(std::memory_order_relaxed)) {
+    return;
+  }
+
+  InstrumentedMutexLock l(&mutex_);
+  if (immutable_db_options_.atomic_flush || cfd == nullptr ||
+      cfd->IsDropped() || cfd->mem()->IsEmpty()) {
+    return;
+  }
+
+  MemTable* const mem = cfd->mem();
+  const auto& mutable_cf_options = cfd->GetLatestMutableCFOptions();
+  const auto* const storage_info = cfd->current()->storage_info();
+  const RangeTombstoneControllerSnapshot snapshot{
+      mem->GetID(),
+      mem->NumRangeDeletion(),
+      mem->MemoryAllocatedBytes(),
+      storage_info->estimated_compaction_needed_bytes(),
+      immutable_db_options_.clock->NowMicros(),
+      storage_info->NumLevelFiles(0),
+      mutable_cf_options.level0_slowdown_writes_trigger,
+      mutable_cf_options.level0_stop_writes_trigger,
+      immutable_db_options_.atomic_flush,
+      mem->IsEmpty(),
+      mem->HasFlushScheduled(),
+  };
+  const auto decision = range_tombstone_controller_.Evaluate(
+      cfd->GetID(), mutable_cf_options, snapshot);
+
+  if (decision == RangeTombstoneControllerDecision::kObserve) {
+    if (range_tombstone_controller_.RecordObservation(cfd->GetID(),
+                                                      mem->GetID())) {
+      ROCKS_LOG_INFO(
+          immutable_db_options_.info_log,
+          "Range tombstone controller would flush column family [%s]: "
+          "range_deletions=%" PRIu64 ", memtable_bytes=%" PRIu64
+          ", l0_files=%d, pending_compaction_bytes=%" PRIu64,
+          cfd->GetName().c_str(), snapshot.num_range_deletions,
+          snapshot.memtable_bytes, snapshot.num_level0_files,
+          snapshot.pending_compaction_bytes);
+    }
+    return;
+  }
+  if (decision != RangeTombstoneControllerDecision::kRequestFlush ||
+      !mem->RequestFlush()) {
+    return;
+  }
+
+  range_tombstone_controller_.RecordFlushRequest(cfd->GetID(), mem->GetID(),
+                                                 snapshot.now_micros);
+  if (mem->MarkFlushScheduled()) {
+    flush_scheduler_.ScheduleWork(cfd);
+  }
 }
 
 void DBImpl::NotifyOnMemTableSealed(ColumnFamilyData* /*cfd*/,

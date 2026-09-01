@@ -197,6 +197,16 @@ struct MutableCFOptions {
             options.sample_for_compression),  // TODO: is 0 fine here?
         compression_per_level(options.compression_per_level),
         memtable_max_range_deletions(options.memtable_max_range_deletions),
+        enable_range_tombstone_controller(
+            options.enable_range_tombstone_controller),
+        range_tombstone_controller_observe_only(
+            options.range_tombstone_controller_observe_only),
+        range_tombstone_controller_min_range_deletions(
+            options.range_tombstone_controller_min_range_deletions),
+        range_tombstone_controller_min_memtable_bytes(
+            options.range_tombstone_controller_min_memtable_bytes),
+        range_tombstone_controller_cooldown_micros(
+            options.range_tombstone_controller_cooldown_micros),
         bottommost_file_compaction_delay(
             options.bottommost_file_compaction_delay),
         uncache_aggressiveness(options.uncache_aggressiveness),
@@ -263,6 +273,11 @@ struct MutableCFOptions {
         memtable_verify_per_key_checksum_on_seek(false),
         sample_for_compression(0),
         memtable_max_range_deletions(0),
+        enable_range_tombstone_controller(false),
+        range_tombstone_controller_observe_only(true),
+        range_tombstone_controller_min_range_deletions(512),
+        range_tombstone_controller_min_memtable_bytes(8ULL * 1024 * 1024),
+        range_tombstone_controller_cooldown_micros(1000000),
         bottommost_file_compaction_delay(0),
         uncache_aggressiveness(0),
         memtable_op_scan_flush_trigger(0),
@@ -377,6 +392,11 @@ struct MutableCFOptions {
   uint64_t sample_for_compression;
   std::vector<CompressionType> compression_per_level;
   uint32_t memtable_max_range_deletions;
+  bool enable_range_tombstone_controller;
+  bool range_tombstone_controller_observe_only;
+  uint32_t range_tombstone_controller_min_range_deletions;
+  uint64_t range_tombstone_controller_min_memtable_bytes;
+  uint64_t range_tombstone_controller_cooldown_micros;
   uint32_t bottommost_file_compaction_delay;
   uint32_t uncache_aggressiveness;
   uint32_t memtable_op_scan_flush_trigger;

@@ -40,6 +40,7 @@
 #include "db/post_memtable_callback.h"
 #include "db/pre_release_callback.h"
 #include "db/range_del_aggregator.h"
+#include "db/range_tombstone_controller.h"
 #include "db/read_callback.h"
 #include "db/seqno_to_time_mapping.h"
 #include "db/snapshot_checker.h"
@@ -1145,6 +1146,12 @@ class DBImpl : public DB {
   void SetRecoverableStatePreReleaseCallback(PreReleaseCallback* callback);
 
   InstrumentedMutex* mutex() const { return &mutex_; }
+
+  // Internal write-path hook called after a memtable mutation. The method is
+  // a no-op unless at least one column family has the experimental controller
+  // enabled. It synchronizes with FlushScheduler through the normal memtable
+  // state transitions and never performs a direct flush.
+  void MaybeScheduleRangeTombstoneControllerFlush(ColumnFamilyData* cfd);
 
   // Initialize a brand new DB. The DB directory is expected to be empty before
   // calling it. Push new manifest file name into `new_filenames`.
@@ -2465,6 +2472,9 @@ class DBImpl : public DB {
   // REQUIRES: mutex locked and in write thread.
   Status ScheduleFlushes(WriteContext* context);
 
+  // REQUIRES: mutex locked.
+  void RefreshRangeTombstoneControllerEnabled();
+
   void MaybeFlushStatsCF(autovector<ColumnFamilyData*>* cfds);
 
   Status TrimMemtableHistory(WriteContext* context);
@@ -3370,6 +3380,9 @@ class DBImpl : public DB {
   uint64_t last_batch_group_size_ = 0;
 
   FlushScheduler flush_scheduler_;
+
+  RangeTombstoneController range_tombstone_controller_;
+  std::atomic<bool> range_tombstone_controller_enabled_ = {false};
 
   TrimHistoryScheduler trim_history_scheduler_;
 

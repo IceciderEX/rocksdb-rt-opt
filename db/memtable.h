@@ -633,6 +633,17 @@ class MemTable final : public ReadOnlyMemTable {
     return flush_state_.load(std::memory_order_relaxed) == FLUSH_REQUESTED;
   }
 
+  // Requests a flush for a controller that has already established that the
+  // current memtable should be sealed. Returns true only for the thread that
+  // changed the state. The caller remains responsible for scheduling the
+  // flush with FlushScheduler.
+  bool RequestFlush() {
+    auto before = FLUSH_NOT_REQUESTED;
+    return flush_state_.compare_exchange_strong(before, FLUSH_REQUESTED,
+                                                std::memory_order_relaxed,
+                                                std::memory_order_relaxed);
+  }
+
   // Returns true if a flush should be scheduled and the caller should
   // be the one to schedule it
   bool MarkFlushScheduled() {

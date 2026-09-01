@@ -85,6 +85,8 @@ const char* GetFlushReasonString(FlushReason flush_reason) {
       return "Catch Up After Error Recovery";
     case FlushReason::kMemtableMaxRangeDeletions:
       return "Memtable Max Range Deletions";
+    case FlushReason::kRangeTombstoneController:
+      return "Range Tombstone Controller";
     default:
       return "Invalid";
   }

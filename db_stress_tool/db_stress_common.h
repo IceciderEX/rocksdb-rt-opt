@@ -386,6 +386,11 @@ DECLARE_bool(allow_data_in_errors);
 DECLARE_bool(enable_thread_tracking);
 
 DECLARE_uint32(memtable_max_range_deletions);
+DECLARE_bool(enable_range_tombstone_controller);
+DECLARE_bool(range_tombstone_controller_observe_only);
+DECLARE_uint32(range_tombstone_controller_min_range_deletions);
+DECLARE_uint64(range_tombstone_controller_min_memtable_bytes);
+DECLARE_uint64(range_tombstone_controller_cooldown_micros);
 
 DECLARE_uint32(bottommost_file_compaction_delay);
 

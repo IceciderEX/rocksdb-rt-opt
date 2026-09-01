@@ -9940,6 +9940,56 @@ double rocksdb_options_get_experimental_mempurge_threshold(
   return opt->rep.experimental_mempurge_threshold;
 }
 
+void rocksdb_options_set_enable_range_tombstone_controller(
+    rocksdb_options_t* opt, unsigned char v) {
+  opt->rep.enable_range_tombstone_controller = v;
+}
+
+unsigned char rocksdb_options_get_enable_range_tombstone_controller(
+    rocksdb_options_t* opt) {
+  return opt->rep.enable_range_tombstone_controller;
+}
+
+void rocksdb_options_set_range_tombstone_controller_observe_only(
+    rocksdb_options_t* opt, unsigned char v) {
+  opt->rep.range_tombstone_controller_observe_only = v;
+}
+
+unsigned char rocksdb_options_get_range_tombstone_controller_observe_only(
+    rocksdb_options_t* opt) {
+  return opt->rep.range_tombstone_controller_observe_only;
+}
+
+void rocksdb_options_set_range_tombstone_controller_min_range_deletions(
+    rocksdb_options_t* opt, uint32_t v) {
+  opt->rep.range_tombstone_controller_min_range_deletions = v;
+}
+
+uint32_t rocksdb_options_get_range_tombstone_controller_min_range_deletions(
+    rocksdb_options_t* opt) {
+  return opt->rep.range_tombstone_controller_min_range_deletions;
+}
+
+void rocksdb_options_set_range_tombstone_controller_min_memtable_bytes(
+    rocksdb_options_t* opt, uint64_t v) {
+  opt->rep.range_tombstone_controller_min_memtable_bytes = v;
+}
+
+uint64_t rocksdb_options_get_range_tombstone_controller_min_memtable_bytes(
+    rocksdb_options_t* opt) {
+  return opt->rep.range_tombstone_controller_min_memtable_bytes;
+}
+
+void rocksdb_options_set_range_tombstone_controller_cooldown_micros(
+    rocksdb_options_t* opt, uint64_t v) {
+  opt->rep.range_tombstone_controller_cooldown_micros = v;
+}
+
+uint64_t rocksdb_options_get_range_tombstone_controller_cooldown_micros(
+    rocksdb_options_t* opt) {
+  return opt->rep.range_tombstone_controller_cooldown_micros;
+}
+
 void rocksdb_options_set_memtable_prefix_bloom_size_ratio(
     rocksdb_options_t* opt, double v) {
   opt->rep.memtable_prefix_bloom_size_ratio = v;

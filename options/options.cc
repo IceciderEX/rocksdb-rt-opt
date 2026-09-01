@@ -476,6 +476,19 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
                    experimental_mempurge_threshold);
   ROCKS_LOG_HEADER(log, "           Options.memtable_max_range_deletions: %d",
                    memtable_max_range_deletions);
+  ROCKS_LOG_HEADER(log, "     Options.enable_range_tombstone_controller: %s",
+                   enable_range_tombstone_controller ? "true" : "false");
+  ROCKS_LOG_HEADER(log, "Options.range_tombstone_controller_observe_only: %s",
+                   range_tombstone_controller_observe_only ? "true" : "false");
+  ROCKS_LOG_HEADER(
+      log, "Options.range_tombstone_controller_min_range_deletions: %" PRIu32,
+      range_tombstone_controller_min_range_deletions);
+  ROCKS_LOG_HEADER(
+      log, "Options.range_tombstone_controller_min_memtable_bytes: %" PRIu64,
+      range_tombstone_controller_min_memtable_bytes);
+  ROCKS_LOG_HEADER(
+      log, "Options.range_tombstone_controller_cooldown_micros: %" PRIu64,
+      range_tombstone_controller_cooldown_micros);
   ROCKS_LOG_HEADER(log, "                 Options.cf_allow_ingest_behind: %s",
                    cf_allow_ingest_behind ? "true" : "false");
   ROCKS_LOG_HEADER(log, "  Options.memtable_batch_lookup_optimization: %s",

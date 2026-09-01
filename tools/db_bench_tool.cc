@@ -1451,6 +1451,27 @@ DEFINE_uint32(memtable_op_scan_flush_trigger,
                   .memtable_op_scan_flush_trigger,
               "Setting for CF option memtable_op_scan_flush_trigger.");
 
+DEFINE_bool(enable_range_tombstone_controller,
+            ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
+                .enable_range_tombstone_controller,
+            "Enable the experimental range tombstone flush controller.");
+DEFINE_bool(range_tombstone_controller_observe_only,
+            ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
+                .range_tombstone_controller_observe_only,
+            "Make the range tombstone controller observe-only.");
+DEFINE_uint32(range_tombstone_controller_min_range_deletions,
+              ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
+                  .range_tombstone_controller_min_range_deletions,
+              "Set the range tombstone controller's minimum tombstone count.");
+DEFINE_uint64(range_tombstone_controller_min_memtable_bytes,
+              ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
+                  .range_tombstone_controller_min_memtable_bytes,
+              "Set the range tombstone controller's minimum memtable bytes.");
+DEFINE_uint64(range_tombstone_controller_cooldown_micros,
+              ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
+                  .range_tombstone_controller_cooldown_micros,
+              "Set the range tombstone controller cooldown in microseconds.");
+
 DEFINE_uint32(min_tombstones_for_range_conversion,
               ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
                   .min_tombstones_for_range_conversion,
@@ -5753,6 +5774,16 @@ class Benchmark {
         FLAGS_memtable_verify_per_key_checksum_on_seek;
     options.memtable_op_scan_flush_trigger =
         FLAGS_memtable_op_scan_flush_trigger;
+    options.enable_range_tombstone_controller =
+        FLAGS_enable_range_tombstone_controller;
+    options.range_tombstone_controller_observe_only =
+        FLAGS_range_tombstone_controller_observe_only;
+    options.range_tombstone_controller_min_range_deletions =
+        FLAGS_range_tombstone_controller_min_range_deletions;
+    options.range_tombstone_controller_min_memtable_bytes =
+        FLAGS_range_tombstone_controller_min_memtable_bytes;
+    options.range_tombstone_controller_cooldown_micros =
+        FLAGS_range_tombstone_controller_cooldown_micros;
     options.min_tombstones_for_range_conversion =
         FLAGS_min_tombstones_for_range_conversion;
     options.compaction_options_universal.reduce_file_locking =

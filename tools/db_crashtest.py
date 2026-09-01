@@ -422,6 +422,11 @@ default_params = {
     "min_write_buffer_number_to_merge": lambda: random.choice([1, 2]),
     "preserve_internal_time_seconds": lambda: random.choice([0, 60, 3600, 36000]),
     "memtable_max_range_deletions": lambda: random.choice([0] * 6 + [100, 1000]),
+    "enable_range_tombstone_controller": lambda: random.choice([0] * 9 + [1]),
+    "range_tombstone_controller_observe_only": lambda: random.choice([0, 1]),
+    "range_tombstone_controller_min_range_deletions": lambda: random.choice([1, 10, 100, 1000]),
+    "range_tombstone_controller_min_memtable_bytes": lambda: random.choice([0, 1024, 1 * 1024 * 1024]),
+    "range_tombstone_controller_cooldown_micros": lambda: random.choice([0, 1000, 1000000]),
     # 0 (disable) is the default and more commonly used value.
     "bottommost_file_compaction_delay": lambda: random.choice(
         [0, 0, 0, 600, 3600, 86400]

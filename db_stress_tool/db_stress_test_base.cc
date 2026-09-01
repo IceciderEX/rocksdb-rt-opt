@@ -5778,6 +5778,16 @@ void InitializeOptionsFromFlags(
   options.enable_thread_tracking = FLAGS_enable_thread_tracking;
 
   options.memtable_max_range_deletions = FLAGS_memtable_max_range_deletions;
+  options.enable_range_tombstone_controller =
+      FLAGS_enable_range_tombstone_controller;
+  options.range_tombstone_controller_observe_only =
+      FLAGS_range_tombstone_controller_observe_only;
+  options.range_tombstone_controller_min_range_deletions =
+      FLAGS_range_tombstone_controller_min_range_deletions;
+  options.range_tombstone_controller_min_memtable_bytes =
+      FLAGS_range_tombstone_controller_min_memtable_bytes;
+  options.range_tombstone_controller_cooldown_micros =
+      FLAGS_range_tombstone_controller_cooldown_micros;
 
   options.bottommost_file_compaction_delay =
       FLAGS_bottommost_file_compaction_delay;

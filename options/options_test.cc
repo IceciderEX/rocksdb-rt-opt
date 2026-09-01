@@ -138,6 +138,11 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
       {"default_temperature", "kHot"},
       {"persist_user_defined_timestamps", "true"},
       {"memtable_max_range_deletions", "0"},
+      {"enable_range_tombstone_controller", "true"},
+      {"range_tombstone_controller_observe_only", "false"},
+      {"range_tombstone_controller_min_range_deletions", "123"},
+      {"range_tombstone_controller_min_memtable_bytes", "4M"},
+      {"range_tombstone_controller_cooldown_micros", "54321"},
   };
 
   std::unordered_map<std::string, std::string> db_options_map = {
@@ -298,6 +303,12 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_cf_opt.default_temperature, Temperature::kHot);
   ASSERT_EQ(new_cf_opt.persist_user_defined_timestamps, true);
   ASSERT_EQ(new_cf_opt.memtable_max_range_deletions, 0);
+  ASSERT_TRUE(new_cf_opt.enable_range_tombstone_controller);
+  ASSERT_FALSE(new_cf_opt.range_tombstone_controller_observe_only);
+  ASSERT_EQ(new_cf_opt.range_tombstone_controller_min_range_deletions, 123U);
+  ASSERT_EQ(new_cf_opt.range_tombstone_controller_min_memtable_bytes,
+            4ULL * 1024 * 1024);
+  ASSERT_EQ(new_cf_opt.range_tombstone_controller_cooldown_micros, 54321U);
 
   cf_options_map["write_buffer_size"] = "hello";
   ASSERT_NOK(GetColumnFamilyOptionsFromMap(exact, base_cf_opt, cf_options_map,
@@ -2674,6 +2685,11 @@ TEST_F(OptionsOldApiTest, GetOptionsFromMapTest) {
       {"default_temperature", "kHot"},
       {"persist_user_defined_timestamps", "true"},
       {"memtable_max_range_deletions", "0"},
+      {"enable_range_tombstone_controller", "true"},
+      {"range_tombstone_controller_observe_only", "false"},
+      {"range_tombstone_controller_min_range_deletions", "123"},
+      {"range_tombstone_controller_min_memtable_bytes", "4M"},
+      {"range_tombstone_controller_cooldown_micros", "54321"},
       {"memtable_veirfy_per_key_checksum_on_seek", "true"},
   };
 
@@ -2833,6 +2849,12 @@ TEST_F(OptionsOldApiTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_cf_opt.persist_user_defined_timestamps, true);
   ASSERT_TRUE(new_cf_opt.memtable_verify_per_key_checksum_on_seek);
   ASSERT_EQ(new_cf_opt.memtable_max_range_deletions, 0);
+  ASSERT_TRUE(new_cf_opt.enable_range_tombstone_controller);
+  ASSERT_FALSE(new_cf_opt.range_tombstone_controller_observe_only);
+  ASSERT_EQ(new_cf_opt.range_tombstone_controller_min_range_deletions, 123U);
+  ASSERT_EQ(new_cf_opt.range_tombstone_controller_min_memtable_bytes,
+            4ULL * 1024 * 1024);
+  ASSERT_EQ(new_cf_opt.range_tombstone_controller_cooldown_micros, 54321U);
 
   cf_options_map["write_buffer_size"] = "hello";
   ASSERT_NOK(GetColumnFamilyOptionsFromMap(cf_config_options, base_cf_opt,

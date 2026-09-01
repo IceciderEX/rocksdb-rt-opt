@@ -1435,6 +1435,27 @@ DEFINE_uint32(memtable_max_range_deletions, 0,
               "If nonzero, RocksDB will try to flush the current memtable"
               "after the number of range deletions is >= this limit");
 
+DEFINE_bool(enable_range_tombstone_controller,
+            ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
+                .enable_range_tombstone_controller,
+            "Enable the experimental range tombstone flush controller.");
+DEFINE_bool(range_tombstone_controller_observe_only,
+            ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
+                .range_tombstone_controller_observe_only,
+            "Make the range tombstone controller observe-only.");
+DEFINE_uint32(range_tombstone_controller_min_range_deletions,
+              ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
+                  .range_tombstone_controller_min_range_deletions,
+              "Set the range tombstone controller's minimum tombstone count.");
+DEFINE_uint64(range_tombstone_controller_min_memtable_bytes,
+              ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
+                  .range_tombstone_controller_min_memtable_bytes,
+              "Set the range tombstone controller's minimum memtable bytes.");
+DEFINE_uint64(range_tombstone_controller_cooldown_micros,
+              ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
+                  .range_tombstone_controller_cooldown_micros,
+              "Set the range tombstone controller cooldown in microseconds.");
+
 DEFINE_uint32(bottommost_file_compaction_delay, 0,
               "Delay kBottommostFiles compaction by this amount of seconds."
               "See more in option comment.");

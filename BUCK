@@ -97,6 +97,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "db/output_validator.cc",
         "db/periodic_task_scheduler.cc",
         "db/range_del_aggregator.cc",
+        "db/range_tombstone_controller.cc",
         "db/range_tombstone_fragmenter.cc",
         "db/repair.cc",
         "db/seqno_to_time_mapping.cc",

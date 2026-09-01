@@ -5246,6 +5246,45 @@ extern ROCKSDB_LIBRARY_API unsigned char rocksdb_options_get_fast_sst_open(
 
 /* AdvancedColumnFamilyOptions */
 
+extern ROCKSDB_LIBRARY_API void
+rocksdb_options_set_enable_range_tombstone_controller(rocksdb_options_t* opt,
+                                                      unsigned char v);
+
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_options_get_enable_range_tombstone_controller(rocksdb_options_t* opt);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_options_set_range_tombstone_controller_observe_only(
+    rocksdb_options_t* opt, unsigned char v);
+
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_options_get_range_tombstone_controller_observe_only(
+    rocksdb_options_t* opt);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_options_set_range_tombstone_controller_min_range_deletions(
+    rocksdb_options_t* opt, uint32_t v);
+
+extern ROCKSDB_LIBRARY_API uint32_t
+rocksdb_options_get_range_tombstone_controller_min_range_deletions(
+    rocksdb_options_t* opt);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_options_set_range_tombstone_controller_min_memtable_bytes(
+    rocksdb_options_t* opt, uint64_t v);
+
+extern ROCKSDB_LIBRARY_API uint64_t
+rocksdb_options_get_range_tombstone_controller_min_memtable_bytes(
+    rocksdb_options_t* opt);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_options_set_range_tombstone_controller_cooldown_micros(
+    rocksdb_options_t* opt, uint64_t v);
+
+extern ROCKSDB_LIBRARY_API uint64_t
+rocksdb_options_get_range_tombstone_controller_cooldown_micros(
+    rocksdb_options_t* opt);
+
 extern ROCKSDB_LIBRARY_API unsigned char
 rocksdb_options_get_memtable_whole_key_filtering(rocksdb_options_t* opt);
 
