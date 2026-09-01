@@ -865,6 +865,8 @@ class InternalStats {
                                     Version* version);
   bool HandleNumDeletesActiveMemTable(uint64_t* value, DBImpl* db,
                                       Version* version);
+  bool HandleNumRangeDeletionsActiveMemTable(uint64_t* value, DBImpl* db,
+                                            Version* version);
   bool HandleNumDeletesImmMemTables(uint64_t* value, DBImpl* db,
                                     Version* version);
   bool HandleEstimateNumKeys(uint64_t* value, DBImpl* db, Version* version);

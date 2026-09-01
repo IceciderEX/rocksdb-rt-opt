@@ -1408,6 +1408,10 @@ class DB {
     //      entries in the unflushed immutable memtables.
     static const std::string kNumDeletesImmMemTables;
 
+    //  "rocksdb.num-range-deletions-active-mem-table" - returns total number of range deletion
+    //      entries in the active memtable.
+    static const std::string kNumRangeDeletionsActiveMemTable;
+
     //  "rocksdb.estimate-num-keys" - returns estimated number of total keys in
     //      the active and unflushed immutable memtables and storage.
     static const std::string kEstimateNumKeys;

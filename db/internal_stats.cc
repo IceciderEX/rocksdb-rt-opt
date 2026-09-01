@@ -278,6 +278,8 @@ static const std::string num_entries_imm_mem_tables =
     "num-entries-imm-mem-tables";
 static const std::string num_deletes_active_mem_table =
     "num-deletes-active-mem-table";
+static const std::string num_range_deletions_active_mem_table =
+    "num-range-deletions-active-mem-table";
 static const std::string num_deletes_imm_mem_tables =
     "num-deletes-imm-mem-tables";
 static const std::string estimate_num_keys = "estimate-num-keys";
@@ -381,6 +383,8 @@ const std::string DB::Properties::kNumEntriesImmMemTables =
     rocksdb_prefix + num_entries_imm_mem_tables;
 const std::string DB::Properties::kNumDeletesActiveMemTable =
     rocksdb_prefix + num_deletes_active_mem_table;
+const std::string DB::Properties::kNumRangeDeletionsActiveMemTable =
+    rocksdb_prefix + num_range_deletions_active_mem_table;
 const std::string DB::Properties::kNumDeletesImmMemTables =
     rocksdb_prefix + num_deletes_imm_mem_tables;
 const std::string DB::Properties::kEstimateNumKeys =
@@ -534,6 +538,9 @@ const UnorderedMap<std::string, DBPropertyInfo>
           nullptr}},
         {DB::Properties::kNumDeletesActiveMemTable,
          {false, nullptr, &InternalStats::HandleNumDeletesActiveMemTable,
+          nullptr, nullptr}},
+        {DB::Properties::kNumRangeDeletionsActiveMemTable,
+         {false, nullptr, &InternalStats::HandleNumRangeDeletionsActiveMemTable,
           nullptr, nullptr}},
         {DB::Properties::kNumDeletesImmMemTables,
          {false, nullptr, &InternalStats::HandleNumDeletesImmMemTables, nullptr,
@@ -1358,6 +1365,13 @@ bool InternalStats::HandleNumDeletesActiveMemTable(uint64_t* value,
                                                    Version* /*version*/) {
   // Current number of entires in the active memtable
   *value = cfd_->mem()->NumDeletion();
+  return true;
+}
+
+bool InternalStats::HandleNumRangeDeletionsActiveMemTable(
+    uint64_t* value, DBImpl* /*db*/, Version* /*version*/) {
+  // Current number of range deletion entries in the active memtable
+  *value = cfd_->mem()->NumRangeDeletion();
   return true;
 }
 

@@ -4087,6 +4087,36 @@ TEST_F(DBRangeDelTest, SeekForPrevTest) {
   iter2.reset();
 }
 
+TEST_F(DBRangeDelTest, NumRangeDeletionsActiveMemTableProperty) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.memtable_max_range_deletions = 0;
+  DestroyAndReopen(options);
+
+  uint64_t count = 0;
+  ASSERT_TRUE(dbfull()->GetIntProperty(
+      DB::Properties::kNumRangeDeletionsActiveMemTable, &count));
+  ASSERT_EQ(0, count);
+
+  ASSERT_OK(dbfull()->DeleteRange(WriteOptions(), dbfull()->DefaultColumnFamily(),
+                                  "a", "b"));
+  ASSERT_TRUE(dbfull()->GetIntProperty(
+      DB::Properties::kNumRangeDeletionsActiveMemTable, &count));
+  ASSERT_EQ(1, count);
+
+  ASSERT_OK(dbfull()->DeleteRange(WriteOptions(), dbfull()->DefaultColumnFamily(),
+                                  "c", "d"));
+  ASSERT_TRUE(dbfull()->GetIntProperty(
+      DB::Properties::kNumRangeDeletionsActiveMemTable, &count));
+  ASSERT_EQ(2, count);
+
+  // Flush active memtable to SST; count should reset to 0 for the new active memtable
+  ASSERT_OK(dbfull()->Flush(FlushOptions()));
+  ASSERT_TRUE(dbfull()->GetIntProperty(
+      DB::Properties::kNumRangeDeletionsActiveMemTable, &count));
+  ASSERT_EQ(0, count);
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
