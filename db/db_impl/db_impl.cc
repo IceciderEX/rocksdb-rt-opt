@@ -40,6 +40,7 @@
 
 #include "db/arena_wrapped_db_iter.h"
 #include "db/attribute_group_iterator_impl.h"
+#include "db/read_path_audit.h"
 #include "db/blob/blob_fetcher.h"
 #include "db/blob/blob_file_partition_manager.h"
 #include "db/blob/blob_index.h"
@@ -2593,6 +2594,11 @@ InternalIterator* DBImpl::NewInternalIterator(
                                   super_version->GetSeqnoToTimeMapping(),
                                   prefix_extractor, scan_opts, user_comparator);
   if (scan_opts == nullptr || mem_intersects) {
+    AUDIT_COUNT_ADD(active_mem_iter_construct_count, 1);
+    AuditScopeTimer active_iter_timer;
+#ifdef ROCKSDB_READ_PATH_AUDIT
+    active_iter_timer.Start(&g_read_path_audit_stats.active_mem_iter_construct_nanos);
+#endif
     // Collect iterator for mutable memtable
     auto mem_iter = super_version->mem->NewIterator(
         read_options, super_version->GetSeqnoToTimeMapping(), arena,
@@ -2619,6 +2625,11 @@ InternalIterator* DBImpl::NewInternalIterator(
 
   if (s.ok() &&
       (scan_opts == nullptr || super_version->imm->GetTotalNumEntries() > 0)) {
+    AUDIT_COUNT_ADD(imm_mem_iter_construct_count, 1);
+    AuditScopeTimer imm_iter_timer;
+#ifdef ROCKSDB_READ_PATH_AUDIT
+    imm_iter_timer.Start(&g_read_path_audit_stats.imm_mem_iter_construct_nanos);
+#endif
     // Collect all needed child iterators for immutable memtables. When scan
     // ranges are provided, AddIterators prunes each immutable memtable
     // individually.
@@ -2632,6 +2643,11 @@ InternalIterator* DBImpl::NewInternalIterator(
   if (s.ok()) {
     // Collect iterators for files in L0 - Ln
     if (read_options.read_tier != kMemtableTier) {
+      AUDIT_COUNT_ADD(sst_iter_construct_count, 1);
+      AuditScopeTimer sst_iter_timer;
+#ifdef ROCKSDB_READ_PATH_AUDIT
+      sst_iter_timer.Start(&g_read_path_audit_stats.sst_iter_construct_nanos);
+#endif
       super_version->current->AddIterators(
           read_options, file_options_, &merge_iter_builder,
           allow_unprepared_value, sequence, scan_opts);

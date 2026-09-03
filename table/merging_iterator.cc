@@ -10,6 +10,7 @@
 #include "table/merging_iterator.h"
 
 #include "db/arena_wrapped_db_iter.h"
+#include "db/read_path_audit.h"
 #include "monitoring/file_read_sample.h"
 #include "test_util/sync_point.h"
 
@@ -232,6 +233,7 @@ class MergingIterator : public InternalIterator {
     while (!minHeap_.empty() &&
            minHeap_.top()->type == HeapItem::Type::DELETE_RANGE_START) {
       TEST_SYNC_POINT_CALLBACK("MergeIterator::PopDeleteRangeStart", nullptr);
+      AUDIT_COUNT_ADD(scan_boundary_advance_count, 1);
       // Invariant(rti) holds since
       // range_tombstone_iters_[minHeap_.top()->level] is still valid, and
       // parameter `replace_top` is set to true here to ensure only one such
@@ -844,6 +846,7 @@ void MergingIterator::SeekImpl(const Slice& target, size_t starting_level,
         // This seek is to some range tombstone end key.
         // Should only happen when there are range tombstones.
         PERF_COUNTER_ADD(internal_range_del_reseek_count, 1);
+        AUDIT_COUNT_ADD(scan_range_del_reseek_count, 1);
       }
       if (children_[level].iter.status().IsTryAgain()) {
         prefetched_target.emplace_back(
@@ -950,6 +953,7 @@ bool MergingIterator::SkipNextDeleted() {
     // Invariant(active_): range_tombstone_iters_[current->level] is about to
     // become !Valid() or that its start key is going to be added to minHeap_.
     active_.erase(current->level);
+    AUDIT_COUNT_ADD(scan_boundary_advance_count, 1);
     assert(range_tombstone_iters_[current->level] &&
            range_tombstone_iters_[current->level]->Valid());
     range_tombstone_iters_[current->level]->Next();
@@ -1010,6 +1014,7 @@ bool MergingIterator::SkipNextDeleted() {
       }
     }
     // LevelIterator enters a new SST file
+    AUDIT_COUNT_ADD(scan_range_del_child_next_count, 1);
     current->iter.Next();
     // Invariant(children_): current is popped from heap and added back only if
     // it is valid
@@ -1053,6 +1058,8 @@ bool MergingIterator::SkipNextDeleted() {
              0);
       if (pik.sequence < range_tombstone_iters_[current->level]->seq()) {
         // covered by range tombstone
+        AUDIT_COUNT_ADD(scan_range_del_child_next_count, 1);
+        AUDIT_COUNT_ADD(scan_covered_skip_count, 1);
         current->iter.Next();
         // Invariant (children_)
         if (current->iter.Valid()) {
@@ -1129,6 +1136,7 @@ void MergingIterator::SeekForPrevImpl(const Slice& target,
         // This seek is to some range tombstone end key.
         // Should only happen when there are range tombstones.
         PERF_COUNTER_ADD(internal_range_del_reseek_count, 1);
+        AUDIT_COUNT_ADD(scan_range_del_reseek_count, 1);
       }
       if (children_[level].iter.status().IsTryAgain()) {
         prefetched_target.emplace_back(

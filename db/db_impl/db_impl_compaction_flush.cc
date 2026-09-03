@@ -2361,10 +2361,10 @@ Status DBImpl::Flush(const FlushOptions& flush_options,
                  cfh->GetName().c_str());
   Status s;
   if (immutable_db_options_.atomic_flush || flush_options.force_atomic_flush) {
-    s = AtomicFlushMemTables(flush_options, FlushReason::kManualFlush,
+    s = AtomicFlushMemTables(flush_options, flush_options.flush_reason,
                              {cfh->cfd()});
   } else {
-    s = FlushMemTable(cfh->cfd(), flush_options, FlushReason::kManualFlush);
+    s = FlushMemTable(cfh->cfd(), flush_options, flush_options.flush_reason);
   }
 
   ROCKS_LOG_INFO(immutable_db_options_.info_log,
@@ -2401,7 +2401,7 @@ Status DBImpl::Flush(const FlushOptions& flush_options,
                     auto cfh = static_cast<ColumnFamilyHandleImpl*>(elem);
                     cfds.emplace_back(cfh->cfd());
                   });
-    s = AtomicFlushMemTables(flush_options, FlushReason::kManualFlush, cfds);
+    s = AtomicFlushMemTables(flush_options, flush_options.flush_reason, cfds);
     ROCKS_LOG_INFO(immutable_db_options_.info_log,
                    "Manual atomic flush finished, status: %s\n"
                    "=====Column families:=====",

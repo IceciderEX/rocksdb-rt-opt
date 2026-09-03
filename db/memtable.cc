@@ -25,6 +25,7 @@
 #include "db/pinned_iterators_manager.h"
 #include "db/range_tombstone_fragmenter.h"
 #include "db/read_callback.h"
+#include "db/read_path_audit.h"
 #include "db/wide/wide_column_serialization.h"
 #include "logging/logging.h"
 #include "memory/arena.h"
@@ -932,14 +933,31 @@ FragmentedRangeTombstoneIterator* MemTable::NewRangeTombstoneIteratorInternal(
                           std::memory_order_relaxed);
   // construct fragmented tombstone list if necessary
   if (!cache->initialized.load(std::memory_order_acquire)) {
-    cache->reader_mutex.lock();
+    AUDIT_COUNT_ADD(fragment_build_lock_attempt_count, 1);
+    if (!cache->reader_mutex.try_lock()) {
+      AUDIT_COUNT_ADD(fragment_build_lock_contended_count, 1);
+      AuditScopeTimer wait_timer;
+#ifdef ROCKSDB_READ_PATH_AUDIT
+      wait_timer.Start(&g_read_path_audit_stats.fragment_build_lock_contended_wait_nanos);
+#endif
+      cache->reader_mutex.lock();
+      wait_timer.Stop();
+    }
+
     if (!cache->tombstones) {
+      AUDIT_COUNT_ADD(range_tombstone_view_materialization_count, 1);
+      AuditScopeTimer build_timer;
+#ifdef ROCKSDB_READ_PATH_AUDIT
+      build_timer.Start(&g_read_path_audit_stats.range_tombstone_view_materialization_nanos);
+#endif
       auto* unfragmented_iter = new MemTableIterator(
           MemTableIterator::kRangeDelEntries, *this, read_options);
       cache->tombstones.reset(new FragmentedRangeTombstoneList(
           std::unique_ptr<InternalIterator>(unfragmented_iter),
           comparator_.comparator));
       cache->initialized.store(true, std::memory_order_release);
+    } else {
+      AUDIT_COUNT_ADD(fragment_build_cache_race_hit_count, 1);
     }
     cache->reader_mutex.unlock();
   }
@@ -1246,6 +1264,7 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
   }
   MaybeUpdateNewestUDT(key_slice);
   if (type == kTypeRangeDeletion) {
+    AUDIT_COUNT_ADD(memtable_cache_invalidation_count, 1);
     auto new_cache = std::make_shared<FragmentedRangeTombstoneListCache>();
     size_t size = cached_range_tombstone_.Size();
     if (allow_concurrent) {
@@ -1581,13 +1600,38 @@ bool MemTable::Get(const LookupKey& key, std::string* value,
 
   PERF_TIMER_GUARD(get_from_memtable_time);
 
+  AuditScopeTimer iter_prepare_timer;
+#ifdef ROCKSDB_READ_PATH_AUDIT
+  if (immutable_memtable) {
+    AUDIT_COUNT_ADD(imm_mem_tombstone_iter_prepare_count, 1);
+    iter_prepare_timer.Start(&g_read_path_audit_stats.imm_mem_tombstone_iter_prepare_nanos);
+  } else {
+    AUDIT_COUNT_ADD(active_mem_tombstone_iter_prepare_count, 1);
+    iter_prepare_timer.Start(&g_read_path_audit_stats.active_mem_tombstone_iter_prepare_nanos);
+  }
+#endif
+
   std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
       NewRangeTombstoneIterator(read_opts,
                                 GetInternalKeySeqno(key.internal_key()),
                                 immutable_memtable));
+  iter_prepare_timer.Stop();
+
   if (range_del_iter != nullptr) {
+    AuditScopeTimer cover_lookup_timer;
+#ifdef ROCKSDB_READ_PATH_AUDIT
+    if (immutable_memtable) {
+      AUDIT_COUNT_ADD(imm_mem_tombstone_cover_lookup_count, 1);
+      cover_lookup_timer.Start(&g_read_path_audit_stats.imm_mem_tombstone_cover_lookup_nanos);
+    } else {
+      AUDIT_COUNT_ADD(active_mem_tombstone_cover_lookup_count, 1);
+      cover_lookup_timer.Start(&g_read_path_audit_stats.active_mem_tombstone_cover_lookup_nanos);
+    }
+#endif
     SequenceNumber covering_seq =
         range_del_iter->MaxCoveringTombstoneSeqnum(key.user_key());
+    cover_lookup_timer.Stop();
+
     if (covering_seq > *max_covering_tombstone_seq) {
       *max_covering_tombstone_seq = covering_seq;
       if (timestamp) {

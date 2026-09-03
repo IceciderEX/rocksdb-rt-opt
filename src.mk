@@ -89,6 +89,7 @@ LIB_SOURCES =                                                   \
   db/range_del_aggregator.cc                                    \
   db/range_tombstone_controller.cc                              \
   db/range_tombstone_fragmenter.cc                              \
+  db/read_path_audit.cc                                         \
   db/repair.cc                                                  \
   db/seqno_to_time_mapping.cc                                   \
   db/snapshot_impl.cc                                           \

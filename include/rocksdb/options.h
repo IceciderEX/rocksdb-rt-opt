@@ -2625,11 +2625,16 @@ struct FlushOptions {
   // Default: false
   bool listener_wait;
 
+  // Reason that triggered this flush operation.
+  // Default: FlushReason::kManualFlush
+  FlushReason flush_reason;
+
   FlushOptions()
       : wait(true),
         allow_write_stall(false),
         force_atomic_flush(false),
-        listener_wait(false) {}
+        listener_wait(false),
+        flush_reason(FlushReason::kManualFlush) {}
 };
 
 struct FlushWALOptions {
