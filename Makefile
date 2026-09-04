@@ -2180,6 +2180,9 @@ range_tombstone_fragmenter_test: $(OBJ_DIR)/db/range_tombstone_fragmenter_test.o
 amtv_test: $(OBJ_DIR)/db/amtv_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+amtv_probe_test: $(OBJ_DIR)/db/amtv_probe_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 sst_file_reader_test: $(OBJ_DIR)/table/sst_file_reader_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
