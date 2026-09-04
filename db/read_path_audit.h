@@ -53,6 +53,12 @@ struct ReadPathAuditStats {
   uint64_t scan_range_del_child_next_count = 0;   // 范围删除相关分支触发的底层 Next 次数
   uint64_t scan_covered_skip_count = 0;           // 同层被墓碑遮蔽跳过的键数
 
+  // 6. 活跃 MemTable 信息记录 (物化/争用时的 MemTable generation 及墓碑数)
+  uint64_t last_materialization_memtable_id = 0;
+  uint64_t last_materialization_tombstone_count = 0;
+  uint64_t last_contended_memtable_id = 0;
+  uint64_t last_contended_tombstone_count = 0;
+
   void Reset() {
     *this = ReadPathAuditStats();
   }
@@ -124,6 +130,7 @@ namespace ROCKSDB_NAMESPACE {
 struct AuditScopeTimer {
   AuditScopeTimer() = default;
   explicit AuditScopeTimer(void*) {}
+  ~AuditScopeTimer() { (void)this; }
   void Start(void*) {}
   void Stop() {}
 };

@@ -939,6 +939,10 @@ FragmentedRangeTombstoneIterator* MemTable::NewRangeTombstoneIteratorInternal(
       AuditScopeTimer wait_timer;
 #ifdef ROCKSDB_READ_PATH_AUDIT
       wait_timer.Start(&g_read_path_audit_stats.fragment_build_lock_contended_wait_nanos);
+      if (ROCKSDB_NAMESPACE::IsReadPathAuditEnabled()) {
+        ROCKSDB_NAMESPACE::g_read_path_audit_stats.last_contended_memtable_id = GetID();
+        ROCKSDB_NAMESPACE::g_read_path_audit_stats.last_contended_tombstone_count = NumRangeDeletion();
+      }
 #endif
       cache->reader_mutex.lock();
       wait_timer.Stop();
@@ -949,6 +953,10 @@ FragmentedRangeTombstoneIterator* MemTable::NewRangeTombstoneIteratorInternal(
       AuditScopeTimer build_timer;
 #ifdef ROCKSDB_READ_PATH_AUDIT
       build_timer.Start(&g_read_path_audit_stats.range_tombstone_view_materialization_nanos);
+      if (ROCKSDB_NAMESPACE::IsReadPathAuditEnabled()) {
+        ROCKSDB_NAMESPACE::g_read_path_audit_stats.last_materialization_memtable_id = GetID();
+        ROCKSDB_NAMESPACE::g_read_path_audit_stats.last_materialization_tombstone_count = NumRangeDeletion();
+      }
 #endif
       auto* unfragmented_iter = new MemTableIterator(
           MemTableIterator::kRangeDelEntries, *this, read_options);
@@ -956,6 +964,7 @@ FragmentedRangeTombstoneIterator* MemTable::NewRangeTombstoneIteratorInternal(
           std::unique_ptr<InternalIterator>(unfragmented_iter),
           comparator_.comparator));
       cache->initialized.store(true, std::memory_order_release);
+      build_timer.Stop();
     } else {
       AUDIT_COUNT_ADD(fragment_build_cache_race_hit_count, 1);
     }
