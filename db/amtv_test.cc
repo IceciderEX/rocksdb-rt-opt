@@ -286,44 +286,82 @@ TEST_F(AMTVTest, FreezeBoundaryCheck65) {
 // Category 2: DB Semantics Reconciliation Tests
 // ==========================================================================
 
+// ==========================================================================
+// Category 2: DB Semantics Reconciliation Tests (3-Way Truth Verification)
+// AMTV Shadow Adapter == Native Full Ground Truth == Native DB Get / Iterator
+// ==========================================================================
+
 TEST_F(AMTVTest, DBDeleteRangePutResurrection) {
   Options options;
   options.create_if_missing = true;
   std::unique_ptr<DB> db;
   ASSERT_OK(DB::Open(options, dbname_, &db));
 
+  // Shadow AMTV state and ground truth tombstone list
+  AMTVState shadow_amtv(0 /* generation */, 64 /* delta limit */);
+  std::vector<RangeTombstone> gt_tombstones;
+  std::unordered_map<std::string, SequenceNumber> put_seqs;
+
   // 1. Put keys k10 .. k90
   for (int i = 1; i <= 9; ++i) {
     std::string k = "k" + std::to_string(i * 10);
     ASSERT_OK(db->Put(WriteOptions(), k, "val_" + k));
+    put_seqs[k] = db->GetLatestSequenceNumber();
   }
 
   // 2. DeleteRange [k20, k80)
   ASSERT_OK(db->DeleteRange(WriteOptions(), db->DefaultColumnFamily(), "k20",
                             "k80"));
+  SequenceNumber del_seq = db->GetLatestSequenceNumber();
+  shadow_amtv.AddTombstone("k20", "k80", del_seq, bytewise_icmp_);
+  gt_tombstones.emplace_back("k20", "k80", del_seq);
 
   // 3. Put resurrection: Put k50 = "resurrected_50"
   ASSERT_OK(db->Put(WriteOptions(), "k50", "resurrected_50"));
+  put_seqs["k50"] = db->GetLatestSequenceNumber();
 
-  // 4. Verify Point Get
-  std::string val;
-  ASSERT_OK(db->Get(ReadOptions(), "k10", &val));
-  ASSERT_EQ(val, "val_k10");
+  SequenceNumber current_seq = db->GetLatestSequenceNumber();
 
-  ASSERT_TRUE(db->Get(ReadOptions(), "k20", &val).IsNotFound());
-  ASSERT_TRUE(db->Get(ReadOptions(), "k30", &val).IsNotFound());
-  ASSERT_TRUE(db->Get(ReadOptions(), "k40", &val).IsNotFound());
+  // Construct Ground Truth single list
+  auto unfrag_iter = MakeRangeDelIter(gt_tombstones, &bytewise_icmp_);
+  FragmentedRangeTombstoneList gt_list(std::move(unfrag_iter), bytewise_icmp_);
+  FragmentedRangeTombstoneIterator gt_iter(&gt_list, bytewise_icmp_, current_seq);
 
-  ASSERT_OK(db->Get(ReadOptions(), "k50", &val));
-  ASSERT_EQ(val, "resurrected_50");
+  // Construct Shadow AMTV MultiSourceAdapter
+  AMTVMultiSourceAdapter shadow_adapter(shadow_amtv.GetSnapshot(),
+                                        &bytewise_icmp_);
 
-  ASSERT_TRUE(db->Get(ReadOptions(), "k60", &val).IsNotFound());
-  ASSERT_TRUE(db->Get(ReadOptions(), "k70", &val).IsNotFound());
+  // 4. Verify 3-Way Truth across all keys k10 .. k90:
+  // AMTV Shadow Adapter == Native Ground Truth == DB Get
+  for (int i = 1; i <= 9; ++i) {
+    std::string k = "k" + std::to_string(i * 10);
+    SequenceNumber gt_seq = gt_iter.MaxCoveringTombstoneSeqnum(k);
+    SequenceNumber amtv_seq =
+        shadow_adapter.MaxCoveringTombstoneSeqnum(k, current_seq);
 
-  ASSERT_OK(db->Get(ReadOptions(), "k80", &val));
-  ASSERT_EQ(val, "val_k80");
-  ASSERT_OK(db->Get(ReadOptions(), "k90", &val));
-  ASSERT_EQ(val, "val_k90");
+    // Assert 1: AMTV shadow adapter output == Native full Ground Truth output
+    ASSERT_EQ(gt_seq, amtv_seq)
+        << "[3-Way Mismatch AMTV vs GT] Key: " << k;
+
+    // Assert 2: Ground Truth / AMTV covering seqnum determines DB Get visibility
+    std::string val;
+    Status s = db->Get(ReadOptions(), k, &val);
+    SequenceNumber put_seq = put_seqs[k];
+
+    if (gt_seq > put_seq) {
+      ASSERT_TRUE(s.IsNotFound())
+          << "Key " << k << " should be deleted by range tombstone @ seq "
+          << gt_seq << ", put seq was " << put_seq;
+    } else {
+      ASSERT_OK(s) << "Key " << k << " should be visible with put seq "
+                   << put_seq;
+      if (k == "k50") {
+        ASSERT_EQ(val, "resurrected_50");
+      } else {
+        ASSERT_EQ(val, "val_" + k);
+      }
+    }
+  }
 
   // 5. Verify Iterator matches Point Get exactly
   std::unique_ptr<Iterator> it(db->NewIterator(ReadOptions()));
@@ -348,34 +386,77 @@ TEST_F(AMTVTest, DBSnapshotBoundary) {
   std::unique_ptr<DB> db;
   ASSERT_OK(DB::Open(options, dbname_, &db));
 
+  AMTVState shadow_amtv(0 /* generation */, 64 /* delta limit */);
+  std::vector<RangeTombstone> gt_tombstones;
+
   ASSERT_OK(db->Put(WriteOptions(), "k1", "v1"));
   ASSERT_OK(db->Put(WriteOptions(), "k2", "v2"));
   ASSERT_OK(db->Put(WriteOptions(), "k3", "v3"));
 
   // Snapshot 1: before range deletion
   const Snapshot* snap1 = db->GetSnapshot();
+  SequenceNumber snap1_seq = snap1->GetSequenceNumber();
 
   // Range delete [k2, k4)
   ASSERT_OK(
       db->DeleteRange(WriteOptions(), db->DefaultColumnFamily(), "k2", "k4"));
+  SequenceNumber del_seq = db->GetLatestSequenceNumber();
+  shadow_amtv.AddTombstone("k2", "k4", del_seq, bytewise_icmp_);
+  gt_tombstones.emplace_back("k2", "k4", del_seq);
 
   // Snapshot 2: after range deletion
   const Snapshot* snap2 = db->GetSnapshot();
+  SequenceNumber snap2_seq = snap2->GetSequenceNumber();
 
-  std::string val;
-  // Under Snap1: k2 and k3 MUST be visible
-  ReadOptions ro_snap1;
-  ro_snap1.snapshot = snap1;
-  ASSERT_OK(db->Get(ro_snap1, "k2", &val));
-  ASSERT_EQ(val, "v2");
-  ASSERT_OK(db->Get(ro_snap1, "k3", &val));
-  ASSERT_EQ(val, "v3");
+  auto unfrag_iter = MakeRangeDelIter(gt_tombstones, &bytewise_icmp_);
+  FragmentedRangeTombstoneList gt_list(std::move(unfrag_iter), bytewise_icmp_);
+  AMTVMultiSourceAdapter shadow_adapter(shadow_amtv.GetSnapshot(),
+                                        &bytewise_icmp_);
 
-  // Under Snap2: k2 and k3 MUST be deleted
-  ReadOptions ro_snap2;
-  ro_snap2.snapshot = snap2;
-  ASSERT_TRUE(db->Get(ro_snap2, "k2", &val).IsNotFound());
-  ASSERT_TRUE(db->Get(ro_snap2, "k3", &val).IsNotFound());
+  // 3-Way Reconciliation under Snapshot 1
+  {
+    FragmentedRangeTombstoneIterator gt_iter(&gt_list, bytewise_icmp_,
+                                            snap1_seq);
+    ReadOptions ro_snap1;
+    ro_snap1.snapshot = snap1;
+    for (const char* k : {"k1", "k2", "k3"}) {
+      SequenceNumber gt_seq = gt_iter.MaxCoveringTombstoneSeqnum(k);
+      SequenceNumber amtv_seq =
+          shadow_adapter.MaxCoveringTombstoneSeqnum(k, snap1_seq);
+      ASSERT_EQ(gt_seq, amtv_seq)
+          << "Under Snap1 AMTV vs GT mismatch for " << k;
+      ASSERT_EQ(amtv_seq, 0U)
+          << "Under Snap1 tombstone must not be visible for " << k;
+
+      std::string val;
+      ASSERT_OK(db->Get(ro_snap1, k, &val));
+    }
+  }
+
+  // 3-Way Reconciliation under Snapshot 2
+  {
+    FragmentedRangeTombstoneIterator gt_iter(&gt_list, bytewise_icmp_,
+                                            snap2_seq);
+    ReadOptions ro_snap2;
+    ro_snap2.snapshot = snap2;
+    for (const char* k : {"k1", "k2", "k3"}) {
+      SequenceNumber gt_seq = gt_iter.MaxCoveringTombstoneSeqnum(k);
+      SequenceNumber amtv_seq =
+          shadow_adapter.MaxCoveringTombstoneSeqnum(k, snap2_seq);
+      ASSERT_EQ(gt_seq, amtv_seq)
+          << "Under Snap2 AMTV vs GT mismatch for " << k;
+
+      std::string val;
+      Status s = db->Get(ro_snap2, k, &val);
+      if (std::string(k) == "k1") {
+        ASSERT_EQ(amtv_seq, 0U);
+        ASSERT_OK(s);
+      } else {
+        ASSERT_EQ(amtv_seq, del_seq);
+        ASSERT_TRUE(s.IsNotFound());
+      }
+    }
+  }
 
   db->ReleaseSnapshot(snap1);
   db->ReleaseSnapshot(snap2);
@@ -387,6 +468,16 @@ TEST_F(AMTVTest, DBKeyByKeyValueReconciliation) {
   std::unique_ptr<DB> db;
   ASSERT_OK(DB::Open(options, dbname_, &db));
 
+  // Use a small delta limit (8) to force multiple open -> sealed freezes
+  AMTVState shadow_amtv(0 /* generation */, 8 /* delta limit */);
+  std::vector<std::string> owned_starts;
+  std::vector<std::string> owned_ends;
+  owned_starts.reserve(15);
+  owned_ends.reserve(15);
+  std::vector<RangeTombstone> gt_tombstones;
+  std::unordered_map<std::string, SequenceNumber> put_seqs;
+  std::unordered_map<std::string, std::string> put_vals;
+
   // Perform 40 operations alternating Puts and DeleteRanges with zero-padded keys
   for (int i = 0; i < 40; ++i) {
     char k_buf[32];
@@ -396,8 +487,57 @@ TEST_F(AMTVTest, DBKeyByKeyValueReconciliation) {
       snprintf(end_buf, sizeof(end_buf), "k%04d", i + 15);
       ASSERT_OK(db->DeleteRange(WriteOptions(), db->DefaultColumnFamily(),
                                 k_buf, end_buf));
+      SequenceNumber del_seq = db->GetLatestSequenceNumber();
+      shadow_amtv.AddTombstone(k_buf, end_buf, del_seq, bytewise_icmp_);
+      owned_starts.emplace_back(k_buf);
+      owned_ends.emplace_back(end_buf);
+      gt_tombstones.emplace_back(owned_starts.back(), owned_ends.back(),
+                                 del_seq);
     } else {
-      ASSERT_OK(db->Put(WriteOptions(), k_buf, "v_" + std::string(k_buf)));
+      std::string val = "v_" + std::string(k_buf);
+      ASSERT_OK(db->Put(WriteOptions(), k_buf, val));
+      SequenceNumber pseq = db->GetLatestSequenceNumber();
+      put_seqs[k_buf] = pseq;
+      put_vals[k_buf] = val;
+    }
+  }
+
+  SequenceNumber current_seq = db->GetLatestSequenceNumber();
+  auto unfrag_iter = MakeRangeDelIter(gt_tombstones, &bytewise_icmp_);
+  FragmentedRangeTombstoneList gt_list(std::move(unfrag_iter), bytewise_icmp_);
+  FragmentedRangeTombstoneIterator gt_iter(&gt_list, bytewise_icmp_,
+                                          current_seq);
+  AMTVMultiSourceAdapter shadow_adapter(shadow_amtv.GetSnapshot(),
+                                        &bytewise_icmp_);
+
+  // 3-Way Reconciliation across all 40 keys:
+  // AMTV shadow adapter output == Native full Ground Truth output == Native DB Get / Iterator visible result
+  for (int i = 0; i < 40; ++i) {
+    char k_buf[32];
+    snprintf(k_buf, sizeof(k_buf), "k%04d", i);
+    std::string key(k_buf);
+
+    SequenceNumber gt_seq = gt_iter.MaxCoveringTombstoneSeqnum(key);
+    SequenceNumber amtv_seq =
+        shadow_adapter.MaxCoveringTombstoneSeqnum(key, current_seq);
+
+    // Assert 1: AMTV shadow adapter output == Native Ground Truth output
+    ASSERT_EQ(gt_seq, amtv_seq)
+        << "[3-Way Reconciliation Mismatch] Key " << key;
+
+    // Assert 2: Ground Truth / AMTV output == DB Get result
+    std::string val_get;
+    Status s = db->Get(ReadOptions(), key, &val_get);
+
+    auto pseq_it = put_seqs.find(key);
+    if (pseq_it == put_seqs.end() || gt_seq > pseq_it->second) {
+      // Key was either never put, or deleted by a range tombstone with gt_seq > pseq
+      ASSERT_TRUE(s.IsNotFound())
+          << "Key " << key << " should be NotFound, gt_seq=" << gt_seq;
+    } else {
+      // Key must be visible with latest put value
+      ASSERT_OK(s) << "Key " << key << " should be found!";
+      ASSERT_EQ(val_get, put_vals[key]);
     }
   }
 
