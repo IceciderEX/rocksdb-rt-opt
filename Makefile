@@ -2177,6 +2177,9 @@ range_locking_test: utilities/transactions/lock/range/range_locking_test.o $(TES
 range_tombstone_fragmenter_test: $(OBJ_DIR)/db/range_tombstone_fragmenter_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+amtv_test: $(OBJ_DIR)/db/amtv_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 sst_file_reader_test: $(OBJ_DIR)/table/sst_file_reader_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 

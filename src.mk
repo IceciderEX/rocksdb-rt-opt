@@ -13,6 +13,7 @@ LIB_SOURCES =                                                   \
   cache/secondary_cache_adapter.cc                              \
   cache/sharded_cache.cc                                        \
   cache/tiered_secondary_cache.cc                               \
+  db/amtv.cc                                                    \
   db/arena_wrapped_db_iter.cc                                   \
   db/attribute_group_iterator_impl.cc                           \
   db/blob/blob_contents.cc                                      \
