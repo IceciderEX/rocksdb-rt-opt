@@ -99,6 +99,10 @@ struct ImmutableCFOptions {
   bool cf_allow_ingest_behind;
 
   bool memtable_batch_lookup_optimization;
+
+  bool enable_amtv;
+  uint32_t amtv_delta_tombstones;
+  uint32_t amtv_max_sealed_deltas;
 };
 
 struct ImmutableOptions : public ImmutableDBOptions, public ImmutableCFOptions {

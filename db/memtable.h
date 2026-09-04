@@ -32,6 +32,7 @@
 #include "table/multiget_context.h"
 #include "util/atomic.h"
 #include "util/cast_util.h"
+#include "db/amtv.h"
 #include "util/dynamic_bloom.h"
 #include "util/hash.h"
 #include "util/hash_containers.h"
@@ -70,6 +71,9 @@ struct ImmutableMemTableOptions {
   bool paranoid_memory_checks;
   bool memtable_verify_per_key_checksum_on_seek;
   bool memtable_batch_lookup_optimization;
+  bool enable_amtv;
+  uint32_t amtv_delta_tombstones;
+  uint32_t amtv_max_sealed_deltas;
 };
 
 // Batched counters to updated when inserting keys in one write batch.
@@ -862,6 +866,10 @@ class MemTable final : public ReadOnlyMemTable {
     return &moptions_;
   }
 
+  bool IsAMTVEnabled() const { return moptions_.enable_amtv; }
+  AMTVState* GetAMTVState() { return amtv_state_.get(); }
+  const AMTVState* GetAMTVState() const { return amtv_state_.get(); }
+
   uint64_t ApproximateOldestKeyTime() const override {
     return oldest_key_time_.load(std::memory_order_relaxed);
   }
@@ -925,6 +933,7 @@ class MemTable final : public ReadOnlyMemTable {
   ConcurrentArena arena_;
   std::unique_ptr<MemTableRep> table_;
   std::unique_ptr<MemTableRep> range_del_table_;
+  std::unique_ptr<AMTVState> amtv_state_;
   // This is OK to be relaxed access because consistency between table_ and
   // range_del_table_ is provided by explicit multi-versioning with sequence
   // numbers. It's ok for stale memory to say the range_del_table_ is empty when

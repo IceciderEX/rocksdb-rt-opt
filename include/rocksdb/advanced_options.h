@@ -419,6 +419,23 @@ struct AdvancedColumnFamilyOptions {
   // Dynamically changeable through SetOptions() API
   uint64_t range_tombstone_controller_cooldown_micros = 1000000;
 
+  // EXPERIMENTAL: If true, enables Active MemTable Tombstone View (AMTV) for
+  // incremental range tombstone point queries in the active memtable.
+  //
+  // Default: false
+  bool enable_amtv = false;
+
+  // EXPERIMENTAL: Maximum number of range tombstones buffered in AMTV OpenDelta
+  // before sealing into a fragmented delta list.
+  //
+  // Default: 64
+  uint32_t amtv_delta_tombstones = 64;
+
+  // EXPERIMENTAL: Maximum number of sealed deltas allowed in AMTV.
+  //
+  // Default: 1
+  uint32_t amtv_max_sealed_deltas = 1;
+
   // existing_value - pointer to previous value (from both memtable and sst).
   //                  nullptr if key doesn't exist
   // existing_value_size - pointer to size of existing_value).

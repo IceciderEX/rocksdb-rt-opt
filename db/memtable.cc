@@ -139,7 +139,10 @@ ImmutableMemTableOptions::ImmutableMemTableOptions(
       memtable_verify_per_key_checksum_on_seek(
           mutable_cf_options.memtable_verify_per_key_checksum_on_seek),
       memtable_batch_lookup_optimization(
-          ioptions.memtable_batch_lookup_optimization) {}
+          ioptions.memtable_batch_lookup_optimization),
+      enable_amtv(ioptions.enable_amtv),
+      amtv_delta_tombstones(ioptions.amtv_delta_tombstones),
+      amtv_max_sealed_deltas(ioptions.amtv_max_sealed_deltas) {}
 
 void ReadOnlyMemTable::ProtectSealedBlobFiles(
     const std::shared_ptr<BlobFilePartitionManager>& blob_partition_manager,
@@ -267,6 +270,9 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
   const Comparator* ucmp = cmp.user_comparator();
   assert(ucmp);
   ts_sz_ = ucmp->timestamp_size();
+  if (moptions_.enable_amtv) {
+    amtv_state_ = std::make_unique<AMTVState>(GetID(), moptions_.amtv_delta_tombstones);
+  }
 }
 
 MemTable::~MemTable() {
@@ -1296,6 +1302,10 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
                            std::memory_order_relaxed);
     }
 
+    if (moptions_.enable_amtv && amtv_state_ != nullptr) {
+      amtv_state_->AddTombstone(key, value, s, comparator_.comparator);
+    }
+
     if (allow_concurrent) {
       range_del_mutex_.unlock();
     }
@@ -1620,34 +1630,73 @@ bool MemTable::Get(const LookupKey& key, std::string* value,
   }
 #endif
 
-  std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
-      NewRangeTombstoneIterator(read_opts,
-                                GetInternalKeySeqno(key.internal_key()),
-                                immutable_memtable));
-  iter_prepare_timer.Stop();
+  if (moptions_.enable_amtv && !immutable_memtable && amtv_state_ != nullptr) {
+    if (!read_opts.ignore_range_deletions &&
+        !is_range_del_table_empty_.LoadRelaxed()) {
+      auto snap = amtv_state_->GetSnapshot();
+      AMTVMultiSourceAdapter adapter(snap, &comparator_.comparator);
+      std::string amtv_ts;
+      SequenceNumber amtv_seq = adapter.MaxCoveringTombstoneSeqnum(
+          key.user_key(), GetInternalKeySeqno(key.internal_key()), &amtv_ts,
+          read_opts.timestamp);
+      if (amtv_seq > *max_covering_tombstone_seq) {
+        *max_covering_tombstone_seq = amtv_seq;
+        if (timestamp && !amtv_ts.empty()) {
+          timestamp->assign(amtv_ts.data(), amtv_ts.size());
+        }
+      }
 
-  if (range_del_iter != nullptr) {
-    AuditScopeTimer cover_lookup_timer;
-#ifdef ROCKSDB_READ_PATH_AUDIT
-    if (immutable_memtable) {
-      AUDIT_COUNT_ADD(imm_mem_tombstone_cover_lookup_count, 1);
-      cover_lookup_timer.Start(&g_read_path_audit_stats.imm_mem_tombstone_cover_lookup_nanos);
-    } else {
-      AUDIT_COUNT_ADD(active_mem_tombstone_cover_lookup_count, 1);
-      cover_lookup_timer.Start(&g_read_path_audit_stats.active_mem_tombstone_cover_lookup_nanos);
-    }
+#ifdef ROCKSDB_AMTV_VERIFY
+      std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
+          NewRangeTombstoneIterator(read_opts,
+                                    GetInternalKeySeqno(key.internal_key()),
+                                    immutable_memtable));
+      SequenceNumber native_seq = 0;
+      if (range_del_iter != nullptr) {
+        native_seq = range_del_iter->MaxCoveringTombstoneSeqnum(key.user_key());
+      }
+      assert(amtv_seq == native_seq);
+      if (amtv_seq != native_seq) {
+        fprintf(stderr,
+                "[ROCKSDB_AMTV_VERIFY_FATAL] Get key %s seq mismatch: AMTV=%llu vs Native=%llu (read_seq=%llu)\n",
+                key.user_key().ToString(true).c_str(),
+                static_cast<unsigned long long>(amtv_seq),
+                static_cast<unsigned long long>(native_seq),
+                static_cast<unsigned long long>(GetInternalKeySeqno(key.internal_key())));
+        abort();
+      }
 #endif
-    SequenceNumber covering_seq =
-        range_del_iter->MaxCoveringTombstoneSeqnum(key.user_key());
-    cover_lookup_timer.Stop();
+    }
+  } else {
+    std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
+        NewRangeTombstoneIterator(read_opts,
+                                  GetInternalKeySeqno(key.internal_key()),
+                                  immutable_memtable));
+    iter_prepare_timer.Stop();
 
-    if (covering_seq > *max_covering_tombstone_seq) {
-      *max_covering_tombstone_seq = covering_seq;
-      if (timestamp) {
-        // Will be overwritten in SaveValue() if there is a point key with
-        // a higher seqno.
-        timestamp->assign(range_del_iter->timestamp().data(),
-                          range_del_iter->timestamp().size());
+    if (range_del_iter != nullptr) {
+      AuditScopeTimer cover_lookup_timer;
+#ifdef ROCKSDB_READ_PATH_AUDIT
+      if (immutable_memtable) {
+        AUDIT_COUNT_ADD(imm_mem_tombstone_cover_lookup_count, 1);
+        cover_lookup_timer.Start(&g_read_path_audit_stats.imm_mem_tombstone_cover_lookup_nanos);
+      } else {
+        AUDIT_COUNT_ADD(active_mem_tombstone_cover_lookup_count, 1);
+        cover_lookup_timer.Start(&g_read_path_audit_stats.active_mem_tombstone_cover_lookup_nanos);
+      }
+#endif
+      SequenceNumber covering_seq =
+          range_del_iter->MaxCoveringTombstoneSeqnum(key.user_key());
+      cover_lookup_timer.Stop();
+
+      if (covering_seq > *max_covering_tombstone_seq) {
+        *max_covering_tombstone_seq = covering_seq;
+        if (timestamp) {
+          // Will be overwritten in SaveValue() if there is a point key with
+          // a higher seqno.
+          timestamp->assign(range_del_iter->timestamp().data(),
+                            range_del_iter->timestamp().size());
+        }
       }
     }
   }
@@ -1812,19 +1861,58 @@ void MemTable::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
     std::array<bool, MultiGetContext::MAX_BATCH_SIZE> merge_in_progresses{};
     size_t num_keys = 0;
 
+    bool use_amtv = moptions_.enable_amtv && !immutable_memtable &&
+                    amtv_state_ != nullptr;
+    std::shared_ptr<const AMTVSnapshot> amtv_snap;
+    if (use_amtv && !no_range_del) {
+      amtv_snap = amtv_state_->GetSnapshot();
+    }
     for (auto iter = temp_range.begin(); iter != temp_range.end(); ++iter) {
       if (!no_range_del) {
-        std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
-            NewRangeTombstoneIteratorInternal(
-                read_options, GetInternalKeySeqno(iter->lkey->internal_key()),
-                immutable_memtable));
-        SequenceNumber covering_seq =
-            range_del_iter->MaxCoveringTombstoneSeqnum(iter->lkey->user_key());
-        if (covering_seq > iter->max_covering_tombstone_seq) {
-          iter->max_covering_tombstone_seq = covering_seq;
-          if (iter->timestamp) {
-            iter->timestamp->assign(range_del_iter->timestamp().data(),
-                                    range_del_iter->timestamp().size());
+        if (use_amtv) {
+          AMTVMultiSourceAdapter adapter(amtv_snap, &comparator_.comparator);
+          std::string amtv_ts;
+          SequenceNumber amtv_seq = adapter.MaxCoveringTombstoneSeqnum(
+              iter->lkey->user_key(),
+              GetInternalKeySeqno(iter->lkey->internal_key()),
+              &amtv_ts, read_options.timestamp);
+          if (amtv_seq > iter->max_covering_tombstone_seq) {
+            iter->max_covering_tombstone_seq = amtv_seq;
+            if (iter->timestamp && !amtv_ts.empty()) {
+              iter->timestamp->assign(amtv_ts.data(), amtv_ts.size());
+            }
+          }
+#ifdef ROCKSDB_AMTV_VERIFY
+          std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
+              NewRangeTombstoneIteratorInternal(
+                  read_options, GetInternalKeySeqno(iter->lkey->internal_key()),
+                  immutable_memtable));
+          SequenceNumber native_seq = 0;
+          if (range_del_iter != nullptr) {
+            native_seq = range_del_iter->MaxCoveringTombstoneSeqnum(iter->lkey->user_key());
+          }
+          assert(amtv_seq == native_seq);
+          if (amtv_seq != native_seq) {
+            fprintf(stderr,
+                    "[ROCKSDB_AMTV_VERIFY_FATAL] MultiGet key mismatch: AMTV=%llu vs Native=%llu\n",
+                    static_cast<unsigned long long>(amtv_seq),
+                    static_cast<unsigned long long>(native_seq));
+            abort();
+          }
+#endif
+        } else {
+          std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
+              NewRangeTombstoneIteratorInternal(
+                  read_options, GetInternalKeySeqno(iter->lkey->internal_key()),
+                  immutable_memtable));
+          SequenceNumber covering_seq =
+              range_del_iter->MaxCoveringTombstoneSeqnum(iter->lkey->user_key());
+          if (covering_seq > iter->max_covering_tombstone_seq) {
+            iter->max_covering_tombstone_seq = covering_seq;
+            if (iter->timestamp) {
+              iter->timestamp->assign(range_del_iter->timestamp().data(),
+                                      range_del_iter->timestamp().size());
+            }
           }
         }
       }
@@ -1917,21 +2005,60 @@ void MemTable::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
     }
   } else {
     // Per-key lookup path
+    bool use_amtv = moptions_.enable_amtv && !immutable_memtable &&
+                    amtv_state_ != nullptr;
+    std::shared_ptr<const AMTVSnapshot> amtv_snap;
+    if (use_amtv && !no_range_del) {
+      amtv_snap = amtv_state_->GetSnapshot();
+    }
     for (auto iter = temp_range.begin(); iter != temp_range.end(); ++iter) {
       bool found_final_value{false};
       bool merge_in_progress = iter->s->IsMergeInProgress();
       if (!no_range_del) {
-        std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
-            NewRangeTombstoneIteratorInternal(
-                read_options, GetInternalKeySeqno(iter->lkey->internal_key()),
-                immutable_memtable));
-        SequenceNumber covering_seq =
-            range_del_iter->MaxCoveringTombstoneSeqnum(iter->lkey->user_key());
-        if (covering_seq > iter->max_covering_tombstone_seq) {
-          iter->max_covering_tombstone_seq = covering_seq;
-          if (iter->timestamp) {
-            iter->timestamp->assign(range_del_iter->timestamp().data(),
-                                    range_del_iter->timestamp().size());
+        if (use_amtv) {
+          AMTVMultiSourceAdapter adapter(amtv_snap, &comparator_.comparator);
+          std::string amtv_ts;
+          SequenceNumber amtv_seq = adapter.MaxCoveringTombstoneSeqnum(
+              iter->lkey->user_key(),
+              GetInternalKeySeqno(iter->lkey->internal_key()),
+              &amtv_ts, read_options.timestamp);
+          if (amtv_seq > iter->max_covering_tombstone_seq) {
+            iter->max_covering_tombstone_seq = amtv_seq;
+            if (iter->timestamp && !amtv_ts.empty()) {
+              iter->timestamp->assign(amtv_ts.data(), amtv_ts.size());
+            }
+          }
+#ifdef ROCKSDB_AMTV_VERIFY
+          std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
+              NewRangeTombstoneIteratorInternal(
+                  read_options, GetInternalKeySeqno(iter->lkey->internal_key()),
+                  immutable_memtable));
+          SequenceNumber native_seq = 0;
+          if (range_del_iter != nullptr) {
+            native_seq = range_del_iter->MaxCoveringTombstoneSeqnum(iter->lkey->user_key());
+          }
+          assert(amtv_seq == native_seq);
+          if (amtv_seq != native_seq) {
+            fprintf(stderr,
+                    "[ROCKSDB_AMTV_VERIFY_FATAL] MultiGet key mismatch: AMTV=%llu vs Native=%llu\n",
+                    static_cast<unsigned long long>(amtv_seq),
+                    static_cast<unsigned long long>(native_seq));
+            abort();
+          }
+#endif
+        } else {
+          std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
+              NewRangeTombstoneIteratorInternal(
+                  read_options, GetInternalKeySeqno(iter->lkey->internal_key()),
+                  immutable_memtable));
+          SequenceNumber covering_seq =
+              range_del_iter->MaxCoveringTombstoneSeqnum(iter->lkey->user_key());
+          if (covering_seq > iter->max_covering_tombstone_seq) {
+            iter->max_covering_tombstone_seq = covering_seq;
+            if (iter->timestamp) {
+              iter->timestamp->assign(range_del_iter->timestamp().data(),
+                                      range_del_iter->timestamp().size());
+            }
           }
         }
       }

@@ -995,6 +995,18 @@ static std::unordered_map<std::string, OptionTypeInfo>
                    memtable_batch_lookup_optimization),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        {"enable_amtv",
+         {offsetof(struct ImmutableCFOptions, enable_amtv),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kCompareNever}},
+        {"amtv_delta_tombstones",
+         {offsetof(struct ImmutableCFOptions, amtv_delta_tombstones),
+          OptionType::kUInt32T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kCompareNever}},
+        {"amtv_max_sealed_deltas",
+         {offsetof(struct ImmutableCFOptions, amtv_max_sealed_deltas),
+          OptionType::kUInt32T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kCompareNever}},
 };
 
 const std::string OptionsHelper::kCFOptionsName = "ColumnFamilyOptions";
@@ -1141,7 +1153,10 @@ ImmutableCFOptions::ImmutableCFOptions(const ColumnFamilyOptions& cf_options)
           cf_options.persist_user_defined_timestamps),
       cf_allow_ingest_behind(cf_options.cf_allow_ingest_behind),
       memtable_batch_lookup_optimization(
-          cf_options.memtable_batch_lookup_optimization) {}
+          cf_options.memtable_batch_lookup_optimization),
+      enable_amtv(cf_options.enable_amtv),
+      amtv_delta_tombstones(cf_options.amtv_delta_tombstones),
+      amtv_max_sealed_deltas(cf_options.amtv_max_sealed_deltas) {}
 
 ImmutableOptions::ImmutableOptions() : ImmutableOptions(Options()) {}
 

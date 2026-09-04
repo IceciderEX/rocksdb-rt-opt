@@ -72,10 +72,10 @@ class OpenDelta {
 
   // Check covering sequence number for user_key.
   // Returns max sequence number covering user_key with seq <= read_seq, or 0 if none.
-  SequenceNumber MaxCoveringTombstoneSeqnum(const Slice& user_key,
-                                           const Comparator* ucmp,
-                                           SequenceNumber read_seq,
-                                           std::string* out_ts = nullptr) const;
+  SequenceNumber MaxCoveringTombstoneSeqnum(
+      const Slice& user_key, const Comparator* ucmp, SequenceNumber read_seq,
+      std::string* out_ts = nullptr,
+      const Slice* ts_upper_bound = nullptr) const;
 
   // Build a native FragmentedRangeTombstoneList from the delta entries.
   std::unique_ptr<FragmentedRangeTombstoneList>
@@ -117,7 +117,7 @@ struct AMTVSnapshot {
   }
 };
 
-// Multi-source semantic adapter for M1a.
+// Multi-source semantic adapter for M1a/M1b.
 // Aggregates Base + Sealed Delta + Open Delta without custom sweep-line.
 class AMTVMultiSourceAdapter {
  public:
@@ -126,9 +126,10 @@ class AMTVMultiSourceAdapter {
       : snapshot_(std::move(snapshot)), icmp_(icmp) {}
 
   // Max covering sequence number across Base, Sealed Delta, and Open Delta.
-  SequenceNumber MaxCoveringTombstoneSeqnum(const Slice& user_key,
-                                           SequenceNumber read_seq,
-                                           std::string* out_ts = nullptr) const;
+  SequenceNumber MaxCoveringTombstoneSeqnum(
+      const Slice& user_key, SequenceNumber read_seq,
+      std::string* out_ts = nullptr,
+      const Slice* ts_upper_bound = nullptr) const;
 
   // Add Base, Sealed Delta, and Open Delta to a native ReadRangeDelAggregator.
   void AddToRangeDelAggregator(

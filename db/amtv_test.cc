@@ -5,8 +5,12 @@
 
 #include "db/amtv.h"
 
+#include <atomic>
 #include <memory>
+#include <mutex>
+#include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "db/dbformat.h"
@@ -23,6 +27,7 @@ namespace ROCKSDB_NAMESPACE {
 class AMTVTest : public testing::Test {
  public:
   AMTVTest() : dbname_(test::PerThreadDBPath("amtv_test")) {}
+  void SetUp() override { DestroyDB(dbname_, Options()).PermitUncheckedError(); }
   ~AMTVTest() override { DestroyDB(dbname_, Options()).PermitUncheckedError(); }
 
  protected:
@@ -553,6 +558,274 @@ TEST_F(AMTVTest, DBKeyByKeyValueReconciliation) {
         << "Value mismatch for key " << key << " between Get and Iterator!";
   }
   ASSERT_OK(it->status());
+}
+
+TEST_F(AMTVTest, Concurrent8Readers1Writer_GetOnly) {
+  Options options;
+  options.create_if_missing = true;
+  options.enable_amtv = true;
+  options.amtv_delta_tombstones = 16;  // Small threshold to force open_delta -> sealed_delta transitions
+  options.amtv_max_sealed_deltas = 1;
+
+  std::string test_db = test::PerThreadDBPath("amtv_test_concurrent");
+  DestroyDB(test_db, options).PermitUncheckedError();
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(options, test_db, &db));
+
+  struct OpLogEntry {
+    enum Type { kPut, kDeleteRange, kFlush } type;
+    std::string key;
+    std::string end_key;
+    std::string val;
+    SequenceNumber seq;
+  };
+
+  std::vector<OpLogEntry> op_log;
+  std::mutex log_mutex;
+
+  // Truth model evaluating visibility of key at explicit snapshot sequence
+  auto EvaluateTruthModelUnlocked = [&](const std::string& key, SequenceNumber read_seq,
+                                        std::string* expected_val) -> bool {
+    SequenceNumber latest_put_seq = 0;
+    std::string latest_val;
+    SequenceNumber max_covering_del_seq = 0;
+
+    for (const auto& op : op_log) {
+      if (op.seq > read_seq) {
+        break;
+      }
+      if (op.type == OpLogEntry::kPut) {
+        if (op.key == key) {
+          latest_put_seq = op.seq;
+          latest_val = op.val;
+        }
+      } else if (op.type == OpLogEntry::kDeleteRange) {
+        if (op.key <= key && key < op.end_key) {
+          if (op.seq > max_covering_del_seq) {
+            max_covering_del_seq = op.seq;
+          }
+        }
+      }
+    }
+
+    if (latest_put_seq > 0 && latest_put_seq > max_covering_del_seq) {
+      if (expected_val != nullptr) {
+        *expected_val = latest_val;
+      }
+      return true;
+    }
+    return false;
+  };
+
+  std::atomic<bool> writer_done{false};
+  std::atomic<uint64_t> total_reads{0};
+  const int kNumReaders = 8;
+  std::vector<std::thread> readers;
+
+  // 8 Reader threads
+  for (int r = 0; r < kNumReaders; ++r) {
+    readers.emplace_back([&, r]() {
+      uint64_t local_reads = 0;
+      std::mt19937_64 rng(1337 + r);
+      while (!writer_done.load(std::memory_order_relaxed) || local_reads < 600) {
+        int key_idx = rng() % 100;
+        char k_buf[32];
+        snprintf(k_buf, sizeof(k_buf), "k%04d", key_idx);
+        std::string key(k_buf);
+
+        const Snapshot* snap = nullptr;
+        SequenceNumber read_seq = 0;
+        std::string expected_val;
+        bool expected_found = false;
+
+        {
+          std::lock_guard<std::mutex> lock(log_mutex);
+          snap = db->GetSnapshot();
+          read_seq = snap->GetSequenceNumber();
+          expected_found = EvaluateTruthModelUnlocked(key, read_seq, &expected_val);
+        }
+
+        ReadOptions ro;
+        ro.snapshot = snap;
+        std::string actual_val;
+        Status s = db->Get(ro, key, &actual_val);
+
+        db->ReleaseSnapshot(snap);
+
+        if (expected_found) {
+          ASSERT_OK(s) << "Reader " << r << " key " << key << " expected found at seq " << read_seq;
+          ASSERT_EQ(actual_val, expected_val) << "Reader " << r << " value mismatch for key " << key;
+        } else {
+          ASSERT_TRUE(s.IsNotFound()) << "Reader " << r << " key " << key
+                                      << " expected NotFound but got status " << s.ToString()
+                                      << " at seq " << read_seq;
+        }
+        local_reads++;
+      }
+      total_reads.fetch_add(local_reads);
+    });
+  }
+
+  auto RecordPut = [&](const std::string& key, const std::string& val) {
+    std::lock_guard<std::mutex> lock(log_mutex);
+    ASSERT_OK(db->Put(WriteOptions(), key, val));
+    SequenceNumber seq = db->GetLatestSequenceNumber();
+    op_log.push_back({OpLogEntry::kPut, key, "", val, seq});
+  };
+
+  auto RecordDeleteRange = [&](const std::string& start, const std::string& end) {
+    std::lock_guard<std::mutex> lock(log_mutex);
+    ASSERT_OK(db->DeleteRange(WriteOptions(), start, end));
+    SequenceNumber seq = db->GetLatestSequenceNumber();
+    op_log.push_back({OpLogEntry::kDeleteRange, start, end, "", seq});
+  };
+
+  auto RecordFlush = [&]() {
+    std::lock_guard<std::mutex> lock(log_mutex);
+    FlushOptions fo;
+    fo.wait = true;
+    ASSERT_OK(db->Flush(fo));
+    SequenceNumber seq = db->GetLatestSequenceNumber();
+    op_log.push_back({OpLogEntry::kFlush, "", "", "", seq});
+  };
+
+  // Phase 1: Populate keys k0000 - k0099
+  for (int i = 0; i < 100; ++i) {
+    char k_buf[32], v_buf[32];
+    snprintf(k_buf, sizeof(k_buf), "k%04d", i);
+    snprintf(v_buf, sizeof(v_buf), "v_init_%04d", i);
+    RecordPut(k_buf, v_buf);
+  }
+
+  // Phase 2: Issue >16 DeleteRanges to trigger delta sealing into sealed_delta
+  for (int i = 0; i < 20; ++i) {
+    char s_buf[32], e_buf[32];
+    int start_idx = (i * 4) % 90;
+    int end_idx = start_idx + 6;
+    snprintf(s_buf, sizeof(s_buf), "k%04d", start_idx);
+    snprintf(e_buf, sizeof(e_buf), "k%04d", end_idx);
+    RecordDeleteRange(s_buf, e_buf);
+  }
+
+  // Phase 3: Put resurrection (Re-Put keys in deleted ranges)
+  for (int i = 0; i < 30; ++i) {
+    char k_buf[32], v_buf[32];
+    int key_idx = (i * 3) % 95;
+    snprintf(k_buf, sizeof(k_buf), "k%04d", key_idx);
+    snprintf(v_buf, sizeof(v_buf), "v_resurrect_%04d", key_idx);
+    RecordPut(k_buf, v_buf);
+  }
+
+  // Phase 4: MemTable to Immutable transition (Flush active MemTable to L0)
+  RecordFlush();
+
+  // Phase 5: Additional DeleteRanges and Resurrections on new active MemTable
+  for (int i = 0; i < 15; ++i) {
+    char s_buf[32], e_buf[32];
+    int start_idx = 10 + i * 2;
+    snprintf(s_buf, sizeof(s_buf), "k%04d", start_idx);
+    snprintf(e_buf, sizeof(e_buf), "k%04d", start_idx + 8);
+    RecordDeleteRange(s_buf, e_buf);
+  }
+  for (int i = 0; i < 10; ++i) {
+    char k_buf[32], v_buf[32];
+    int key_idx = 12 + i * 2;
+    snprintf(k_buf, sizeof(k_buf), "k%04d", key_idx);
+    snprintf(v_buf, sizeof(v_buf), "v_resurrect_phase5_%04d", key_idx);
+    RecordPut(k_buf, v_buf);
+  }
+
+  // Complete writer and join readers
+  writer_done.store(true, std::memory_order_release);
+  for (auto& t : readers) {
+    t.join();
+  }
+
+  // Phase 6: DB Close and Reopen verification
+  SequenceNumber final_seq = db->GetLatestSequenceNumber();
+  db.reset();
+
+  ASSERT_OK(DB::Open(options, test_db, &db));
+
+  for (int i = 0; i < 100; ++i) {
+    char k_buf[32];
+    snprintf(k_buf, sizeof(k_buf), "k%04d", i);
+    std::string key(k_buf);
+    std::string expected_val;
+    bool expected_found = EvaluateTruthModelUnlocked(key, final_seq, &expected_val);
+
+    std::string actual_val;
+    Status s = db->Get(ReadOptions(), key, &actual_val);
+    if (expected_found) {
+      ASSERT_OK(s) << "Post-reopen key " << key << " should be found";
+      ASSERT_EQ(actual_val, expected_val);
+    } else {
+      ASSERT_TRUE(s.IsNotFound()) << "Post-reopen key " << key << " should be NotFound";
+    }
+  }
+
+  db.reset();
+}
+
+TEST_F(AMTVTest, MultiGet_GetOnly) {
+  Options options;
+  options.create_if_missing = true;
+  options.enable_amtv = true;
+  options.amtv_delta_tombstones = 8;
+  options.amtv_max_sealed_deltas = 1;
+
+  std::string test_db = test::PerThreadDBPath("amtv_test_multiget");
+  DestroyDB(test_db, options).PermitUncheckedError();
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(options, test_db, &db));
+
+  // Insert point keys
+  for (int i = 0; i < 20; ++i) {
+    char k[32], v[32];
+    snprintf(k, sizeof(k), "mg%02d", i);
+    snprintf(v, sizeof(v), "val%02d", i);
+    ASSERT_OK(db->Put(WriteOptions(), k, v));
+  }
+
+  // DeleteRange [mg05, mg15)
+  ASSERT_OK(db->DeleteRange(WriteOptions(), "mg05", "mg15"));
+
+  // Resurrect mg08
+  ASSERT_OK(db->Put(WriteOptions(), "mg08", "val08_resurrected"));
+
+  // Batch MultiGet across all 20 keys
+  std::vector<Slice> keys;
+  std::vector<std::string> key_strs;
+  for (int i = 0; i < 20; ++i) {
+    char k[32];
+    snprintf(k, sizeof(k), "mg%02d", i);
+    key_strs.push_back(k);
+  }
+  for (const auto& s : key_strs) {
+    keys.push_back(s);
+  }
+
+  std::vector<std::string> values;
+  std::vector<Status> statuses = db->MultiGet(ReadOptions(), keys, &values);
+  ASSERT_EQ(statuses.size(), 20u);
+
+  for (int i = 0; i < 20; ++i) {
+    if (i >= 5 && i < 15) {
+      if (i == 8) {
+        ASSERT_OK(statuses[i]);
+        ASSERT_EQ(values[i], "val08_resurrected");
+      } else {
+        ASSERT_TRUE(statuses[i].IsNotFound()) << "Key " << key_strs[i] << " should be deleted";
+      }
+    } else {
+      ASSERT_OK(statuses[i]);
+      char expected_val[32];
+      snprintf(expected_val, sizeof(expected_val), "val%02d", i);
+      ASSERT_EQ(values[i], expected_val);
+    }
+  }
+
+  db.reset();
 }
 
 

@@ -18,12 +18,19 @@ void OpenDelta::AddEntry(const Slice& start_user_key,
 
 SequenceNumber OpenDelta::MaxCoveringTombstoneSeqnum(
     const Slice& user_key, const Comparator* ucmp, SequenceNumber read_seq,
-    std::string* out_ts) const {
+    std::string* out_ts, const Slice* ts_upper_bound) const {
   SequenceNumber max_seq = 0;
   const OpenDeltaEntry* best_entry = nullptr;
+  size_t ts_sz = ucmp->timestamp_size();
 
   for (const auto& entry : entries_) {
     if (entry.sequence() <= read_seq) {
+      if (ts_sz > 0 && ts_upper_bound != nullptr && !ts_upper_bound->empty()) {
+        Slice entry_ts = entry.timestamp(ts_sz);
+        if (ucmp->CompareTimestamp(entry_ts, *ts_upper_bound) > 0) {
+          continue;
+        }
+      }
       if (ucmp->CompareWithoutTimestamp(entry.user_start_key(), user_key) <= 0 &&
           ucmp->CompareWithoutTimestamp(user_key, entry.user_end_key()) < 0) {
         if (entry.sequence() > max_seq) {
@@ -35,7 +42,6 @@ SequenceNumber OpenDelta::MaxCoveringTombstoneSeqnum(
   }
 
   if (best_entry != nullptr && out_ts != nullptr) {
-    size_t ts_sz = ucmp->timestamp_size();
     if (ts_sz > 0) {
       Slice ts = best_entry->timestamp(ts_sz);
       out_ts->assign(ts.data(), ts.size());
@@ -75,7 +81,8 @@ std::shared_ptr<OpenDelta> OpenDelta::Clone() const {
 // --------------------------------------------------------------------------
 
 SequenceNumber AMTVMultiSourceAdapter::MaxCoveringTombstoneSeqnum(
-    const Slice& user_key, SequenceNumber read_seq, std::string* out_ts) const {
+    const Slice& user_key, SequenceNumber read_seq, std::string* out_ts,
+    const Slice* ts_upper_bound) const {
   SequenceNumber max_seq = 0;
   std::string best_ts;
   const auto* ucmp = icmp_->user_comparator();
@@ -83,7 +90,7 @@ SequenceNumber AMTVMultiSourceAdapter::MaxCoveringTombstoneSeqnum(
   // 1. Query Base
   if (snapshot_->base && !snapshot_->base->empty()) {
     FragmentedRangeTombstoneIterator base_iter(snapshot_->base.get(), *icmp_,
-                                              read_seq);
+                                              read_seq, ts_upper_bound);
     SequenceNumber s = base_iter.MaxCoveringTombstoneSeqnum(user_key);
     if (s > max_seq) {
       max_seq = s;
@@ -97,7 +104,8 @@ SequenceNumber AMTVMultiSourceAdapter::MaxCoveringTombstoneSeqnum(
   // 2. Query Sealed Delta
   if (snapshot_->sealed_delta && !snapshot_->sealed_delta->empty()) {
     FragmentedRangeTombstoneIterator sealed_iter(snapshot_->sealed_delta.get(),
-                                                *icmp_, read_seq);
+                                                *icmp_, read_seq,
+                                                ts_upper_bound);
     SequenceNumber s = sealed_iter.MaxCoveringTombstoneSeqnum(user_key);
     if (s > max_seq) {
       max_seq = s;
@@ -112,7 +120,7 @@ SequenceNumber AMTVMultiSourceAdapter::MaxCoveringTombstoneSeqnum(
   if (snapshot_->open_delta && !snapshot_->open_delta->empty()) {
     std::string open_ts;
     SequenceNumber s = snapshot_->open_delta->MaxCoveringTombstoneSeqnum(
-        user_key, ucmp, read_seq, &open_ts);
+        user_key, ucmp, read_seq, &open_ts, ts_upper_bound);
     if (s > max_seq) {
       max_seq = s;
       best_ts = std::move(open_ts);
