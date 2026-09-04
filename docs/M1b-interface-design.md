@@ -1,147 +1,135 @@
-# AMTV Milestone 1b: 读路径接口设计与对账规范 (M1b-interface-design.md)
+# AMTV Milestone 1b-GetOnly & Milestone 1c-ScanArchitecture 架构与接口设计规范
 
-## 0. 设计目标与核心约束
+## 0. 阶段拆分与边界
 
-在 `memtable_max_range_deletions = 0` 的前提下，M1b 旨在将 M1a 经过对账的 AMTV 增量数据结构接入活跃 MemTable 的读路径。
-
-**核心硬约束**:
-1. **禁止在 M1b 手写未经验证的扫线算法**: 范围删除的边界重叠、截断与遮挡语义极为复杂，不得重新发明区间迭代器。
-2. **禁止在每个读者处重新全量合并/物化全部墓碑**: 避免退化回原生每读重新碎片化的 CPU 开销与锁争用。
-3. **严格保持原生语义**: WAL、Flush、Compaction、SST 写入、Immutable MemTable 保持 100% 原生路径。
-4. **全量原生真值差分对账**: 接入读路径前后，必须支持逐 Key、逐 Scan 与全量单体 `FragmentedRangeTombstoneList` 的差分校验。
+按照用户指令，AMTV 后续演进严格拆分为两个阶段：
+1. **`M1b-GetOnly`**：仅在活跃 MemTable 的 `Get/MultiGet` 中使用已通过 Differential Oracle 验证的 `AMTVMultiSourceAdapter`，绕过 `reader_mutex` 与重复物化；**Scan 路径 100% 保持原生**。
+2. **`M1c-ScanArchitecture`**：确定范围扫描路径的终态架构设计与逐 Scan 差分对账规范，**在设计与最小探针审核通过前不编写任何生产 Scan 读路径代码**。
 
 ---
 
-## 1. 活跃 MemTable 单 Range Tombstone Iterator 槽位的消费者梳理
+## 1. M1b-GetOnly: 活跃 MemTable 点查旁路接入
 
-通过对 RocksDB v11.8.0 源码全量审计，活跃 MemTable（`immutable_memtable = false`）创建的范围删除迭代器仅有以下三类消费者：
+### 1.1 核心约束
+1. **Scan 路径保持原生**:
+   - `MemTable::NewRangeTombstoneIteratorInternal`、`MergingIterator`、`DBIter`、`ArenaWrappedDBIter::Refresh` 均保持原生路径，不做任何改动。
+2. **DeleteRange 不得跳过原生缓存失效**:
+   - 写线程在 `MemTable::Add` 写入 `DeleteRange` 时，必须照常执行 `AtomicSharedPtrStore(local_cache_ref_ptr, ...)` 触发 `cached_range_tombstone_` 失效，确保后续原生 Scan 读者仍能感知最新写入。
+3. **定位与宣称**:
+   - AMTV 在 M1b 中严格定位为“点查旁路优化”，不宣称已解决范围扫描。
+4. **内存生命周期铁律**:
+   - **“AMTV 影子条目必须深拷贝边界键，以避免适配器自身的 Slice 生命周期错误。”** 原生 `RangeTombstone` 仅存引用 Slice，AMTV 的 `OpenDeltaEntry` 必须深拷贝 `start_user_key` 与 `end_key`。
 
-### 1.1 消费者 A: 点查路径 (`MemTable::Get` 与 `MemTable::MultiGet`)
-- **源码位置**:
-  - [`db/memtable.cc:1624`](file:///home/wam/grad/rocksdb-v11.8.0/db/memtable.cc#L1624) (`MemTable::Get`)
-  - [`db/memtable.cc:1818, 1925`](file:///home/wam/grad/rocksdb-v11.8.0/db/memtable.cc#L1818) (`MemTable::MultiGet`)
-- **消费方式**:
+### 1.2 接入点设计
+- **`MemTable::Get` ([`db/memtable.cc:1622`](file:///home/wam/grad/rocksdb-v11.8.0/db/memtable.cc#L1622))**:
   ```cpp
-  std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
-      NewRangeTombstoneIterator(read_options, seq, false /* immutable_memtable */));
-  SequenceNumber covering_seq = range_del_iter->MaxCoveringTombstoneSeqnum(user_key);
-  ```
-- **特征**: **点查只调用 `MaxCoveringTombstoneSeqnum(user_key)`**，完全不需要双向游标扫线（`Seek`, `Next`, `Prev`）。
+  if (!no_range_del) {
+    if (enable_amtv_ && !immutable_memtable && amtv_state_ != nullptr) {
+      auto snap = amtv_state_->GetSnapshot();
+      AMTVMultiSourceAdapter adapter(snap, &comparator_.comparator);
+      max_covering_tombstone_seq =
+          adapter.MaxCoveringTombstoneSeqnum(lkey.user_key(), read_seq, &range_del_timestamp);
 
-### 1.2 消费者 B: Scan 迭代器装配路径 (`DBImpl::NewIterator`)
-- **源码位置**:
-  - [`db/db_impl/db_impl.cc:2607-2621`](file:///home/wam/grad/rocksdb-v11.8.0/db/db_impl/db_impl.cc#L2607-L2621)
-  - [`table/merging_iterator.cc:1712, 1758-1768`](file:///home/wam/grad/rocksdb-v11.8.0/table/merging_iterator.cc#L1758-L1768)
-- **消费方式**:
-  - `DBImpl::NewIterator` 调用 `mem->NewRangeTombstoneIterator(...)`；
-  - 包装为 `TruncatedRangeDelIterator` 后，通过 `MergeIteratorBuilder::AddPointAndTombstoneIterator(mem_iter, std::move(mem_tombstone_iter))` 挂载为 `merging_iter` 的第 0 个 child 范围墓碑迭代器。
-  - `MergeIteratorBuilder::Finish` 将 `&merge_iter->range_tombstone_iters_.front()` 赋给 `ArenaWrappedDBIter::SetMemtableRangetombstoneIter(...)`。
-- **特征**: 活跃 MemTable 在 `MergingIterator` 中恰好占据一个平级槽位。
-
-### 1.3 消费者 C: Scan 迭代器刷新路径 (`ArenaWrappedDBIter::Refresh`)
-- **源码位置**:
-  - [`db/arena_wrapped_db_iter.cc:290-317`](file:///home/wam/grad/rocksdb-v11.8.0/db/arena_wrapped_db_iter.cc#L290-L317)
-- **消费方式**:
-  - 当迭代器调用 `Refresh()` 且 SuperVersion 未变时，原地更新 `*memtable_range_tombstone_iter_`：
-  ```cpp
-  *memtable_range_tombstone_iter_ =
-      std::make_unique<TruncatedRangeDelIterator>(
-          std::unique_ptr<FragmentedRangeTombstoneIterator>(t), ...);
+  #ifndef NDEBUG
+      // 双轨差分断言（Test/Debug 模式）：验证 AMTV 判定与原生物化判定完全一致
+      std::unique_ptr<FragmentedRangeTombstoneIterator> native_iter(
+          NewRangeTombstoneIterator(read_opts, read_seq, immutable_memtable));
+      SequenceNumber native_seq =
+          native_iter ? native_iter->MaxCoveringTombstoneSeqnum(lkey.user_key()) : 0;
+      assert(max_covering_tombstone_seq == native_seq);
+  #endif
+    } else {
+      std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
+          NewRangeTombstoneIterator(read_opts, read_seq, immutable_memtable));
+      max_covering_tombstone_seq =
+          range_del_iter->MaxCoveringTombstoneSeqnum(lkey.user_key());
+      if (moptions.user_comparator->timestamp_size() > 0) {
+        range_del_timestamp.assign(range_del_iter->timestamp().data(),
+                                   range_del_iter->timestamp().size());
+      }
+    }
+  }
   ```
+- **`MemTable::MultiGet` ([`db/memtable.cc:1818, 1925`](file:///home/wam/grad/rocksdb-v11.8.0/db/memtable.cc#L1818))**:
+  - 获取一次 `amtv_state_->GetSnapshot()`，对批次内的 Key 连续复用 `AMTVMultiSourceAdapter` 求覆盖序列号，消除批次内重复物化与反复进入 `reader_mutex`。
+
+### 1.3 并发正确性测试设计
+在 `db/amtv_test.cc` 中实现 `AMTVTest.Concurrent8Readers1Writer_GetOnly`：
+- **1 个写线程**：持续执行 5,000 次交替的 `DeleteRange` 与 `Put`。
+- **8 个并发读线程**：持续并发执行 `db->Get(ReadOptions(), key)`。
+- **校验点**：
+  1. 线性化：读者一旦观察到 $read\_seq \ge S_{del}$，绝不能漏掉该范围删除；
+  2. 一致性：AMTV 判定与原生判定结果完全相同；
+  3. 线程安全：TSAN/ASan 洁净，无 Data Race、无 UAF。
 
 ---
 
-## 2. 方案比较：扩展多源消费者 vs 构造复合门面
+## 2. M1c-ScanArchitecture: 范围扫描路径架构路线选型
 
-针对消费者的接入方式，存在两种架构路径：
+### 2.1 路线 A vs 路线 B 深度论证
 
-| 维度 | 方案 A: 扩展 MergingIterator 支持多源槽位 | 方案 B: 构造分层复用门面 (Composite Facade) |
+用户要求在以下两条路线中选一条，并说明正确性证明和代价：
+- **路线 A**: 扩展 `TruncatedRangeDelIterator` 或其上游消费者，使一个活跃 MemTable 可向 Scan 聚合器提供多个原生范围墓碑来源；复用已有聚合语义。
+- **路线 B**: 设计可持久增量更新的数据结构，使每个 AMTV snapshot 始终产出一个全局 Fragment 后的单一视图；禁止在每次 Scan 时对 Base + Delta 做全量 Fragment。
+
+#### 论证矩阵：
+
+| 评估维度 | 路线 A (推荐: 扩展 TruncatedRangeDelIterator 接受多源聚合) | 路线 B (自研全局增量动态打碎数据结构) |
 | :--- | :--- | :--- |
-| **接入点修改范围** | 需修改 `MergeIteratorBuilder`、`MergingIterator` 核心头文件与内部向量结构（影响所有 SST Level） | 仅在 `MemTable` 内部提供符合现有抽象基类的派生门面，不改动 `MergingIterator` |
-| **扫线正确性风险** | 需修改 `MergingIterator` 核心归并主循环，风险扩散至整库查询路径 | 保持 `MergingIterator` 原有协议，完全不触及引擎层归并调度 |
-| **实现复杂度** | 高，需重新设计 Level 与 MemTable 异构 tombstone 容器 | 中，利用现成的不可变多层列表与原生切片聚合 |
-| **推选结论** | **不推荐** | **推荐 (基于原生抽象的安全接入)** |
+| **算法正确性保证** | **极高**。每个子层均为原生 `FragmentedRangeTombstoneIterator`，完全复用 RocksDB 官方经过十几年检验的区间切分逻辑。 | **极低/高风险**。必须重新发明带有 sequence、timestamp 与区间重叠判定的并发可持久化红黑/线段树，极易引入隐蔽 Corner-case。 |
+| **写端开销** | **零惩罚**。OpenDelta 仅简单追加，Sealed Delta 批量物化一次，Base 异步合并。 | **巨大写放大**。每条 `DeleteRange` 必须在写临界区执行区间几何切割与分裂重平衡，严重压垮写性能。 |
+| **读端全量重算** | **严格杜绝**。Base（数千条）与 Sealed Delta（64条）全生命周期预打碎复用指针，读者仅按需打碎 OpenDelta（$\le 63$ 条）。 | **严格杜绝**。每个快照天然是全局单体视图。 |
+| **手写扫线风险** | **零风险**。不手写任何区间扫线代码，全部调用原生迭代器。 | **高风险**。直接违背“禁止在 M1b/M1c 手写未经验证区间算法”的禁令。 |
 
----
+#### **路线选型结论**: 坚定选择 **路线 A**。
 
-## 3. 推荐方案：无全量重算的分层复用门面设计
+### 2.2 路线 A 正确性数学证明
+设读者在读序列号 $S_r$ 下扫描点键 $x$。
+- 全量真实墓碑集合为 $T = T_{base} \cup T_{sealed} \cup T_{open}$。
+- 原生单体打碎列表判定的覆盖序列号为：
+  $$seq_{native}(x) = \max \{ t.seq \mid t \in T,\ t.start \le x < t.end,\ t.seq \le S_r \}$$
+- 路线 A 中，`TruncatedRangeDelIterator` 内置持有来自同一 MemTable 的 3 个原生子迭代器：$I_{base}, I_{sealed}, I_{open}$。
+- 路线 A 判定的覆盖序列号为：
+  $$seq_{AMTV}(x) = \max \Big( seq(I_{base}, x),\ seq(I_{sealed}, x),\ seq(I_{open}, x) \Big)$$
+- 根据集合并集的最大值恒等式（$\max$ 运算符的结合律与交换律）：
+  $$\max_{t \in T_1 \cup T_2}(f(t)) \equiv \max \left( \max_{t \in T_1}(f(t)),\ \max_{t \in T_2}(f(t)) \right)$$
+- 恒有：
+  $$\mathbf{seq_{AMTV}(x) \equiv seq_{native}(x)}$$
+- **证毕**: 路线 A 的多源聚合判定在全键空间与所有序列号下与原生全局打碎单体列表严格等价。
 
-为确保在每个读者 Scan 时**绝不重新全量 Fragment 全部墓碑**，采用“不可变层复用 + 极小增量按需物化”：
+### 2.3 路线 A 性能代价分析
+1. **CPU 开销**:
+   `TruncatedRangeDelIterator::ShouldDelete()` 对 $K \le 3$ 个内部迭代器取 $\max$。因为 $K$ 极小（最多 3 个），其单次比较耗时在几纳秒量级，相比于重新全量排序打碎数千条墓碑，CPU 开销微乎其微。
+2. **内存开销**:
+   仅需将 `TruncatedRangeDelIterator` 内部的单指针 `iter_` 扩展为 `std::vector<std::unique_ptr<FragmentedRangeTombstoneIterator>>`（最多 3 个元素，占用几十字节栈/堆空间）。
 
-### 3.1 数据分层与生命周期
-1. **Base (基底墓碑层)**:
-   - 包含绝大多数墓碑（如数百至数千条）。
-   - 是一个只读的 `FragmentedRangeTombstoneList`，由写线程在后台合并时单次构建并原子发布。
-   - 所有并发读者共享同一个 `std::shared_ptr<const FragmentedRangeTombstoneList>`，**重用率 100%，物化开销为 0**。
-2. **Sealed Delta (冻结增量层)**:
-   - 容纳 64 条墓碑。当 OpenDelta 满 64 条时，写线程触发一次局部碎片化生成 `sealed_delta` 并原子发布。
-   - 碎片化 64 条墓碑耗时极短，且整个生命周期内只物化一次。所有读者直接共享只读指针。
-3. **OpenDelta (活跃追加增量)**:
-   - 容纳 $< 64$ 条墓碑。
-   - 点查（Get/MultiGet）：直接遍历数组求 max seq，**零分配、零物化**。
-   - 范围扫描（Scan）：
-     - 若 OpenDelta 为空（即刚完成冻结），门面直接由 Base 与 Sealed Delta 组成，**读者完全零物化**；
-     - 若 OpenDelta 非空（最多 63 条）：由 Scan 读者或发布端按需生成这 $\le 63$ 条墓碑的微型 `FragmentedRangeTombstoneList` 并挂载进聚合器。
-
-### 3.2 门面对象设计 (`AMTVRangeTombstoneFacade`)
-继承自抽象基类 `RangeTombstoneIterator`（与 `FragmentedRangeTombstoneIterator` 具有相同接口能力）：
-```cpp
-class AMTVRangeTombstoneFacade : public RangeTombstoneIterator {
- public:
-  AMTVRangeTombstoneFacade(std::shared_ptr<const AMTVSnapshot> snapshot,
-                           const InternalKeyComparator* icmp,
-                           SequenceNumber read_seq);
-
-  // 1. 点查核心接口：委托给经过 M1a 充分对账的 MultiSourceAdapter
-  SequenceNumber MaxCoveringTombstoneSeqnum(const Slice& user_key) override;
-
-  // 2. Scan 核心接口：由内部微型聚合器驱动
-  void Seek(const Slice& target) override;
-  void SeekForPrev(const Slice& target) override;
-  void Next() override;
-  void Prev() override;
-  bool Valid() const override;
-  Slice start_key() const override;
-  Slice end_key() const override;
-  SequenceNumber seq() const override;
-
- private:
-  std::shared_ptr<const AMTVSnapshot> snapshot_;
-  AMTVMultiSourceAdapter adapter_;
-  // 利用已有的 ReadRangeDelAggregator 进行多源融合，绝不手写区间切分
-  ReadRangeDelAggregator internal_agg_;
-};
+### 2.4 逐 Scan Differential Oracle 规范
+在 M1c 阶段，必须实现真实 `MergingIterator` 消费链的逐 Scan 对账测试：
+```text
+AMTV Scan 可见键序列
+  ≡
+原生全量 Fragment 后的 Scan 可见键序列
+  ≡
+原生 DB Iterator 可见键序列
 ```
+- **覆盖用例场景**:
+  1. 跨层区间重叠与完全嵌套；
+  2. 首尾相邻边界开闭区间；
+  3. DeleteRange 覆盖区内 Put 复活；
+  4. Snapshot 隔离可见性；
+  5. Iterator Refresh 活跃代际切换；
+  6. MemTable 转为 Immutable 过程中的持续迭代。
 
 ---
 
-## 4. 各功能模块的原生语义保持规范
+## 3. 模块原生语义保持汇总表
 
-1. **`Get` 语义**:
-   - 命中活跃 MemTable 时，调用 `amtv_state_->GetSnapshot()`。
-   - 直接调用 `AMTVMultiSourceAdapter::MaxCoveringTombstoneSeqnum(user_key, read_seq)`，完全避开 `reader_mutex` 与全量物化。
-2. **`Iterator Refresh` 语义**:
-   - `ArenaWrappedDBIter::Refresh()` 检测到 SuperVersion 未变时，仅需获取最新 AMTV 快照重新包装门面即可。若 `publish_epoch` 相同，甚至无需替换底册。
-3. **`Immutable MemTable` 语义**:
-   - `immutable_memtable = true` 时，调用路径完全不变，直接使用不可变 MemTable 固化的 `fragmented_range_tombstone_list_`。
-4. **`FlushJob` 语义**:
-   - FlushJob 在 MemTable 冻结为 Immutable 之后执行，强制传递 `immutable_memtable = true`。
-   - AMTV 完全不介入 FlushJob，WAL 与 SST 生成保持 100% 原生。
-5. **`MemTableList` 语义**:
-   - 历史 MemTable 列表中所有元素均为不可变 MemTable，完全使用原生逻辑。
-
----
-
-## 5. 逐 Key / 逐 Scan 差分对账机制 (Differential Oracle)
-
-在 M1b 中，每一个单元测试与压力审计均启用全量真值对照：
-1. **逐 Key 对账**:
-   $$\forall \text{Key } k,\quad \text{Facade::MaxCoveringTombstoneSeqnum}(k) \equiv \text{GroundTruthList::MaxCoveringTombstoneSeqnum}(k)$$
-2. **逐 Scan 游标步进对账**:
-   在每一次 `Seek`, `SeekForPrev`, `Next`, `Prev` 之后：
-   - `Facade::Valid() == GroundTruth::Valid()`
-   - `Facade::start_key() == GroundTruth::start_key()`
-   - `Facade::end_key() == GroundTruth::end_key()`
-   - `Facade::seq() == GroundTruth::seq()`
-3. **Fail-Fast 容灾**:
-   一旦出现任何非零偏差，即刻产生测试断言失败，阻止任何隐式语义漂移。
+| 模块 / 操作 | M1b-GetOnly 语义保持方式 | M1c-ScanArchitecture 语义保持方式 |
+| :--- | :--- | :--- |
+| **`Get / MultiGet`** | 使用 `AMTVMultiSourceAdapter`，零锁、零重新碎片化 | 继承 M1b 机制 |
+| **`DBIter::NewIterator`** | 100% 保持原生不变 | 挂载路线 A 多源 `TruncatedRangeDelIterator` |
+| **`ArenaWrappedDBIter::Refresh`** | 100% 保持原生不变 | 刷新活跃 MemTable 的多源槽位 |
+| **`Immutable MemTable`** | 显式传 `immutable=true`，完全走原生打碎列表 | 显式传 `immutable=true`，完全走原生打碎列表 |
+| **`FlushJob`** | 完全走原生打碎列表，AMTV 不介入 | 完全走原生打碎列表，AMTV 不介入 |
+| **`MemTableList`** | 均为不可变 MemTable，100% 原生 | 均为不可变 MemTable，100% 原生 |
+| **`DeleteRange 缓存失效`** | **保留原生失效** (`cached_range_tombstone_`) | 视 Scan 完全迁移状态平滑解耦 |
