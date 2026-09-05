@@ -92,7 +92,8 @@ void VerifyDifferentialOracle(
     for (const auto& t : base_tombstones) {
       raw.emplace_back(t.start_key_, t.end_key_, t.seq_);
     }
-    snapshot->sealed_runs.emplace_back(run_id++, std::move(raw), icmp);
+    snapshot->sealed_runs.push_back(
+        std::make_shared<const AMTVRun>(run_id++, std::move(raw), icmp));
   }
 
   if (!sealed_tombstones.empty()) {
@@ -100,7 +101,8 @@ void VerifyDifferentialOracle(
     for (const auto& t : sealed_tombstones) {
       raw.emplace_back(t.start_key_, t.end_key_, t.seq_);
     }
-    snapshot->sealed_runs.emplace_back(run_id++, std::move(raw), icmp);
+    snapshot->sealed_runs.push_back(
+        std::make_shared<const AMTVRun>(run_id++, std::move(raw), icmp));
   }
 
   auto open_delta = std::make_shared<OpenDelta>();
@@ -282,10 +284,10 @@ TEST_F(AMTVTest, FreezeBoundaryCheck65) {
   {
     auto snap = state.GetSnapshot();
     ASSERT_EQ(snap->sealed_runs.size(), 1U);
-    ASSERT_EQ(snap->sealed_runs[0].tombstone_count, 64U);
-    ASSERT_EQ(snap->sealed_runs[0].raw_entries.size(), 64U);
-    ASSERT_EQ(snap->sealed_runs[0].min_seq, 1U);
-    ASSERT_EQ(snap->sealed_runs[0].max_seq, 64U);
+    ASSERT_EQ(snap->sealed_runs[0]->tombstone_count, 64U);
+    ASSERT_EQ(snap->sealed_runs[0]->raw_entries.size(), 64U);
+    ASSERT_EQ(snap->sealed_runs[0]->min_seq, 1U);
+    ASSERT_EQ(snap->sealed_runs[0]->max_seq, 64U);
     ASSERT_EQ(snap->open_delta->size(), 0U);
   }
 
@@ -294,7 +296,7 @@ TEST_F(AMTVTest, FreezeBoundaryCheck65) {
   {
     auto snap = state.GetSnapshot();
     ASSERT_EQ(snap->sealed_runs.size(), 1U);
-    ASSERT_EQ(snap->sealed_runs[0].tombstone_count, 64U);
+    ASSERT_EQ(snap->sealed_runs[0]->tombstone_count, 64U);
     ASSERT_EQ(snap->open_delta->size(), 1U);
     ASSERT_EQ(snap->total_tombstones(), 65U);
   }
@@ -1037,6 +1039,7 @@ TEST_F(AMTVTest, FourWayOracleFallbackAndBoundaryTest) {
   opt_amtv.create_if_missing = true;
   opt_amtv.enable_amtv = true;
   opt_amtv.amtv_delta_tombstones = 16;
+  opt_amtv.amtv_merge_soft_limit = 16;
   opt_amtv.amtv_hard_layer_limit = 8;
   opt_amtv.write_buffer_size = 64 * 1024 * 1024; // Ensure no flush occurs
 
@@ -1186,6 +1189,7 @@ TEST_F(AMTVTest, M2a_HistoryRunRetention) {
   options.create_if_missing = true;
   options.enable_amtv = true;
   options.amtv_delta_tombstones = 4;
+  options.amtv_merge_soft_limit = 16;
   options.amtv_hard_layer_limit = 8;
   options.write_buffer_size = 64 * 1024 * 1024; // Ensure no flush occurs
 
@@ -1232,11 +1236,11 @@ TEST_F(AMTVTest, M2a_HistoryRunRetention) {
   // Validate run invariants
   for (size_t r = 0; r < snap->sealed_runs.size(); ++r) {
     const auto& run = snap->sealed_runs[r];
-    EXPECT_EQ(run.run_id, r + 1);
-    EXPECT_EQ(run.tombstone_count, 4U);
-    EXPECT_EQ(run.raw_entries.size(), 4U);
-    EXPECT_NE(run.fragmented_list, nullptr);
-    EXPECT_LE(run.min_seq, run.max_seq);
+    EXPECT_EQ(run->run_id, r + 1);
+    EXPECT_EQ(run->tombstone_count, 4U);
+    EXPECT_EQ(run->raw_entries.size(), 4U);
+    EXPECT_NE(run->fragmented_list, nullptr);
+    EXPECT_LE(run->min_seq, run->max_seq);
   }
 
   // Verify deletion effectiveness: Oldest Run (Run 1: i=0..3), Middle Run (Run 3: i=8..11), Newest Run (Run 5: i=16..19)
@@ -1525,6 +1529,7 @@ TEST_F(AMTVTest, M2a_FourWayOracleExtension) {
   opt_amtv.create_if_missing = true;
   opt_amtv.enable_amtv = true;
   opt_amtv.amtv_delta_tombstones = 16;
+  opt_amtv.amtv_merge_soft_limit = 16;
   opt_amtv.amtv_hard_layer_limit = 8;
   opt_amtv.write_buffer_size = 64 * 1024 * 1024;
 
@@ -1582,10 +1587,10 @@ TEST_F(AMTVTest, M2a_FourWayOracleExtension) {
   // Validate raw_entries preservation and fidelity in every run
   for (size_t r = 0; r < snap->sealed_runs.size(); ++r) {
     const auto& run = snap->sealed_runs[r];
-    EXPECT_EQ(run.run_id, r + 1);
-    EXPECT_EQ(run.tombstone_count, 16U);
-    EXPECT_EQ(run.raw_entries.size(), 16U);
-    EXPECT_NE(run.fragmented_list, nullptr);
+    EXPECT_EQ(run->run_id, r + 1);
+    EXPECT_EQ(run->tombstone_count, 16U);
+    EXPECT_EQ(run->raw_entries.size(), 16U);
+    EXPECT_NE(run->fragmented_list, nullptr);
   }
 
   // 4-WAY DIFFERENTIAL RECONCILIATION:
@@ -1790,7 +1795,7 @@ TEST_F(AMTVTest, M2a1_FallbackTombstoneCountPrecision) {
   // 144th DeleteRange: attempts to seal 9th run (projected = 9 > 8) -> triggers fallback.
   // tombstones_at_fallback MUST be exactly 144.
   AMTVState state1(/*memtable_generation=*/0, /*delta_limit=*/16,
-                   /*merge_soft_limit=*/4, /*hard_limit=*/8);
+                   /*merge_soft_limit=*/16, /*hard_limit=*/8);
   for (int i = 0; i < 143; ++i) {
     char start[16], end[16];
     snprintf(start, sizeof(start), "k%04d", i * 10);
@@ -1831,7 +1836,7 @@ TEST_F(AMTVTest, M2a1_FallbackTombstoneCountPrecision) {
   // Test 3: Construct 8 sealed runs + non-empty Open Delta, then FreezeOpenDelta().
   // Verify entry value equals canonical shadow total without double-counting Open Delta.
   AMTVState state2(/*memtable_generation=*/0, /*delta_limit=*/16,
-                   /*merge_soft_limit=*/4, /*hard_limit=*/8);
+                   /*merge_soft_limit=*/16, /*hard_limit=*/8);
   // 8 sealed runs = 128 tombstones
   for (int i = 0; i < 128; ++i) {
     char start[16], end[16];
@@ -1866,6 +1871,445 @@ TEST_F(AMTVTest, M2a1_FallbackTombstoneCountPrecision) {
   EXPECT_EQ(snap2_frozen->tombstones_at_fallback, 133U);
   EXPECT_EQ(snap2_frozen->open_delta->size(), 0U);
   EXPECT_EQ(snap2_frozen->sealed_run_count(), 8U);
+}
+
+// ==========================================================================
+// M2b Background Run Merge Test Suite
+// ==========================================================================
+
+TEST_F(AMTVTest, M2b_MergeSemantics) {
+  // delta=4, soft=4, hard=8. Construct at least 12 runs (48 DeleteRanges).
+  // Verify after each merge against external full Fragment ground truth:
+  // - covering sequence, timestamp, Get, MultiGet
+  Options opt;
+  opt.create_if_missing = true;
+  opt.enable_amtv = true;
+  opt.amtv_delta_tombstones = 4;
+  opt.amtv_merge_soft_limit = 4;
+  opt.amtv_hard_layer_limit = 8;
+  opt.write_buffer_size = 64 * 1024 * 1024;
+
+  Options opt_native = opt;
+  opt_native.enable_amtv = false;
+
+  std::string db_amtv_path = test::PerThreadDBPath("amtv_m2b_merge_sem");
+  std::string db_native_path = test::PerThreadDBPath("amtv_m2b_merge_sem_native");
+  DestroyDB(db_amtv_path, Options()).PermitUncheckedError();
+  DestroyDB(db_native_path, Options()).PermitUncheckedError();
+
+  std::unique_ptr<DB> db_amtv;
+  std::unique_ptr<DB> db_native;
+  ASSERT_OK(DB::Open(opt, db_amtv_path, &db_amtv));
+  ASSERT_OK(DB::Open(opt_native, db_native_path, &db_native));
+
+  // Insert 60 keys
+  std::vector<std::string> probe_keys;
+  for (int i = 0; i < 60; ++i) {
+    char k[32], v[32];
+    snprintf(k, sizeof(k), "key%04d", i);
+    snprintf(v, sizeof(v), "val%04d", i);
+    ASSERT_OK(db_amtv->Put(WriteOptions(), k, v));
+    ASSERT_OK(db_native->Put(WriteOptions(), k, v));
+    probe_keys.emplace_back(k);
+  }
+
+  ColumnFamilyData* cfd = static_cast<ColumnFamilyHandleImpl*>(db_amtv->DefaultColumnFamily())->cfd();
+  MemTable* mem = cfd->mem();
+  AMTVState* state = mem->GetAMTVState();
+  ASSERT_NE(state, nullptr);
+
+  // Inject 48 DeleteRanges (12 runs of 4)
+  for (int run = 0; run < 12; ++run) {
+    for (int d = 0; d < 4; ++d) {
+      int idx = (run * 4 + d) % 50;
+      char s[32], e[32];
+      snprintf(s, sizeof(s), "key%04d", idx);
+      snprintf(e, sizeof(e), "key%04d", idx + 3);
+      ASSERT_OK(db_amtv->DeleteRange(WriteOptions(), s, e));
+      ASSERT_OK(db_native->DeleteRange(WriteOptions(), s, e));
+    }
+    // Controlled synchronous merge check if soft limit reached
+    state->RunMergeSynchronously();
+
+    // Verify Get & MultiGet equivalence
+    for (const auto& k : probe_keys) {
+      std::string val_amtv, val_native;
+      Status s_amtv = db_amtv->Get(ReadOptions(), k, &val_amtv);
+      Status s_nat = db_native->Get(ReadOptions(), k, &val_native);
+      ASSERT_EQ(s_amtv.code(), s_nat.code()) << "Key mismatch at " << k;
+      if (s_amtv.ok()) {
+        ASSERT_EQ(val_amtv, val_native);
+      }
+    }
+    std::vector<Slice> mg_slices;
+    for (const auto& k : probe_keys) mg_slices.emplace_back(k);
+    std::vector<std::string> vals_amtv, vals_nat;
+    auto statuses_amtv = db_amtv->MultiGet(ReadOptions(), mg_slices, &vals_amtv);
+    auto statuses_nat = db_native->MultiGet(ReadOptions(), mg_slices, &vals_nat);
+    for (size_t i = 0; i < mg_slices.size(); ++i) {
+      ASSERT_EQ(statuses_amtv[i].code(), statuses_nat[i].code());
+      if (statuses_amtv[i].ok()) {
+        ASSERT_EQ(vals_amtv[i], vals_nat[i]);
+      }
+    }
+    // Verify sealed runs never exceed hard limit
+    EXPECT_LE(state->GetSnapshot()->sealed_run_count(), 8U);
+  }
+
+  EXPECT_GT(state->merge_completed(), 0U);
+  EXPECT_FALSE(state->is_fallback_required());
+}
+
+TEST_F(AMTVTest, M2b_OutOfOrderAndOverlappingInput) {
+  // Delta=4, soft=4, hard=8
+  // Each run has out-of-order start keys.
+  // Across runs: nested, crossing, adjacent, and Put resurrections.
+  Options opt;
+  opt.create_if_missing = true;
+  opt.enable_amtv = true;
+  opt.amtv_delta_tombstones = 4;
+  opt.amtv_merge_soft_limit = 4;
+  opt.amtv_hard_layer_limit = 8;
+  opt.write_buffer_size = 64 * 1024 * 1024;
+
+  Options opt_native = opt;
+  opt_native.enable_amtv = false;
+
+  std::string db_amtv_path = test::PerThreadDBPath("amtv_m2b_ooo_db");
+  std::string db_native_path = test::PerThreadDBPath("amtv_m2b_ooo_native");
+  DestroyDB(db_amtv_path, Options()).PermitUncheckedError();
+  DestroyDB(db_native_path, Options()).PermitUncheckedError();
+
+  std::unique_ptr<DB> db_amtv;
+  std::unique_ptr<DB> db_native;
+  ASSERT_OK(DB::Open(opt, db_amtv_path, &db_amtv));
+  ASSERT_OK(DB::Open(opt_native, db_native_path, &db_native));
+
+  // Base keys
+  for (int i = 0; i < 100; ++i) {
+    char k[32], v[32];
+    snprintf(k, sizeof(k), "k%04d", i);
+    snprintf(v, sizeof(v), "val%04d_init", i);
+    ASSERT_OK(db_amtv->Put(WriteOptions(), k, v));
+    ASSERT_OK(db_native->Put(WriteOptions(), k, v));
+  }
+
+  // Run 1 (out-of-order start keys: k080, k020, k060, k010)
+  ASSERT_OK(db_amtv->DeleteRange(WriteOptions(), "k0080", "k0090"));
+  ASSERT_OK(db_native->DeleteRange(WriteOptions(), "k0080", "k0090"));
+  ASSERT_OK(db_amtv->DeleteRange(WriteOptions(), "k0020", "k0040"));
+  ASSERT_OK(db_native->DeleteRange(WriteOptions(), "k0020", "k0040"));
+  ASSERT_OK(db_amtv->DeleteRange(WriteOptions(), "k0060", "k0075"));
+  ASSERT_OK(db_native->DeleteRange(WriteOptions(), "k0060", "k0075"));
+  ASSERT_OK(db_amtv->DeleteRange(WriteOptions(), "k0010", "k0025")); // overlapping with k0020..k0040
+  ASSERT_OK(db_native->DeleteRange(WriteOptions(), "k0010", "k0025"));
+
+  // Run 2 (adjacent and nested: k0040..k0060 is adjacent to [0020, 0040) and [0060, 0075))
+  ASSERT_OK(db_amtv->DeleteRange(WriteOptions(), "k0040", "k0060"));
+  ASSERT_OK(db_native->DeleteRange(WriteOptions(), "k0040", "k0060"));
+  ASSERT_OK(db_amtv->DeleteRange(WriteOptions(), "k0005", "k0095")); // big nested covering all!
+  ASSERT_OK(db_native->DeleteRange(WriteOptions(), "k0005", "k0095"));
+  ASSERT_OK(db_amtv->DeleteRange(WriteOptions(), "k0070", "k0085")); // cross overlap
+  ASSERT_OK(db_native->DeleteRange(WriteOptions(), "k0070", "k0085"));
+  ASSERT_OK(db_amtv->DeleteRange(WriteOptions(), "k0030", "k0035")); // nested within [0020, 0040)
+  ASSERT_OK(db_native->DeleteRange(WriteOptions(), "k0030", "k0035"));
+
+  // Put resurrection of keys inside deleted ranges
+  ASSERT_OK(db_amtv->Put(WriteOptions(), "k0032", "val0032_resurrected"));
+  ASSERT_OK(db_native->Put(WriteOptions(), "k0032", "val0032_resurrected"));
+  ASSERT_OK(db_amtv->Put(WriteOptions(), "k0085", "val0085_resurrected"));
+  ASSERT_OK(db_native->Put(WriteOptions(), "k0085", "val0085_resurrected"));
+
+  // Run 3 & 4
+  for (int r = 0; r < 8; ++r) {
+    char s[32], e[32];
+    snprintf(s, sizeof(s), "k%04d", (73 - r * 7));
+    snprintf(e, sizeof(e), "k%04d", (73 - r * 7) + 8);
+    ASSERT_OK(db_amtv->DeleteRange(WriteOptions(), s, e));
+    ASSERT_OK(db_native->DeleteRange(WriteOptions(), s, e));
+  }
+
+  ColumnFamilyData* cfd = static_cast<ColumnFamilyHandleImpl*>(db_amtv->DefaultColumnFamily())->cfd();
+  AMTVState* state = cfd->mem()->GetAMTVState();
+  // Wait for in-flight merge if any, or trigger merge
+  while (state->is_merge_in_progress()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  if (state->GetSnapshot()->sealed_run_count() >= 4) {
+    state->RunMergeSynchronously();
+  }
+  EXPECT_GE(state->merge_completed(), 1U);
+
+  // Probe all keys 0000..0099
+  for (int i = 0; i < 100; ++i) {
+    char k[32];
+    snprintf(k, sizeof(k), "k%04d", i);
+    std::string v_amtv, v_nat;
+    Status s_amtv = db_amtv->Get(ReadOptions(), k, &v_amtv);
+    Status s_nat = db_native->Get(ReadOptions(), k, &v_nat);
+    ASSERT_EQ(s_amtv.code(), s_nat.code()) << "Mismatch at key " << k;
+    if (s_amtv.ok()) {
+      ASSERT_EQ(v_amtv, v_nat) << "Value mismatch at key " << k;
+    }
+  }
+}
+
+TEST_F(AMTVTest, M2b_TaskWriteInterleaving) {
+  // Use SyncPoint in BGMergeTask: AfterMergeBeforePublish to pause merge task.
+  // Foreground injects new DeleteRanges forming Run 5 and Run 6.
+  // Unpause merge task.
+  // Verify: merged run replaces Run 1..4 without overwriting Run 5, Run 6, or open delta.
+  std::shared_ptr<AMTVState> state = std::make_shared<AMTVState>(
+      /*memtable_generation=*/1, /*delta_limit=*/4, /*merge_soft_limit=*/4,
+      /*hard_limit=*/8, &bytewise_icmp_);
+
+  // Form 4 sealed runs (16 tombstones)
+  for (int i = 0; i < 16; ++i) {
+    char s[16], e[16];
+    snprintf(s, sizeof(s), "k%04d", i * 10);
+    snprintf(e, sizeof(e), "k%04d", i * 10 + 5);
+    state->AddTombstone(s, e, i + 1, bytewise_icmp_);
+  }
+  ASSERT_EQ(state->GetSnapshot()->sealed_run_count(), 4U);
+
+  std::atomic<bool> merge_paused{false};
+  std::atomic<bool> allow_publish{false};
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "AMTVState::BGMerge:AfterMergeBeforePublish", [&](void* /*arg*/) {
+        merge_paused.store(true);
+        while (!allow_publish.load()) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // Trigger merge on separate thread
+  std::thread bg_thread([&]() {
+    state->RunMergeSynchronously();
+  });
+
+  // Wait until merge thread is paused after building merged_run
+  while (!merge_paused.load()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+
+  // Foreground now adds 8 more tombstones (forms Run 5 and Run 6) + 2 open delta tombstones
+  for (int i = 16; i < 24; ++i) {
+    char s[16], e[16];
+    snprintf(s, sizeof(s), "k%04d", i * 10);
+    snprintf(e, sizeof(e), "k%04d", i * 10 + 5);
+    state->AddTombstone(s, e, i + 1, bytewise_icmp_);
+  }
+  state->AddTombstone("k9900", "k9905", 100, bytewise_icmp_);
+  state->AddTombstone("k9910", "k9915", 101, bytewise_icmp_);
+
+  // Snapshot before merge publishes has:
+  // 6 sealed runs (Run 1..6) and 2 open delta tombstones
+  auto snap_mid = state->GetSnapshot();
+  ASSERT_EQ(snap_mid->sealed_run_count(), 6U);
+  ASSERT_EQ(snap_mid->open_delta->size(), 2U);
+
+  // Allow merge task to publish
+  allow_publish.store(true);
+  bg_thread.join();
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // Verify:
+  // Merge published successfully:
+  // Run 1..4 replaced by merged run (index 0).
+  // Run 5 and Run 6 are retained at indices 1 and 2.
+  // Total sealed runs = 1 (merged) + 2 (runs 5 & 6) = 3!
+  auto snap_final = state->GetSnapshot();
+  ASSERT_EQ(snap_final->sealed_run_count(), 3U);
+  ASSERT_EQ(snap_final->open_delta->size(), 2U);
+  EXPECT_EQ(state->merge_completed(), 1U);
+
+  // Total tombstones must be EXACTLY 24 sealed + 2 open = 26!
+  EXPECT_EQ(snap_final->total_tombstones(), 26U);
+
+  // Check that all 26 tombstones are active and covering
+  AMTVMultiSourceAdapter adapter(snap_final, &bytewise_icmp_);
+  for (int i = 0; i < 24; ++i) {
+    char k[16];
+    snprintf(k, sizeof(k), "k%04d", i * 10 + 2);
+    EXPECT_EQ(adapter.MaxCoveringTombstoneSeqnum(k, 1000), static_cast<SequenceNumber>(i + 1));
+  }
+  EXPECT_EQ(adapter.MaxCoveringTombstoneSeqnum("k9902", 1000), 100U);
+  EXPECT_EQ(adapter.MaxCoveringTombstoneSeqnum("k9912", 1000), 101U);
+}
+
+TEST_F(AMTVTest, M2b_TaskGenerationInterleaving) {
+  // SyncPoint pause in BGMergeTask: AfterMergeBeforePublish.
+  // Foreground triggers MemTable transition to immutable / invalidates generation.
+  // Unpause merge task.
+  // Verify: merge task detects invalidation/generation mismatch, discards result, no UAF, no publish.
+  std::shared_ptr<AMTVState> state = std::make_shared<AMTVState>(
+      /*memtable_generation=*/42, /*delta_limit=*/4, /*merge_soft_limit=*/4,
+      /*hard_limit=*/8, &bytewise_icmp_);
+
+  for (int i = 0; i < 16; ++i) {
+    char s[16], e[16];
+    snprintf(s, sizeof(s), "k%04d", i * 10);
+    snprintf(e, sizeof(e), "k%04d", i * 10 + 5);
+    state->AddTombstone(s, e, i + 1, bytewise_icmp_);
+  }
+  ASSERT_EQ(state->GetSnapshot()->sealed_run_count(), 4U);
+
+  std::atomic<bool> merge_paused{false};
+  std::atomic<bool> allow_publish{false};
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "AMTVState::BGMerge:AfterMergeBeforePublish", [&](void* /*arg*/) {
+        merge_paused.store(true);
+        while (!allow_publish.load()) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  std::thread bg_thread([&]() {
+    state->RunMergeSynchronously();
+  });
+
+  while (!merge_paused.load()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+
+  // Foreground switches memtable: mark immutable and invalidate
+  state->MarkImmutable();
+
+  allow_publish.store(true);
+  bg_thread.join();
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // Verification:
+  // Merge was discarded because state became immutable!
+  EXPECT_EQ(state->merge_discarded(), 1U);
+  EXPECT_EQ(state->merge_completed(), 0U);
+  // Snapshot sealed runs remain 4 (not published)
+  EXPECT_EQ(state->GetSnapshot()->sealed_run_count(), 4U);
+}
+
+TEST_F(AMTVTest, M2b_OverloadBackoff) {
+  // Artificial overload: merge is blocked or cannot keep pace.
+  // Foreground continues writing until 8 sealed runs are formed.
+  // 9th run triggers sticky fallback.
+  // Fallback ceases delta accumulation.
+  // Get and MultiGet match native DB bit-for-bit.
+  Options opt;
+  opt.create_if_missing = true;
+  opt.enable_amtv = true;
+  opt.amtv_delta_tombstones = 4;
+  opt.amtv_merge_soft_limit = 100; // Artificially disable merge by setting soft limit high
+  opt.amtv_hard_layer_limit = 8;
+  opt.write_buffer_size = 64 * 1024 * 1024;
+
+  Options opt_native = opt;
+  opt_native.enable_amtv = false;
+
+  std::string db_amtv_path = test::PerThreadDBPath("amtv_m2b_overload_db");
+  std::string db_native_path = test::PerThreadDBPath("amtv_m2b_overload_native");
+  DestroyDB(db_amtv_path, Options()).PermitUncheckedError();
+  DestroyDB(db_native_path, Options()).PermitUncheckedError();
+
+  std::unique_ptr<DB> db_amtv;
+  std::unique_ptr<DB> db_native;
+  ASSERT_OK(DB::Open(opt, db_amtv_path, &db_amtv));
+  ASSERT_OK(DB::Open(opt_native, db_native_path, &db_native));
+
+  for (int i = 0; i < 50; ++i) {
+    char k[32], v[32];
+    snprintf(k, sizeof(k), "k%04d", i * 10);
+    snprintf(v, sizeof(v), "val%04d", i * 10);
+    ASSERT_OK(db_amtv->Put(WriteOptions(), k, v));
+    ASSERT_OK(db_native->Put(WriteOptions(), k, v));
+  }
+
+  // 8 runs * 4 = 32 tombstones.
+  // 36 tombstones = 8 sealed runs + 4 in open delta, 36th tombstone seals 9th run (9 > 8) -> sticky fallback!
+  for (int i = 0; i < 40; ++i) {
+    char s[32], e[32];
+    snprintf(s, sizeof(s), "k%04d", (i % 20) * 10 + 2);
+    snprintf(e, sizeof(e), "k%04d", (i % 20) * 10 + 7);
+    ASSERT_OK(db_amtv->DeleteRange(WriteOptions(), s, e));
+    ASSERT_OK(db_native->DeleteRange(WriteOptions(), s, e));
+  }
+
+  ColumnFamilyData* cfd = static_cast<ColumnFamilyHandleImpl*>(db_amtv->DefaultColumnFamily())->cfd();
+  AMTVState* state = cfd->mem()->GetAMTVState();
+  ASSERT_NE(state, nullptr);
+
+  auto snap = state->GetSnapshot();
+  EXPECT_TRUE(snap->fallback_required);
+  EXPECT_TRUE(state->is_fallback_required());
+  EXPECT_EQ(snap->sealed_runs.size(), 8U);
+  EXPECT_EQ(snap->open_delta->size(), 0U);
+  EXPECT_EQ(state->tombstones_at_fallback(), 36U);
+
+  // Verify Get & MultiGet match native DB
+  for (int i = 0; i < 50; ++i) {
+    char k[32];
+    snprintf(k, sizeof(k), "k%04d", i * 10);
+    std::string v_amtv, v_nat;
+    Status s_amtv = db_amtv->Get(ReadOptions(), k, &v_amtv);
+    Status s_nat = db_native->Get(ReadOptions(), k, &v_nat);
+    EXPECT_EQ(s_amtv.code(), s_nat.code());
+    if (s_amtv.ok()) {
+      EXPECT_EQ(v_amtv, v_nat);
+    }
+  }
+}
+
+TEST_F(AMTVTest, M2b_ControlledLongTermMerge) {
+  // Inject 20,000 tombstones (20k).
+  // delta=64, soft=4, hard=8.
+  // Ensure merges are performed so sealed runs stay <= 8 without fallback.
+  // Verify all runs traceable, zero semantic mismatch against external truth model.
+  std::shared_ptr<AMTVState> state = std::make_shared<AMTVState>(
+      /*memtable_generation=*/1, /*delta_limit=*/64, /*merge_soft_limit=*/4,
+      /*hard_limit=*/8, &bytewise_icmp_);
+
+  const int kTotalTombstones = 20000;
+  for (int i = 0; i < kTotalTombstones; ++i) {
+    char s[32], e[32];
+    snprintf(s, sizeof(s), "k%06d", (i % 2000) * 10);
+    snprintf(e, sizeof(e), "k%06d", (i % 2000) * 10 + 5);
+    state->AddTombstone(s, e, i + 1, bytewise_icmp_);
+
+    // When soft limit reached, wait for in-progress merge or run synchronously
+    if (state->GetSnapshot()->sealed_run_count() >= 4) {
+      while (state->is_merge_in_progress()) {
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+      }
+      if (state->GetSnapshot()->sealed_run_count() >= 4) {
+        state->RunMergeSynchronously();
+      }
+    }
+  }
+
+  while (state->is_merge_in_progress()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  if (state->GetSnapshot()->sealed_run_count() >= 4) {
+    state->RunMergeSynchronously();
+  }
+
+  auto snap = state->GetSnapshot();
+  EXPECT_FALSE(snap->fallback_required);
+  EXPECT_FALSE(state->is_fallback_required());
+  EXPECT_LE(snap->sealed_run_count(), 8U);
+  EXPECT_EQ(state->fallback_event_count(), 0U);
+  EXPECT_GT(state->merge_completed(), 50U);
+  EXPECT_EQ(state->tombstones_at_fallback(), 0U);
+  EXPECT_EQ(snap->total_tombstones(), static_cast<uint64_t>(kTotalTombstones));
+
+  fprintf(stderr, "\n========== M2b 20k AUDIT SUMMARY ==========\n%s\n===========================================\n",
+          state->GetAuditSummary().c_str());
 }
 
 }  // namespace ROCKSDB_NAMESPACE

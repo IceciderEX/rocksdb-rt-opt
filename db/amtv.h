@@ -14,6 +14,7 @@
 #include "db/range_tombstone_fragmenter.h"
 #include "port/port.h"
 #include "rocksdb/comparator.h"
+#include "rocksdb/env.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/types.h"
 #include "util/atomic.h"
@@ -110,8 +111,10 @@ struct AMTVSnapshot {
   uint64_t memtable_generation = 0;
   uint64_t publish_epoch = 0;
 
-  // Sealed runs: directory of immutable runs
-  std::vector<AMTVRun> sealed_runs;
+  // M2b: sealed_runs holds immutable shared_ptr<const AMTVRun>.
+  // Shallow copying during snapshot creation is O(runs) pointer copies,
+  // zero copying of raw entries.
+  std::vector<std::shared_ptr<const AMTVRun>> sealed_runs;
 
   // Open delta: unsealed range tombstones (< delta_tombstones_limit)
   std::shared_ptr<const OpenDelta> open_delta;
@@ -133,7 +136,9 @@ struct AMTVSnapshot {
   uint64_t total_tombstones() const {
     uint64_t count = 0;
     for (const auto& r : sealed_runs) {
-      count += r.tombstone_count;
+      if (r) {
+        count += r->tombstone_count;
+      }
     }
     if (open_delta) {
       count += open_delta->size();
@@ -171,13 +176,15 @@ class AMTVMultiSourceAdapter {
 };
 
 // AMTVState manages the lifecycle and atomic publication of AMTVSnapshot.
-class AMTVState {
+class AMTVState : public std::enable_shared_from_this<AMTVState> {
  public:
   explicit AMTVState(uint64_t memtable_generation = 0,
                      uint32_t delta_tombstones_limit = 64,
                      uint32_t merge_soft_limit = 4,
-                     uint32_t hard_layer_limit = 8);
-  ~AMTVState() = default;
+                     uint32_t hard_layer_limit = 8,
+                     const InternalKeyComparator* icmp = nullptr,
+                     Env* env = nullptr);
+  ~AMTVState();
 
   // Read path: acquire snapshot lock-free.
   std::shared_ptr<const AMTVSnapshot> GetSnapshot() const {
@@ -191,7 +198,27 @@ class AMTVState {
   // Freeze open delta into a new sealed AMTVRun.
   void FreezeOpenDelta(const InternalKeyComparator& icmp);
 
-  // Telemetry & metrics (recorded only upon fallback to protect hot paths)
+  // Background merge scheduling & task
+  void MaybeScheduleMerge();
+  static void BGMergeWrapper(void* arg);
+  void BGMergeTask();
+  bool RunMergeSynchronously();
+
+  // Lifecycle transitions
+  void MarkImmutable() {
+    is_immutable_.store(true, std::memory_order_release);
+  }
+  void Invalidate() {
+    is_invalidated_.store(true, std::memory_order_release);
+  }
+  bool is_immutable() const {
+    return is_immutable_.load(std::memory_order_relaxed);
+  }
+  bool is_invalidated() const {
+    return is_invalidated_.load(std::memory_order_relaxed);
+  }
+
+  // Telemetry & metrics (recorded on low-frequency paths: seal, merge, fallback)
   void RecordGetFallback() {
     fallback_to_native_count_.fetch_add(1, std::memory_order_relaxed);
   }
@@ -211,32 +238,80 @@ class AMTVState {
   bool is_fallback_required() const {
     return fallback_required_.load(std::memory_order_relaxed);
   }
+  bool is_merge_in_progress() const {
+    return merge_in_progress_.load(std::memory_order_relaxed);
+  }
+
+  uint64_t merge_requested() const {
+    return merge_requested_.load(std::memory_order_relaxed);
+  }
+  uint64_t merge_completed() const {
+    return merge_completed_.load(std::memory_order_relaxed);
+  }
+  uint64_t merge_discarded() const {
+    return merge_discarded_.load(std::memory_order_relaxed);
+  }
+  uint64_t merge_failed() const {
+    return merge_failed_.load(std::memory_order_relaxed);
+  }
+  uint64_t merge_input_run_count() const {
+    return merge_input_run_count_.load(std::memory_order_relaxed);
+  }
+  uint64_t merge_input_tombstones() const {
+    return merge_input_tombstones_.load(std::memory_order_relaxed);
+  }
+  uint64_t merge_wall_time_nanos() const {
+    return merge_wall_time_nanos_.load(std::memory_order_relaxed);
+  }
+  uint64_t fallback_event_count() const {
+    return fallback_event_count_.load(std::memory_order_relaxed);
+  }
 
   uint64_t memtable_generation() const { return memtable_generation_; }
   uint32_t delta_tombstones_limit() const { return delta_tombstones_limit_; }
   uint32_t merge_soft_limit() const { return merge_soft_limit_; }
   uint32_t hard_layer_limit() const { return hard_layer_limit_; }
 
+  std::string GetAuditSummary() const;
+
  private:
   const uint64_t memtable_generation_;
   const uint32_t delta_tombstones_limit_;
   const uint32_t merge_soft_limit_;
   const uint32_t hard_layer_limit_;
+  const InternalKeyComparator* icmp_{nullptr};
+  std::unique_ptr<InternalKeyComparator> fallback_icmp_;
+  Env* env_{nullptr};
 
   // Synchronizes write-side mutations. Never entered by readers.
   mutable port::Mutex write_mutex_;
 
-  // Next run_id to assign to a newly sealed AMTVRun. Protected by write_mutex_.
-  uint64_t next_run_id_{1};
+  // Next run_id to assign to a newly sealed AMTVRun. Protected by write_mutex_ or atomic.
+  std::atomic<uint64_t> next_run_id_{1};
 
   // Atomic pointer holding current immutable snapshot.
   std::shared_ptr<const AMTVSnapshot> snapshot_;
+
+  // Concurrency & Lifecycle flags
+  std::atomic<bool> merge_in_progress_{false};
+  std::atomic<bool> is_immutable_{false};
+  std::atomic<bool> is_invalidated_{false};
 
   // Fast write-side atomic flag to immediately stop delta accumulation
   std::atomic<bool> fallback_required_{false};
   std::atomic<uint64_t> tombstones_at_fallback_{0};
   std::atomic<uint32_t> peak_sealed_layers_{0};
   std::atomic<uint64_t> fallback_to_native_count_{0};
+
+  // M2b Audit metrics
+  std::atomic<uint64_t> merge_requested_{0};
+  std::atomic<uint64_t> merge_completed_{0};
+  std::atomic<uint64_t> merge_discarded_{0};
+  std::atomic<uint64_t> merge_failed_{0};
+  std::atomic<uint64_t> merge_input_run_count_{0};
+  std::atomic<uint64_t> merge_input_tombstones_{0};
+  std::atomic<uint64_t> merge_wall_time_nanos_{0};
+  std::atomic<uint64_t> fallback_event_count_{0};
 };
 
 }  // namespace ROCKSDB_NAMESPACE

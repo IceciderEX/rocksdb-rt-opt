@@ -76,6 +76,7 @@ struct ImmutableMemTableOptions {
   uint32_t amtv_merge_soft_limit;
   uint32_t amtv_hard_layer_limit;
   uint32_t amtv_max_sealed_deltas;
+  Env* env;
 };
 
 // Batched counters to updated when inserting keys in one write batch.
@@ -839,6 +840,9 @@ class MemTable final : public ReadOnlyMemTable {
     is_immutable_.StoreRelaxed(true);
     table_->MarkReadOnly();
     mem_tracker_.DoneAllocating();
+    if (amtv_state_) {
+      amtv_state_->MarkImmutable();
+    }
   }
 
   void MarkFlushed() override { table_->MarkFlushed(); }
@@ -871,6 +875,7 @@ class MemTable final : public ReadOnlyMemTable {
   bool IsAMTVEnabled() const { return moptions_.enable_amtv; }
   AMTVState* GetAMTVState() { return amtv_state_.get(); }
   const AMTVState* GetAMTVState() const { return amtv_state_.get(); }
+  std::shared_ptr<AMTVState> GetAMTVStateShared() { return amtv_state_; }
 
   uint64_t ApproximateOldestKeyTime() const override {
     return oldest_key_time_.load(std::memory_order_relaxed);
@@ -935,7 +940,7 @@ class MemTable final : public ReadOnlyMemTable {
   ConcurrentArena arena_;
   std::unique_ptr<MemTableRep> table_;
   std::unique_ptr<MemTableRep> range_del_table_;
-  std::unique_ptr<AMTVState> amtv_state_;
+  std::shared_ptr<AMTVState> amtv_state_;
   // This is OK to be relaxed access because consistency between table_ and
   // range_del_table_ is provided by explicit multi-versioning with sequence
   // numbers. It's ok for stale memory to say the range_del_table_ is empty when

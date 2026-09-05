@@ -144,7 +144,8 @@ ImmutableMemTableOptions::ImmutableMemTableOptions(
       amtv_delta_tombstones(ioptions.amtv_delta_tombstones),
       amtv_merge_soft_limit(ioptions.amtv_merge_soft_limit),
       amtv_hard_layer_limit(ioptions.amtv_hard_layer_limit),
-      amtv_max_sealed_deltas(ioptions.amtv_hard_layer_limit) {}
+      amtv_max_sealed_deltas(ioptions.amtv_hard_layer_limit),
+      env(ioptions.env) {}
 
 void ReadOnlyMemTable::ProtectSealedBlobFiles(
     const std::shared_ptr<BlobFilePartitionManager>& blob_partition_manager,
@@ -273,13 +274,17 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
   assert(ucmp);
   ts_sz_ = ucmp->timestamp_size();
   if (moptions_.enable_amtv) {
-    amtv_state_ = std::make_unique<AMTVState>(
+    amtv_state_ = std::make_shared<AMTVState>(
         GetID(), moptions_.amtv_delta_tombstones,
-        moptions_.amtv_merge_soft_limit, moptions_.amtv_hard_layer_limit);
+        moptions_.amtv_merge_soft_limit, moptions_.amtv_hard_layer_limit,
+        &cmp, moptions_.env);
   }
 }
 
 MemTable::~MemTable() {
+  if (amtv_state_) {
+    amtv_state_->Invalidate();
+  }
   mem_tracker_.FreeMem();
   assert(refs_ == 0);
 }
