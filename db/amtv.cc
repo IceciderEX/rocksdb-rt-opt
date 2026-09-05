@@ -6,6 +6,9 @@
 #include "db/amtv.h"
 
 #include <algorithm>
+#include <limits>
+#include <map>
+#include <time.h>
 
 #include "test_util/sync_point.h"
 #include "util/vector_iterator.h"
@@ -14,9 +17,13 @@ namespace ROCKSDB_NAMESPACE {
 
 std::atomic<uint64_t> test_open_delta_materialize_count{0};
 
-AMTVRun::AMTVRun(uint64_t id, std::vector<OpenDeltaEntry> entries,
+AMTVRun::AMTVRun(uint64_t id, uint32_t lvl, uint64_t chunk_count, bool partial,
+                 std::vector<OpenDeltaEntry> entries,
                  const InternalKeyComparator& icmp)
     : run_id(id),
+      level(lvl),
+      source_chunk_count(chunk_count),
+      is_partial(partial),
       raw_entries(std::move(entries)),
       tombstone_count(raw_entries.size()),
       min_seq(kMaxSequenceNumber),
@@ -44,6 +51,67 @@ AMTVRun::AMTVRun(uint64_t id, std::vector<OpenDeltaEntry> entries,
                                                std::move(values), &icmp);
   fragmented_list =
       std::make_shared<FragmentedRangeTombstoneList>(std::move(iter), icmp);
+}
+
+bool FindMergePair(
+    const std::vector<std::shared_ptr<const AMTVRun>>& sealed_runs,
+    std::shared_ptr<const AMTVRun>* out_run_a,
+    std::shared_ptr<const AMTVRun>* out_run_b) {
+  if (sealed_runs.size() < 2) {
+    return false;
+  }
+  uint32_t min_level = std::numeric_limits<uint32_t>::max();
+  bool found_level = false;
+
+  // Find lowest level that has at least two non-partial runs with same source_chunk_count
+  for (size_t i = 0; i < sealed_runs.size(); ++i) {
+    const auto& r1 = sealed_runs[i];
+    if (!r1 || r1->is_partial) continue;
+    for (size_t j = i + 1; j < sealed_runs.size(); ++j) {
+      const auto& r2 = sealed_runs[j];
+      if (!r2 || r2->is_partial) continue;
+      if (CanMergeRuns(*r1, *r2)) {
+        if (!found_level || r1->level < min_level) {
+          min_level = r1->level;
+          found_level = true;
+        }
+      }
+    }
+  }
+
+  if (!found_level) {
+    return false;
+  }
+
+  std::vector<std::shared_ptr<const AMTVRun>> candidates;
+  for (const auto& r : sealed_runs) {
+    if (r && !r->is_partial && r->level == min_level) {
+      candidates.push_back(r);
+    }
+  }
+
+  std::sort(candidates.begin(), candidates.end(),
+            [](const std::shared_ptr<const AMTVRun>& a,
+               const std::shared_ptr<const AMTVRun>& b) {
+              return a->run_id < b->run_id;
+            });
+
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    for (size_t j = i + 1; j < candidates.size(); ++j) {
+      if (CanMergeRuns(*candidates[i], *candidates[j])) {
+        if (out_run_a) *out_run_a = candidates[i];
+        if (out_run_b) *out_run_b = candidates[j];
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+bool HasMergeablePair(
+    const std::vector<std::shared_ptr<const AMTVRun>>& sealed_runs) {
+  return FindMergePair(sealed_runs, nullptr, nullptr);
 }
 
 void OpenDelta::AddEntry(const Slice& start_user_key,
@@ -209,7 +277,8 @@ AMTVState::AMTVState(uint64_t memtable_generation,
       merge_soft_limit_(merge_soft_limit),
       hard_layer_limit_(hard_layer_limit),
       icmp_(icmp),
-      env_(env ? env : Env::Default()) {
+      env_(env ? env : Env::Default()),
+      task_cond_(&task_mu_) {
   if (icmp_ == nullptr) {
     fallback_icmp_ =
         std::make_unique<InternalKeyComparator>(BytewiseComparator());
@@ -224,7 +293,72 @@ AMTVState::AMTVState(uint64_t memtable_generation,
 }
 
 AMTVState::~AMTVState() {
-  Invalidate();
+  CancelAndDrain();
+}
+
+void AMTVState::CancelAndDrain() {
+  is_invalidated_.store(true, std::memory_order_release);
+
+  // Unschedule any pending tasks from BOTTOM and LOW queues
+  if (env_) {
+    env_->UnSchedule(this, Env::Priority::BOTTOM);
+    env_->UnSchedule(this, Env::Priority::LOW);
+  }
+
+  // Wait for all queued and running tasks to drain completely without holding write_mutex_
+  {
+    MutexLock l(&task_mu_);
+    while (queued_tasks_ > 0 || running_tasks_ > 0) {
+      task_cond_.Wait();
+    }
+  }
+}
+
+bool AMTVState::IsMergeStable() const {
+  if (merge_in_progress_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  {
+    MutexLock l(&task_mu_);
+    if (queued_tasks_ > 0 || running_tasks_ > 0) {
+      return false;
+    }
+  }
+  auto snap = GetSnapshot();
+  if (!snap || snap->fallback_required) {
+    return true;
+  }
+  return !HasMergeablePair(snap->sealed_runs);
+}
+
+void AMTVState::WaitForMergeStable() {
+  MutexLock l(&task_mu_);
+  while (true) {
+    if (!merge_in_progress_.load(std::memory_order_acquire) &&
+        queued_tasks_ == 0 && running_tasks_ == 0) {
+      auto snap = GetSnapshot();
+      if (!snap || snap->fallback_required ||
+          !HasMergeablePair(snap->sealed_runs)) {
+        break;
+      }
+    }
+    task_cond_.Wait();
+  }
+}
+
+int AMTVState::queued_tasks() const {
+  MutexLock l(&task_mu_);
+  return queued_tasks_;
+}
+
+int AMTVState::running_tasks() const {
+  MutexLock l(&task_mu_);
+  return running_tasks_;
+}
+
+std::string AMTVState::priority_used() const {
+  MutexLock l(&task_mu_);
+  return priority_used_;
 }
 
 void AMTVState::AddTombstone(const Slice& start_user_key,
@@ -256,23 +390,25 @@ void AMTVState::AddTombstone(const Slice& start_user_key,
     new_open->AddEntry(start_user_key, end_user_key, seq);
 
     if (new_open->size() >= delta_tombstones_limit_) {
-      // P0 constraint 2: projected_sealed_runs > amtv_hard_layer_limit
+      // P0 constraint 2: projected_sealed_runs > amtv_hard_layer_limit (hard_run_limit)
       // triggers fallback_required. Up to hard_layer_limit_ (e.g. 8) sealed
       // runs are served normally; only when a 9th sealed run would form do we fall back.
       uint32_t projected_sealed_runs = cur_snap->sealed_run_count() + 1;
       if (projected_sealed_runs > hard_layer_limit_) {
         new_snap->fallback_required = true;
-        // Fixed in M2a.1: cur_snap->total_tombstones() + 1 exactly reflects total
-        // tombstones at fallback entry (current snap total + 1 newly added tombstone).
+        // cur_snap->total_tombstones() + 1 reflects exact total tombstones at fallback entry
         new_snap->tombstones_at_fallback = cur_snap->total_tombstones() + 1;
         tombstones_at_fallback_.store(new_snap->tombstones_at_fallback,
                                       std::memory_order_relaxed);
+        runs_at_fallback_.store(cur_snap->sealed_run_count(),
+                                std::memory_order_relaxed);
         fallback_required_.store(true, std::memory_order_relaxed);
         fallback_event_count_.fetch_add(1, std::memory_order_relaxed);
         new_snap->open_delta = std::make_shared<OpenDelta>();
       } else {
         auto new_run = std::make_shared<const AMTVRun>(
-            next_run_id_++, new_open->entries(), icmp);
+            next_run_id_++, /*level=*/0, /*chunk_count=*/1, /*is_partial=*/false,
+            new_open->entries(), icmp);
         new_snap->sealed_runs.push_back(std::move(new_run));
         new_snap->open_delta = std::make_shared<OpenDelta>();
         uint32_t current_runs = new_snap->sealed_run_count();
@@ -281,7 +417,21 @@ void AMTVState::AddTombstone(const Slice& start_user_key,
                !peak_sealed_layers_.compare_exchange_weak(
                    prev_peak, current_runs, std::memory_order_relaxed)) {
         }
-        if (current_runs >= merge_soft_limit_) {
+        peak_run_level_histogram_[0] =
+            std::max(peak_run_level_histogram_[0], 1U);
+
+        uint64_t current_raw_bytes = 0;
+        for (const auto& r : new_snap->sealed_runs) {
+          if (r) current_raw_bytes += r->raw_entries.size() * sizeof(OpenDeltaEntry);
+        }
+        uint64_t prev_raw_peak = raw_entries_bytes_peak_.load(std::memory_order_relaxed);
+        while (current_raw_bytes > prev_raw_peak &&
+               !raw_entries_bytes_peak_.compare_exchange_weak(
+                   prev_raw_peak, current_raw_bytes, std::memory_order_relaxed)) {
+        }
+
+        if (current_runs >= merge_soft_limit_ &&
+            HasMergeablePair(new_snap->sealed_runs)) {
           should_schedule_merge = true;
         }
       }
@@ -324,17 +474,21 @@ void AMTVState::FreezeOpenDelta(const InternalKeyComparator& icmp) {
     uint32_t projected_sealed_runs = cur_snap->sealed_run_count() + 1;
     if (projected_sealed_runs > hard_layer_limit_) {
       new_snap->fallback_required = true;
-      // Fixed in M2a.1: cur_snap->total_tombstones() already includes cur_snap->open_delta->size().
-      // Must NOT add open_delta again.
       new_snap->tombstones_at_fallback = cur_snap->total_tombstones();
       tombstones_at_fallback_.store(new_snap->tombstones_at_fallback,
                                     std::memory_order_relaxed);
+      runs_at_fallback_.store(cur_snap->sealed_run_count(),
+                              std::memory_order_relaxed);
       fallback_required_.store(true, std::memory_order_relaxed);
       fallback_event_count_.fetch_add(1, std::memory_order_relaxed);
       new_snap->open_delta = std::make_shared<OpenDelta>();
     } else {
+      bool is_partial =
+          (cur_snap->open_delta->size() < delta_tombstones_limit_);
+      uint64_t chunk_count = is_partial ? 0 : 1;
       auto new_run = std::make_shared<const AMTVRun>(
-          next_run_id_++, cur_snap->open_delta->entries(), icmp);
+          next_run_id_++, /*level=*/0, chunk_count, is_partial,
+          cur_snap->open_delta->entries(), icmp);
       new_snap->sealed_runs.push_back(std::move(new_run));
       new_snap->open_delta = std::make_shared<OpenDelta>();
       uint32_t current_runs = new_snap->sealed_run_count();
@@ -343,7 +497,11 @@ void AMTVState::FreezeOpenDelta(const InternalKeyComparator& icmp) {
              !peak_sealed_layers_.compare_exchange_weak(
                  prev_peak, current_runs, std::memory_order_relaxed)) {
       }
-      if (current_runs >= merge_soft_limit_) {
+      peak_run_level_histogram_[0] =
+          std::max(peak_run_level_histogram_[0], 1U);
+
+      if (!is_partial && current_runs >= merge_soft_limit_ &&
+          HasMergeablePair(new_snap->sealed_runs)) {
         should_schedule_merge = true;
       }
     }
@@ -368,7 +526,8 @@ void AMTVState::MaybeScheduleMerge() {
   }
   auto snap = GetSnapshot();
   if (!snap || snap->fallback_required ||
-      snap->sealed_runs.size() < merge_soft_limit_) {
+      snap->sealed_runs.size() < merge_soft_limit_ ||
+      !HasMergeablePair(snap->sealed_runs)) {
     return;
   }
 
@@ -388,9 +547,29 @@ void AMTVState::MaybeScheduleMerge() {
   }
 
   Env* env = env_ ? env_ : Env::Default();
+  Env::Priority priority = Env::Priority::LOW;
+  std::string pri_str;
+  if (env->GetBackgroundThreads(Env::Priority::BOTTOM) > 0) {
+    priority = Env::Priority::BOTTOM;
+    pri_str = "BOTTOM";
+  } else {
+    priority = Env::Priority::LOW;
+    pri_str = "LOW (Env::Priority::BOTTOM threads == 0)";
+  }
+
+  uint64_t sched_time = env->NowNanos();
+  {
+    MutexLock l(&task_mu_);
+    queued_tasks_++;
+    last_scheduled_priority_ = priority;
+    priority_used_ = std::move(pri_str);
+    last_scheduled_time_nanos_ = sched_time;
+  }
+
   auto* arg = new std::shared_ptr<AMTVState>(self);
   TEST_SYNC_POINT("AMTVState::MaybeScheduleMerge:BeforeSchedule");
-  env->Schedule(&AMTVState::BGMergeWrapper, arg, Env::Priority::LOW);
+  env->Schedule(&AMTVState::BGMergeWrapper, arg, priority, this,
+                &AMTVState::BGMergeUnschedule);
 }
 
 void AMTVState::BGMergeWrapper(void* arg) {
@@ -402,7 +581,34 @@ void AMTVState::BGMergeWrapper(void* arg) {
   }
 }
 
+void AMTVState::BGMergeUnschedule(void* arg) {
+  std::unique_ptr<std::shared_ptr<AMTVState>> holder(
+      static_cast<std::shared_ptr<AMTVState>*>(arg));
+  std::shared_ptr<AMTVState> state = *holder;
+  if (state) {
+    state->OnTaskUnscheduled();
+  }
+}
+
+void AMTVState::OnTaskUnscheduled() {
+  {
+    MutexLock l(&task_mu_);
+    if (queued_tasks_ > 0) {
+      queued_tasks_--;
+    }
+    merge_unscheduled_.fetch_add(1, std::memory_order_relaxed);
+    task_cond_.SignalAll();
+  }
+  merge_in_progress_.store(false, std::memory_order_release);
+}
+
 bool AMTVState::RunMergeSynchronously() {
+  auto snap = GetSnapshot();
+  if (!snap || snap->fallback_required ||
+      snap->sealed_runs.size() < merge_soft_limit_ ||
+      !HasMergeablePair(snap->sealed_runs)) {
+    return false;
+  }
   bool expected = false;
   if (!merge_in_progress_.compare_exchange_strong(expected, true)) {
     return false;
@@ -413,7 +619,37 @@ bool AMTVState::RunMergeSynchronously() {
 }
 
 void AMTVState::BGMergeTask() {
-  uint64_t start_time = (env_ ? env_ : Env::Default())->NowNanos();
+  Env* env = env_ ? env_ : Env::Default();
+  uint64_t start_wall_time = env->NowNanos();
+
+  struct timespec start_cpu_ts;
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &start_cpu_ts);
+
+  {
+    MutexLock l(&task_mu_);
+    if (queued_tasks_ > 0) {
+      queued_tasks_--;
+    }
+    running_tasks_++;
+    if (last_scheduled_time_nanos_ > 0 &&
+        start_wall_time >= last_scheduled_time_nanos_) {
+      task_queue_wait_time_nanos_.fetch_add(
+          start_wall_time - last_scheduled_time_nanos_,
+          std::memory_order_relaxed);
+    }
+  }
+
+  auto cleanup_running = [&]() {
+    {
+      MutexLock l(&task_mu_);
+      running_tasks_--;
+      task_cond_.SignalAll();
+    }
+    merge_in_progress_.store(false, std::memory_order_release);
+    TEST_SYNC_POINT("AMTVState::BGMerge:TaskEnd");
+    // P0-2: Unconditionally try to schedule the next merge before exiting
+    MaybeScheduleMerge();
+  };
 
   // 1. Initial snapshot check
   auto snap = GetSnapshot();
@@ -422,25 +658,34 @@ void AMTVState::BGMergeTask() {
       is_invalidated_.load(std::memory_order_relaxed) ||
       snap->sealed_runs.size() < merge_soft_limit_) {
     merge_discarded_.fetch_add(1, std::memory_order_relaxed);
-    merge_in_progress_.store(false, std::memory_order_release);
+    cleanup_running();
     return;
   }
 
-  // 2. Select oldest 4 runs
-  const size_t kMergeInputs = 4;
-  std::vector<std::shared_ptr<const AMTVRun>> input_runs;
-  std::vector<uint64_t> input_run_ids;
-  input_runs.reserve(kMergeInputs);
-  input_run_ids.reserve(kMergeInputs);
-
-  for (size_t i = 0; i < kMergeInputs; ++i) {
-    input_runs.push_back(snap->sealed_runs[i]);
-    input_run_ids.push_back(snap->sealed_runs[i]->run_id);
+  // 2. Select lowest level pair of same-level non-partial runs
+  std::shared_ptr<const AMTVRun> run_a, run_b;
+  if (!FindMergePair(snap->sealed_runs, &run_a, &run_b)) {
+    merge_discarded_.fetch_add(1, std::memory_order_relaxed);
+    cleanup_running();
+    return;
   }
 
-  uint64_t total_input_tombstones = 0;
-  for (const auto& r : input_runs) {
-    total_input_tombstones += r->raw_entries.size();
+  uint64_t run_a_id = run_a->run_id;
+  uint64_t run_b_id = run_b->run_id;
+  uint32_t input_level = run_a->level;
+  uint64_t input_chunk_count = run_a->source_chunk_count;
+  uint32_t new_level = input_level + 1;
+  uint64_t new_chunk_count =
+      run_a->source_chunk_count + run_b->source_chunk_count;
+  uint64_t total_input_tombstones =
+      run_a->raw_entries.size() + run_b->raw_entries.size();
+
+  uint64_t in_flight_bytes = total_input_tombstones * sizeof(OpenDeltaEntry);
+  uint64_t prev_in_flight =
+      in_flight_merge_bytes_peak_.load(std::memory_order_relaxed);
+  while (in_flight_bytes > prev_in_flight &&
+         !in_flight_merge_bytes_peak_.compare_exchange_weak(
+             prev_in_flight, in_flight_bytes, std::memory_order_relaxed)) {
   }
 
   TEST_SYNC_POINT("AMTVState::BGMerge:BeforeMerge");
@@ -448,22 +693,23 @@ void AMTVState::BGMergeTask() {
   // 3. Rebuild merged run outside of write_mutex_ from raw_entries
   std::vector<OpenDeltaEntry> merged_entries;
   merged_entries.reserve(total_input_tombstones);
-  for (const auto& r : input_runs) {
-    merged_entries.insert(merged_entries.end(), r->raw_entries.begin(),
-                          r->raw_entries.end());
-  }
+  // Deterministic order: smaller run_id first
+  merged_entries.insert(merged_entries.end(), run_a->raw_entries.begin(),
+                        run_a->raw_entries.end());
+  merged_entries.insert(merged_entries.end(), run_b->raw_entries.begin(),
+                        run_b->raw_entries.end());
 
   const InternalKeyComparator* icmp_to_use = icmp_;
   assert(icmp_to_use != nullptr);
 
   uint64_t merged_run_id = next_run_id_.fetch_add(1, std::memory_order_relaxed);
   auto merged_run = std::make_shared<const AMTVRun>(
-      merged_run_id, std::move(merged_entries), *icmp_to_use);
+      merged_run_id, new_level, new_chunk_count, /*is_partial=*/false,
+      std::move(merged_entries), *icmp_to_use);
 
   TEST_SYNC_POINT("AMTVState::BGMerge:AfterMergeBeforePublish");
 
   // 4. Critical Section: check conditions and publish
-  bool reschedule = false;
   {
     MutexLock l(&write_mutex_);
 
@@ -482,17 +728,22 @@ void AMTVState::BGMergeTask() {
       can_publish = false;
     }
 
-    // Check input run_ids still exist at index 0..3 in cur_snap->sealed_runs
+    // Check both run_a_id and run_b_id still exist in cur_snap->sealed_runs
+    // with same level & chunk_count
     if (can_publish) {
-      if (cur_snap->sealed_runs.size() < kMergeInputs) {
-        can_publish = false;
-      } else {
-        for (size_t i = 0; i < kMergeInputs; ++i) {
-          if (cur_snap->sealed_runs[i]->run_id != input_run_ids[i]) {
-            can_publish = false;
-            break;
-          }
+      bool found_a = false, found_b = false;
+      for (const auto& r : cur_snap->sealed_runs) {
+        if (r && r->run_id == run_a_id && r->level == input_level &&
+            r->source_chunk_count == input_chunk_count && !r->is_partial) {
+          found_a = true;
         }
+        if (r && r->run_id == run_b_id && r->level == input_level &&
+            r->source_chunk_count == input_chunk_count && !r->is_partial) {
+          found_b = true;
+        }
+      }
+      if (!found_a || !found_b) {
+        can_publish = false;
       }
     }
 
@@ -502,14 +753,20 @@ void AMTVState::BGMergeTask() {
       new_snap->publish_epoch = cur_snap->publish_epoch + 1;
       new_snap->fallback_required = false;
       new_snap->tombstones_at_fallback = 0;
-
-      new_snap->sealed_runs.reserve(cur_snap->sealed_runs.size() - kMergeInputs + 1);
-      new_snap->sealed_runs.push_back(merged_run);
-      for (size_t i = kMergeInputs; i < cur_snap->sealed_runs.size(); ++i) {
-        new_snap->sealed_runs.push_back(cur_snap->sealed_runs[i]);
-      }
-
       new_snap->open_delta = cur_snap->open_delta;
+
+      new_snap->sealed_runs.reserve(cur_snap->sealed_runs.size() - 1);
+      bool replaced_first = false;
+      for (const auto& r : cur_snap->sealed_runs) {
+        if (r && (r->run_id == run_a_id || r->run_id == run_b_id)) {
+          if (!replaced_first) {
+            new_snap->sealed_runs.push_back(merged_run);
+            replaced_first = true;
+          }
+        } else {
+          new_snap->sealed_runs.push_back(r);
+        }
+      }
 
       TEST_SYNC_POINT("AMTVState::BGMerge:BeforeAtomicPublish");
       AtomicSharedPtrStore(&snapshot_,
@@ -517,54 +774,148 @@ void AMTVState::BGMergeTask() {
                            std::memory_order_release);
 
       merge_completed_.fetch_add(1, std::memory_order_relaxed);
-      merge_input_run_count_.fetch_add(kMergeInputs, std::memory_order_relaxed);
+      merge_input_run_count_.fetch_add(2, std::memory_order_relaxed);
       merge_input_tombstones_.fetch_add(total_input_tombstones,
                                         std::memory_order_relaxed);
-      uint64_t elapsed = (env_ ? env_ : Env::Default())->NowNanos() - start_time;
-      merge_wall_time_nanos_.fetch_add(elapsed, std::memory_order_relaxed);
+      merge_count_per_level_[input_level]++;
+      merge_input_tombstones_per_level_[input_level] += total_input_tombstones;
+      peak_run_level_histogram_[new_level] =
+          std::max(peak_run_level_histogram_[new_level], 1U);
 
-      auto published = AtomicSharedPtrLoad(&snapshot_, std::memory_order_relaxed);
-      if (published && published->sealed_runs.size() >= merge_soft_limit_) {
-        reschedule = true;
-      }
+      uint64_t elapsed_wall = env->NowNanos() - start_wall_time;
+      merge_wall_time_nanos_.fetch_add(elapsed_wall, std::memory_order_relaxed);
+
+      struct timespec end_cpu_ts;
+      clock_gettime(CLOCK_THREAD_CPUTIME_ID, &end_cpu_ts);
+      uint64_t elapsed_cpu =
+          (end_cpu_ts.tv_sec - start_cpu_ts.tv_sec) * 1000000000ULL +
+          (end_cpu_ts.tv_nsec - start_cpu_ts.tv_nsec);
+      merge_cpu_time_nanos_.fetch_add(elapsed_cpu, std::memory_order_relaxed);
     } else {
       merge_discarded_.fetch_add(1, std::memory_order_relaxed);
-      if (cur_snap && !cur_snap->fallback_required &&
-          !is_immutable_.load(std::memory_order_relaxed) &&
-          !is_invalidated_.load(std::memory_order_relaxed) &&
-          cur_snap->sealed_runs.size() >= merge_soft_limit_) {
-        reschedule = true;
-      }
     }
     TEST_SYNC_POINT("AMTVState::BGMerge:AfterPublish");
   }
 
-  merge_in_progress_.store(false, std::memory_order_release);
-
-  if (reschedule) {
-    MaybeScheduleMerge();
-  }
+  cleanup_running();
 }
 
-std::string AMTVState::GetAuditSummary() const {
-  char buf[512];
-  snprintf(buf, sizeof(buf),
-           "sealed_run_peak: %u, merge_requested: %llu, merge_completed: %llu, "
-           "merge_discarded: %llu, merge_failed: %llu, "
-           "merge_input_runs: %llu, merge_input_tombstones: %llu, "
-           "merge_wall_time_us: %llu, fallback_event_count: %llu, "
-           "fallback_get_count: %llu, tombstones_at_fallback: %llu",
-           peak_sealed_runs(),
-           static_cast<unsigned long long>(merge_requested()),
-           static_cast<unsigned long long>(merge_completed()),
-           static_cast<unsigned long long>(merge_discarded()),
-           static_cast<unsigned long long>(merge_failed()),
-           static_cast<unsigned long long>(merge_input_run_count()),
-           static_cast<unsigned long long>(merge_input_tombstones()),
-           static_cast<unsigned long long>(merge_wall_time_nanos() / 1000),
-           static_cast<unsigned long long>(fallback_event_count()),
-           static_cast<unsigned long long>(get_fallback_to_native_count()),
-           static_cast<unsigned long long>(tombstones_at_fallback()));
+std::string AMTVState::GetAuditSummary(uint64_t original_tombstones) const {
+  std::map<uint32_t, uint32_t> curr_level_hist;
+  auto snap = GetSnapshot();
+  uint64_t current_raw_entries = 0;
+  if (snap) {
+    for (const auto& r : snap->sealed_runs) {
+      if (r) {
+        curr_level_hist[r->level]++;
+        current_raw_entries += r->raw_entries.size();
+      }
+    }
+    if (snap->open_delta) {
+      current_raw_entries += snap->open_delta->size();
+    }
+  }
+
+  std::string curr_hist_str = "{";
+  bool first = true;
+  for (const auto& p : curr_level_hist) {
+    if (!first) curr_hist_str += ", ";
+    curr_hist_str += "L" + std::to_string(p.first) + ": " + std::to_string(p.second);
+    first = false;
+  }
+  curr_hist_str += "}";
+
+  std::string peak_hist_str = "{";
+  first = true;
+  {
+    MutexLock l(&write_mutex_);
+    for (const auto& p : peak_run_level_histogram_) {
+      if (!first) peak_hist_str += ", ";
+      peak_hist_str += "L" + std::to_string(p.first) + ": " + std::to_string(p.second);
+      first = false;
+    }
+  }
+  peak_hist_str += "}";
+
+  std::string per_level_merges_str = "{";
+  first = true;
+  {
+    MutexLock l(&write_mutex_);
+    for (const auto& p : merge_count_per_level_) {
+      if (!first) per_level_merges_str += ", ";
+      uint64_t tombstones = 0;
+      auto it = merge_input_tombstones_per_level_.find(p.first);
+      if (it != merge_input_tombstones_per_level_.end()) {
+        tombstones = it->second;
+      }
+      per_level_merges_str += "L" + std::to_string(p.first) + "->L" +
+                              std::to_string(p.first + 1) + ": (" +
+                              std::to_string(p.second) + " merges, " +
+                              std::to_string(tombstones) + " tombstones)";
+      first = false;
+    }
+  }
+  per_level_merges_str += "}";
+
+  double amp_ratio = 0.0;
+  if (original_tombstones > 0) {
+    amp_ratio =
+        static_cast<double>(merge_input_tombstones()) / original_tombstones;
+  }
+
+  char buf[2048];
+  snprintf(
+      buf, sizeof(buf),
+      "run_level_histogram: %s\n"
+      "peak_run_level_histogram: %s\n"
+      "sealed_run_peak (hard_run_limit: %u): %u\n"
+      "per_level_merges: %s\n"
+      "merge_requested: %llu\n"
+      "merge_completed: %llu\n"
+      "merge_discarded: %llu\n"
+      "merge_unscheduled: %llu\n"
+      "merge_input_runs: %llu\n"
+      "merge_input_tombstones: %llu\n"
+      "amplification (merge_input_tombstones / original_tombstones): %.2fx\n"
+      "merge_wall_time_us: %llu\n"
+      "merge_cpu_time_us: %llu\n"
+      "task_queue_wait_time_us: %llu\n"
+      "raw_entries_bytes_peak: %llu\n"
+      "in_flight_merge_bytes_peak: %llu\n"
+      "priority_used: %s\n"
+      "fallback_event_count: %llu\n"
+      "fallback_get_count: %llu\n"
+      "tombstones_at_fallback: %llu\n"
+      "runs_at_fallback: %u\n"
+      "tombstone_conservation: %llu / %llu (%s)",
+      curr_hist_str.c_str(), peak_hist_str.c_str(), hard_run_limit(),
+      peak_sealed_runs(), per_level_merges_str.c_str(),
+      static_cast<unsigned long long>(merge_requested()),
+      static_cast<unsigned long long>(merge_completed()),
+      static_cast<unsigned long long>(merge_discarded()),
+      static_cast<unsigned long long>(merge_unscheduled()),
+      static_cast<unsigned long long>(merge_input_run_count()),
+      static_cast<unsigned long long>(merge_input_tombstones()), amp_ratio,
+      static_cast<unsigned long long>(merge_wall_time_nanos() / 1000),
+      static_cast<unsigned long long>(
+          merge_cpu_time_nanos_.load(std::memory_order_relaxed) / 1000),
+      static_cast<unsigned long long>(
+          task_queue_wait_time_nanos_.load(std::memory_order_relaxed) / 1000),
+      static_cast<unsigned long long>(
+          raw_entries_bytes_peak_.load(std::memory_order_relaxed)),
+      static_cast<unsigned long long>(
+          in_flight_merge_bytes_peak_.load(std::memory_order_relaxed)),
+      priority_used().c_str(),
+      static_cast<unsigned long long>(fallback_event_count()),
+      static_cast<unsigned long long>(get_fallback_to_native_count()),
+      static_cast<unsigned long long>(tombstones_at_fallback()),
+      runs_at_fallback(),
+      static_cast<unsigned long long>(current_raw_entries),
+      static_cast<unsigned long long>(
+          original_tombstones > 0 ? original_tombstones : current_raw_entries),
+      (original_tombstones == 0 || current_raw_entries == original_tombstones)
+          ? "PASSED"
+          : "FAILED");
   return std::string(buf);
 }
 

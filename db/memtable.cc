@@ -283,7 +283,7 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
 
 MemTable::~MemTable() {
   if (amtv_state_) {
-    amtv_state_->Invalidate();
+    amtv_state_->CancelAndDrain();
   }
   mem_tracker_.FreeMem();
   assert(refs_ == 0);

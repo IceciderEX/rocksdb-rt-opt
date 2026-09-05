@@ -95,6 +95,9 @@ extern std::atomic<uint64_t> test_open_delta_materialize_count;
 // Immutable AMTVRun representing a sealed run of range tombstones.
 struct AMTVRun {
   uint64_t run_id = 0;
+  uint32_t level = 0;               // 0, 1, 2, ...
+  uint64_t source_chunk_count = 1;  // Number of base delta chunks (uint64_t)
+  bool is_partial = false;          // True if sealed from a non-full Open Delta
   std::vector<OpenDeltaEntry> raw_entries;
   std::shared_ptr<FragmentedRangeTombstoneList> fragmented_list;
   uint64_t tombstone_count = 0;
@@ -102,9 +105,29 @@ struct AMTVRun {
   SequenceNumber max_seq = 0;
 
   AMTVRun() = default;
-  AMTVRun(uint64_t id, std::vector<OpenDeltaEntry> entries,
+  AMTVRun(uint64_t id, uint32_t lvl, uint64_t chunk_count, bool partial,
+          std::vector<OpenDeltaEntry> entries,
           const InternalKeyComparator& icmp);
+  AMTVRun(uint64_t id, std::vector<OpenDeltaEntry> entries,
+          const InternalKeyComparator& icmp)
+      : AMTVRun(id, 0, 1, false, std::move(entries), icmp) {}
 };
+
+// Returns true if r1 and r2 are eligible for binary size-tiered merge.
+inline bool CanMergeRuns(const AMTVRun& r1, const AMTVRun& r2) {
+  return !r1.is_partial && !r2.is_partial && r1.level == r2.level &&
+         r1.source_chunk_count == r2.source_chunk_count;
+}
+
+// Find lowest level pair of same-level, non-partial runs with smallest run_ids.
+bool FindMergePair(
+    const std::vector<std::shared_ptr<const AMTVRun>>& sealed_runs,
+    std::shared_ptr<const AMTVRun>* out_run_a,
+    std::shared_ptr<const AMTVRun>* out_run_b);
+
+// Returns true if there exists at least one pair of mergeable runs.
+bool HasMergeablePair(
+    const std::vector<std::shared_ptr<const AMTVRun>>& sealed_runs);
 
 // Immutable snapshot of AMTV state published atomically.
 struct AMTVSnapshot {
@@ -180,7 +203,7 @@ class AMTVState : public std::enable_shared_from_this<AMTVState> {
  public:
   explicit AMTVState(uint64_t memtable_generation = 0,
                      uint32_t delta_tombstones_limit = 64,
-                     uint32_t merge_soft_limit = 4,
+                     uint32_t merge_soft_limit = 2,
                      uint32_t hard_layer_limit = 8,
                      const InternalKeyComparator* icmp = nullptr,
                      Env* env = nullptr);
@@ -201,8 +224,17 @@ class AMTVState : public std::enable_shared_from_this<AMTVState> {
   // Background merge scheduling & task
   void MaybeScheduleMerge();
   static void BGMergeWrapper(void* arg);
+  static void BGMergeUnschedule(void* arg);
+  void OnTaskUnscheduled();
   void BGMergeTask();
   bool RunMergeSynchronously();
+
+  // Explicit drain and cancellation protocol (P0-1)
+  void CancelAndDrain();
+
+  // Precise stability check and wait protocol (P0-2)
+  bool IsMergeStable() const;
+  void WaitForMergeStable();
 
   // Lifecycle transitions
   void MarkImmutable() {
@@ -235,12 +267,17 @@ class AMTVState : public std::enable_shared_from_this<AMTVState> {
   uint64_t tombstones_at_fallback() const {
     return tombstones_at_fallback_.load(std::memory_order_relaxed);
   }
+  uint32_t runs_at_fallback() const {
+    return runs_at_fallback_.load(std::memory_order_relaxed);
+  }
   bool is_fallback_required() const {
     return fallback_required_.load(std::memory_order_relaxed);
   }
   bool is_merge_in_progress() const {
     return merge_in_progress_.load(std::memory_order_relaxed);
   }
+  int queued_tasks() const;
+  int running_tasks() const;
 
   uint64_t merge_requested() const {
     return merge_requested_.load(std::memory_order_relaxed);
@@ -251,8 +288,8 @@ class AMTVState : public std::enable_shared_from_this<AMTVState> {
   uint64_t merge_discarded() const {
     return merge_discarded_.load(std::memory_order_relaxed);
   }
-  uint64_t merge_failed() const {
-    return merge_failed_.load(std::memory_order_relaxed);
+  uint64_t merge_unscheduled() const {
+    return merge_unscheduled_.load(std::memory_order_relaxed);
   }
   uint64_t merge_input_run_count() const {
     return merge_input_run_count_.load(std::memory_order_relaxed);
@@ -263,6 +300,18 @@ class AMTVState : public std::enable_shared_from_this<AMTVState> {
   uint64_t merge_wall_time_nanos() const {
     return merge_wall_time_nanos_.load(std::memory_order_relaxed);
   }
+  uint64_t merge_cpu_time_nanos() const {
+    return merge_cpu_time_nanos_.load(std::memory_order_relaxed);
+  }
+  uint64_t task_queue_wait_time_nanos() const {
+    return task_queue_wait_time_nanos_.load(std::memory_order_relaxed);
+  }
+  uint64_t raw_entries_bytes_peak() const {
+    return raw_entries_bytes_peak_.load(std::memory_order_relaxed);
+  }
+  uint64_t in_flight_merge_bytes_peak() const {
+    return in_flight_merge_bytes_peak_.load(std::memory_order_relaxed);
+  }
   uint64_t fallback_event_count() const {
     return fallback_event_count_.load(std::memory_order_relaxed);
   }
@@ -271,8 +320,10 @@ class AMTVState : public std::enable_shared_from_this<AMTVState> {
   uint32_t delta_tombstones_limit() const { return delta_tombstones_limit_; }
   uint32_t merge_soft_limit() const { return merge_soft_limit_; }
   uint32_t hard_layer_limit() const { return hard_layer_limit_; }
+  uint32_t hard_run_limit() const { return hard_layer_limit_; }
 
-  std::string GetAuditSummary() const;
+  std::string priority_used() const;
+  std::string GetAuditSummary(uint64_t original_tombstones = 0) const;
 
  private:
   const uint64_t memtable_generation_;
@@ -303,15 +354,34 @@ class AMTVState : public std::enable_shared_from_this<AMTVState> {
   std::atomic<uint32_t> peak_sealed_layers_{0};
   std::atomic<uint64_t> fallback_to_native_count_{0};
 
-  // M2b Audit metrics
+  // Task synchronization and lifecycle tracking (P0-1, P0-2)
+  mutable port::Mutex task_mu_;
+  mutable port::CondVar task_cond_;
+  int queued_tasks_{0};
+  int running_tasks_{0};
+  Env::Priority last_scheduled_priority_{Env::Priority::LOW};
+  std::string priority_used_{"UNKNOWN"};
+  uint64_t last_scheduled_time_nanos_{0};
+
+  // M2c Audit metrics
   std::atomic<uint64_t> merge_requested_{0};
   std::atomic<uint64_t> merge_completed_{0};
   std::atomic<uint64_t> merge_discarded_{0};
-  std::atomic<uint64_t> merge_failed_{0};
+  std::atomic<uint64_t> merge_unscheduled_{0};
   std::atomic<uint64_t> merge_input_run_count_{0};
   std::atomic<uint64_t> merge_input_tombstones_{0};
   std::atomic<uint64_t> merge_wall_time_nanos_{0};
+  std::atomic<uint64_t> merge_cpu_time_nanos_{0};
+  std::atomic<uint64_t> task_queue_wait_time_nanos_{0};
   std::atomic<uint64_t> fallback_event_count_{0};
+  std::atomic<uint32_t> runs_at_fallback_{0};
+  std::atomic<uint64_t> raw_entries_bytes_peak_{0};
+  std::atomic<uint64_t> in_flight_merge_bytes_peak_{0};
+
+  // Per-level breakdown (protected by write_mutex_)
+  std::map<uint32_t, uint64_t> merge_count_per_level_;
+  std::map<uint32_t, uint64_t> merge_input_tombstones_per_level_;
+  std::map<uint32_t, uint32_t> peak_run_level_histogram_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE
