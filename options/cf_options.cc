@@ -1003,6 +1003,14 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableCFOptions, amtv_delta_tombstones),
           OptionType::kUInt32T, OptionVerificationType::kNormal,
           OptionTypeFlags::kCompareNever}},
+        {"amtv_merge_soft_limit",
+         {offsetof(struct ImmutableCFOptions, amtv_merge_soft_limit),
+          OptionType::kUInt32T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kCompareNever}},
+        {"amtv_hard_layer_limit",
+         {offsetof(struct ImmutableCFOptions, amtv_hard_layer_limit),
+          OptionType::kUInt32T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kCompareNever}},
         {"amtv_max_sealed_deltas",
          {offsetof(struct ImmutableCFOptions, amtv_max_sealed_deltas),
           OptionType::kUInt32T, OptionVerificationType::kNormal,
@@ -1156,7 +1164,9 @@ ImmutableCFOptions::ImmutableCFOptions(const ColumnFamilyOptions& cf_options)
           cf_options.memtable_batch_lookup_optimization),
       enable_amtv(cf_options.enable_amtv),
       amtv_delta_tombstones(cf_options.amtv_delta_tombstones),
-      amtv_max_sealed_deltas(cf_options.amtv_max_sealed_deltas) {}
+      amtv_merge_soft_limit(cf_options.amtv_merge_soft_limit),
+      amtv_hard_layer_limit(cf_options.amtv_hard_layer_limit),
+      amtv_max_sealed_deltas(cf_options.amtv_hard_layer_limit) {}
 
 ImmutableOptions::ImmutableOptions() : ImmutableOptions(Options()) {}
 

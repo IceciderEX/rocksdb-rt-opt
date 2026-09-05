@@ -83,6 +83,12 @@ std::shared_ptr<OpenDelta> OpenDelta::Clone() const {
 SequenceNumber AMTVMultiSourceAdapter::MaxCoveringTombstoneSeqnum(
     const Slice& user_key, SequenceNumber read_seq, std::string* out_ts,
     const Slice* ts_upper_bound) const {
+  if (snapshot_ == nullptr) {
+    if (out_ts != nullptr) {
+      out_ts->clear();
+    }
+    return 0;
+  }
   SequenceNumber max_seq = 0;
   std::string best_ts;
   const auto* ucmp = icmp_->user_comparator();
@@ -90,7 +96,7 @@ SequenceNumber AMTVMultiSourceAdapter::MaxCoveringTombstoneSeqnum(
   // 1. Query Base
   if (snapshot_->base && !snapshot_->base->empty()) {
     FragmentedRangeTombstoneIterator base_iter(snapshot_->base.get(), *icmp_,
-                                              read_seq, ts_upper_bound);
+                                               read_seq, ts_upper_bound);
     SequenceNumber s = base_iter.MaxCoveringTombstoneSeqnum(user_key);
     if (s > max_seq) {
       max_seq = s;
@@ -101,17 +107,19 @@ SequenceNumber AMTVMultiSourceAdapter::MaxCoveringTombstoneSeqnum(
     }
   }
 
-  // 2. Query Sealed Delta
-  if (snapshot_->sealed_delta && !snapshot_->sealed_delta->empty()) {
-    FragmentedRangeTombstoneIterator sealed_iter(snapshot_->sealed_delta.get(),
-                                                *icmp_, read_seq,
-                                                ts_upper_bound);
-    SequenceNumber s = sealed_iter.MaxCoveringTombstoneSeqnum(user_key);
-    if (s > max_seq) {
-      max_seq = s;
-      if (ucmp->timestamp_size() > 0) {
-        best_ts.assign(sealed_iter.timestamp().data(),
-                       sealed_iter.timestamp().size());
+  // 2. Query Sealed Deltas
+  for (const auto& sealed_delta : snapshot_->sealed_deltas) {
+    if (sealed_delta && !sealed_delta->empty()) {
+      FragmentedRangeTombstoneIterator sealed_iter(sealed_delta.get(),
+                                                   *icmp_, read_seq,
+                                                   ts_upper_bound);
+      SequenceNumber s = sealed_iter.MaxCoveringTombstoneSeqnum(user_key);
+      if (s > max_seq) {
+        max_seq = s;
+        if (ucmp->timestamp_size() > 0) {
+          best_ts.assign(sealed_iter.timestamp().data(),
+                         sealed_iter.timestamp().size());
+        }
       }
     }
   }
@@ -127,8 +135,12 @@ SequenceNumber AMTVMultiSourceAdapter::MaxCoveringTombstoneSeqnum(
     }
   }
 
-  if (out_ts != nullptr && !best_ts.empty()) {
-    *out_ts = std::move(best_ts);
+  if (out_ts != nullptr) {
+    if (max_seq > 0 && ucmp->timestamp_size() > 0) {
+      *out_ts = std::move(best_ts);
+    } else {
+      out_ts->clear();
+    }
   }
   return max_seq;
 }
@@ -145,10 +157,12 @@ void AMTVMultiSourceAdapter::AddToRangeDelAggregator(
         snapshot_->base.get(), *icmp_, read_seq));
   }
 
-  // 2. Add Sealed Delta
-  if (snapshot_->sealed_delta && !snapshot_->sealed_delta->empty()) {
-    agg->AddTombstones(std::make_unique<FragmentedRangeTombstoneIterator>(
-        snapshot_->sealed_delta.get(), *icmp_, read_seq));
+  // 2. Add Sealed Deltas
+  for (const auto& sealed_delta : snapshot_->sealed_deltas) {
+    if (sealed_delta && !sealed_delta->empty()) {
+      agg->AddTombstones(std::make_unique<FragmentedRangeTombstoneIterator>(
+          sealed_delta.get(), *icmp_, read_seq));
+    }
   }
 
   // 3. Add Open Delta (via on-the-fly FragmentedRangeTombstoneList)
@@ -171,9 +185,13 @@ void AMTVMultiSourceAdapter::AddToRangeDelAggregator(
 // --------------------------------------------------------------------------
 
 AMTVState::AMTVState(uint64_t memtable_generation,
-                     uint32_t delta_tombstones_limit)
+                     uint32_t delta_tombstones_limit,
+                     uint32_t merge_soft_limit,
+                     uint32_t hard_layer_limit)
     : memtable_generation_(memtable_generation),
-      delta_tombstones_limit_(delta_tombstones_limit) {
+      delta_tombstones_limit_(delta_tombstones_limit),
+      merge_soft_limit_(merge_soft_limit),
+      hard_layer_limit_(hard_layer_limit) {
   auto init_snap = std::make_shared<AMTVSnapshot>();
   init_snap->memtable_generation = memtable_generation_;
   init_snap->open_delta = std::make_shared<OpenDelta>();
@@ -185,7 +203,17 @@ AMTVState::AMTVState(uint64_t memtable_generation,
 void AMTVState::AddTombstone(const Slice& start_user_key,
                              const Slice& end_user_key, SequenceNumber seq,
                              const InternalKeyComparator& icmp) {
+  // P0 constraint 1: If fallback has already been triggered for this memtable,
+  // cease all AMTV shadow delta accumulation immediately.
+  if (fallback_required_.load(std::memory_order_relaxed)) {
+    return;
+  }
+
   MutexLock l(&write_mutex_);
+  if (fallback_required_.load(std::memory_order_relaxed)) {
+    return;
+  }
+
   auto cur_snap = AtomicSharedPtrLoad(&snapshot_, std::memory_order_relaxed);
   auto new_snap = std::make_shared<AMTVSnapshot>(*cur_snap);
   new_snap->publish_epoch++;
@@ -196,10 +224,27 @@ void AMTVState::AddTombstone(const Slice& start_user_key,
   new_open->AddEntry(start_user_key, end_user_key, seq);
 
   if (new_open->size() >= delta_tombstones_limit_) {
-    // Freeze open delta into sealed delta
-    auto sealed = new_open->BuildFragmentedRangeTombstoneList(icmp);
-    new_snap->sealed_delta = std::move(sealed);
-    new_snap->open_delta = std::make_shared<OpenDelta>();
+    // P0 constraint 2: projected_sealed_layers > amtv_hard_layer_limit
+    // triggers fallback_required. Up to hard_layer_limit_ (e.g. 8) sealed
+    // layers are served normally; only when a 9th sealed layer would form do we fall back.
+    uint32_t projected_sealed_layers = cur_snap->sealed_layer_count() + 1;
+    if (projected_sealed_layers > hard_layer_limit_) {
+      new_snap->fallback_required = true;
+      new_snap->tombstones_at_fallback =
+          cur_snap->total_tombstones() + new_open->size();
+      tombstones_at_fallback_.store(new_snap->tombstones_at_fallback,
+                                    std::memory_order_relaxed);
+      fallback_required_.store(true, std::memory_order_relaxed);
+      new_snap->open_delta = std::make_shared<OpenDelta>();
+    } else {
+      auto sealed = new_open->BuildFragmentedRangeTombstoneList(icmp);
+      new_snap->sealed_deltas.push_back(std::move(sealed));
+      new_snap->open_delta = std::make_shared<OpenDelta>();
+      uint32_t current_layers = new_snap->sealed_layer_count();
+      if (current_layers > peak_sealed_layers_.load(std::memory_order_relaxed)) {
+        peak_sealed_layers_.store(current_layers, std::memory_order_relaxed);
+      }
+    }
   } else {
     new_snap->open_delta = std::move(new_open);
   }
@@ -222,16 +267,39 @@ void AMTVState::SetBase(
 }
 
 void AMTVState::FreezeOpenDelta(const InternalKeyComparator& icmp) {
+  if (fallback_required_.load(std::memory_order_relaxed)) {
+    return;
+  }
   MutexLock l(&write_mutex_);
+  if (fallback_required_.load(std::memory_order_relaxed)) {
+    return;
+  }
   auto cur_snap = AtomicSharedPtrLoad(&snapshot_, std::memory_order_relaxed);
   if (!cur_snap->open_delta || cur_snap->open_delta->empty()) {
     return;
   }
   auto new_snap = std::make_shared<AMTVSnapshot>(*cur_snap);
   new_snap->publish_epoch++;
-  auto sealed = cur_snap->open_delta->BuildFragmentedRangeTombstoneList(icmp);
-  new_snap->sealed_delta = std::move(sealed);
-  new_snap->open_delta = std::make_shared<OpenDelta>();
+
+  uint32_t projected_sealed_layers = cur_snap->sealed_layer_count() + 1;
+  if (projected_sealed_layers > hard_layer_limit_) {
+    new_snap->fallback_required = true;
+    new_snap->tombstones_at_fallback =
+        cur_snap->total_tombstones() + cur_snap->open_delta->size();
+    tombstones_at_fallback_.store(new_snap->tombstones_at_fallback,
+                                  std::memory_order_relaxed);
+    fallback_required_.store(true, std::memory_order_relaxed);
+    new_snap->open_delta = std::make_shared<OpenDelta>();
+  } else {
+    auto sealed = cur_snap->open_delta->BuildFragmentedRangeTombstoneList(icmp);
+    new_snap->sealed_deltas.push_back(std::move(sealed));
+    new_snap->open_delta = std::make_shared<OpenDelta>();
+    uint32_t current_layers = new_snap->sealed_layer_count();
+    if (current_layers > peak_sealed_layers_.load(std::memory_order_relaxed)) {
+      peak_sealed_layers_.store(current_layers, std::memory_order_relaxed);
+    }
+  }
+
   AtomicSharedPtrStore(&snapshot_,
                        std::shared_ptr<const AMTVSnapshot>(std::move(new_snap)),
                        std::memory_order_release);

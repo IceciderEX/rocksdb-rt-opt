@@ -96,19 +96,32 @@ struct AMTVSnapshot {
   // Stable base: fragmented range tombstone list (can be nullptr if empty)
   std::shared_ptr<FragmentedRangeTombstoneList> base;
 
-  // Sealed delta: 1 frozen fragmented range tombstone list (for M1a)
-  std::shared_ptr<FragmentedRangeTombstoneList> sealed_delta;
+  // Sealed deltas: frozen fragmented range tombstone lists
+  std::vector<std::shared_ptr<FragmentedRangeTombstoneList>> sealed_deltas;
 
-  // Open delta: unsealed range tombstones (< 64)
+  // Open delta: unsealed range tombstones (< delta_tombstones_limit)
   std::shared_ptr<const OpenDelta> open_delta;
+
+  // Fallback safety flag: if true, Get/MultiGet must bypass multi-source adapter
+  // and fall back to canonical native range tombstone query.
+  bool fallback_required = false;
+
+  // Total tombstone count when fallback was triggered
+  uint64_t tombstones_at_fallback = 0;
+
+  uint32_t sealed_layer_count() const {
+    return static_cast<uint32_t>(sealed_deltas.size());
+  }
 
   uint64_t total_tombstones() const {
     uint64_t count = 0;
     if (base) {
       count += base->num_unfragmented_tombstones();
     }
-    if (sealed_delta) {
-      count += sealed_delta->num_unfragmented_tombstones();
+    for (const auto& sd : sealed_deltas) {
+      if (sd) {
+        count += sd->num_unfragmented_tombstones();
+      }
     }
     if (open_delta) {
       count += open_delta->size();
@@ -118,20 +131,20 @@ struct AMTVSnapshot {
 };
 
 // Multi-source semantic adapter for M1a/M1b.
-// Aggregates Base + Sealed Delta + Open Delta without custom sweep-line.
+// Aggregates Base + Sealed Deltas + Open Delta without custom sweep-line.
 class AMTVMultiSourceAdapter {
  public:
   AMTVMultiSourceAdapter(std::shared_ptr<const AMTVSnapshot> snapshot,
                          const InternalKeyComparator* icmp)
       : snapshot_(std::move(snapshot)), icmp_(icmp) {}
 
-  // Max covering sequence number across Base, Sealed Delta, and Open Delta.
+  // Max covering sequence number across Base, Sealed Deltas, and Open Delta.
   SequenceNumber MaxCoveringTombstoneSeqnum(
       const Slice& user_key, SequenceNumber read_seq,
       std::string* out_ts = nullptr,
       const Slice* ts_upper_bound = nullptr) const;
 
-  // Add Base, Sealed Delta, and Open Delta to a native ReadRangeDelAggregator.
+  // Add Base, Sealed Deltas, and Open Delta to a native ReadRangeDelAggregator.
   void AddToRangeDelAggregator(
       ReadRangeDelAggregator* agg, SequenceNumber read_seq,
       std::vector<std::unique_ptr<FragmentedRangeTombstoneList>>*
@@ -148,7 +161,9 @@ class AMTVMultiSourceAdapter {
 class AMTVState {
  public:
   explicit AMTVState(uint64_t memtable_generation = 0,
-                     uint32_t delta_tombstones_limit = 64);
+                     uint32_t delta_tombstones_limit = 64,
+                     uint32_t merge_soft_limit = 4,
+                     uint32_t hard_layer_limit = 8);
   ~AMTVState() = default;
 
   // Read path: acquire snapshot lock-free.
@@ -163,21 +178,61 @@ class AMTVState {
   // Set base explicitly (used during state initialization or testing).
   void SetBase(std::shared_ptr<FragmentedRangeTombstoneList> base);
 
-  // Freeze open delta into sealed delta (M1a: single sealed delta).
+  // Freeze open delta into sealed delta.
   void FreezeOpenDelta(const InternalKeyComparator& icmp);
+
+  // Telemetry & metrics (recorded only upon fallback to protect hot paths)
+  void RecordGetFallback(uint64_t tombstones = 0) {
+    fallback_to_native_count_.fetch_add(1, std::memory_order_relaxed);
+    if (tombstones > 0) {
+      total_fallback_tombstones_.fetch_add(tombstones, std::memory_order_relaxed);
+      last_fallback_tombstones_.store(tombstones, std::memory_order_relaxed);
+    }
+  }
+
+  uint32_t peak_sealed_layers() const {
+    return peak_sealed_layers_.load(std::memory_order_relaxed);
+  }
+  uint64_t get_fallback_to_native_count() const {
+    return fallback_to_native_count_.load(std::memory_order_relaxed);
+  }
+  uint64_t total_fallback_tombstones() const {
+    return total_fallback_tombstones_.load(std::memory_order_relaxed);
+  }
+  uint64_t last_fallback_tombstones() const {
+    return last_fallback_tombstones_.load(std::memory_order_relaxed);
+  }
+  uint64_t tombstones_at_fallback() const {
+    return tombstones_at_fallback_.load(std::memory_order_relaxed);
+  }
+  bool is_fallback_required() const {
+    return fallback_required_.load(std::memory_order_relaxed);
+  }
 
   uint64_t memtable_generation() const { return memtable_generation_; }
   uint32_t delta_tombstones_limit() const { return delta_tombstones_limit_; }
+  uint32_t merge_soft_limit() const { return merge_soft_limit_; }
+  uint32_t hard_layer_limit() const { return hard_layer_limit_; }
 
  private:
   const uint64_t memtable_generation_;
   const uint32_t delta_tombstones_limit_;
+  const uint32_t merge_soft_limit_;
+  const uint32_t hard_layer_limit_;
 
   // Synchronizes write-side mutations. Never entered by readers.
   mutable port::Mutex write_mutex_;
 
   // Atomic pointer holding current immutable snapshot.
   std::shared_ptr<const AMTVSnapshot> snapshot_;
+
+  // Fast write-side atomic flag to immediately stop delta accumulation
+  std::atomic<bool> fallback_required_{false};
+  std::atomic<uint64_t> tombstones_at_fallback_{0};
+  std::atomic<uint32_t> peak_sealed_layers_{0};
+  std::atomic<uint64_t> fallback_to_native_count_{0};
+  std::atomic<uint64_t> total_fallback_tombstones_{0};
+  std::atomic<uint64_t> last_fallback_tombstones_{0};
 };
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -431,10 +431,19 @@ struct AdvancedColumnFamilyOptions {
   // Default: 64
   uint32_t amtv_delta_tombstones = 64;
 
-  // EXPERIMENTAL: Maximum number of sealed deltas allowed in AMTV.
+  // EXPERIMENTAL: Soft limit of sealed deltas before triggering background merge.
   //
-  // Default: 1
-  uint32_t amtv_max_sealed_deltas = 1;
+  // Default: 4
+  uint32_t amtv_merge_soft_limit = 4;
+
+  // EXPERIMENTAL: Hard limit of sealed deltas before triggering fallback to
+  // native range tombstone query.
+  //
+  // Default: 8
+  uint32_t amtv_hard_layer_limit = 8;
+
+  // Legacy alias for amtv_hard_layer_limit.
+  uint32_t amtv_max_sealed_deltas = 8;
 
   // existing_value - pointer to previous value (from both memtable and sst).
   //                  nullptr if key doesn't exist

@@ -73,6 +73,8 @@ struct ImmutableMemTableOptions {
   bool memtable_batch_lookup_optimization;
   bool enable_amtv;
   uint32_t amtv_delta_tombstones;
+  uint32_t amtv_merge_soft_limit;
+  uint32_t amtv_hard_layer_limit;
   uint32_t amtv_max_sealed_deltas;
 };
 

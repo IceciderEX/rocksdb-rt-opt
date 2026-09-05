@@ -139,6 +139,8 @@ Oracle 验证三方等价性：
    正式撤回此前“零自研扫线算法”或“分层取 max 即可直接用于 Scan”的结论。在不构建全量 Fragment 的前提下，不存在不写扫线算法就能让多路区间流等价于单个分片流的魔法。
 
 ### 7.2 阶段决策与执行边界
+- **重要澄清：`AddToRangeDelAggregator()` 的存在绝不等于具备可供 `MergingIterator` 使用的全局有序、互不重叠分片流**：
+  `ReadRangeDelAggregator` 可以接受通过 `AddToRangeDelAggregator()` 挂载多个来源，但它仅用于点查布尔判定（`ShouldDelete(key)`）；在该场景下对各个来源独立二分并取最大 sequence 满足局部结合律。然而，范围扫描 `MergingIterator` 要求输入的单个范围墓碑槽位输出一个**全局严格有序、互不重叠、随游标推进且支持反向 Seek 的单调几何分片流**。多源独立挂载根本无法直接被 `MergingIterator` 消费。
 - **M1c-ScanArchitecture 明确暂停在设计与差分探针阶段**，绝不修改、接入或替换真实 Scan 读路径（`DBImpl::NewIterator`、`MemTable::NewRangeTombstoneIteratorInternal`、`MergingIterator`、`DBIter`）。
 - **保留原生 Scan 的一切行为**：包括 DeleteRange 后的 `cached_range_tombstone_` 缓存失效、原生锁争用与原生视图物化，确保原生 Scan 正确性 100% 不受影响。
-- **M1b-GetOnly 聚焦于成熟的点查旁路**：Point Get 的分层取 max 已在数学上严格证明等价，且三方 Oracle 已在 M1a 100% 通过验证。M1b 将专注于将该成熟能力安全、确定性地接入活跃 MemTable 的 `Get`（及 `MultiGet`）路径。
+- **M1b-GetOnly 聚焦于成熟的点查旁路**：Point Get 的分层取 max 已在数学上严格证明等价，且三方/四方 Oracle 已通过验证。M1b 将专注于将该成熟能力安全、确定性地接入活跃 MemTable 的 `Get`（及 `MultiGet`）路径。
