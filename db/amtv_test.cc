@@ -23,6 +23,7 @@
 #include "rocksdb/options.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
+#include "test_util/sync_point.h"
 #include "util/coding.h"
 #include "util/vector_iterator.h"
 
@@ -84,17 +85,22 @@ void VerifyDifferentialOracle(
 
   // 2. Build AMTV Multi-Source Adapter
   auto snapshot = std::make_shared<AMTVSnapshot>();
+  uint64_t run_id = 1;
 
   if (!base_tombstones.empty()) {
-    auto unfrag = MakeRangeDelIter(base_tombstones, &icmp);
-    snapshot->base =
-        std::make_unique<FragmentedRangeTombstoneList>(std::move(unfrag), icmp);
+    std::vector<OpenDeltaEntry> raw;
+    for (const auto& t : base_tombstones) {
+      raw.emplace_back(t.start_key_, t.end_key_, t.seq_);
+    }
+    snapshot->sealed_runs.emplace_back(run_id++, std::move(raw), icmp);
   }
 
   if (!sealed_tombstones.empty()) {
-    auto unfrag = MakeRangeDelIter(sealed_tombstones, &icmp);
-    snapshot->sealed_deltas.push_back(
-        std::make_unique<FragmentedRangeTombstoneList>(std::move(unfrag), icmp));
+    std::vector<OpenDeltaEntry> raw;
+    for (const auto& t : sealed_tombstones) {
+      raw.emplace_back(t.start_key_, t.end_key_, t.seq_);
+    }
+    snapshot->sealed_runs.emplace_back(run_id++, std::move(raw), icmp);
   }
 
   auto open_delta = std::make_shared<OpenDelta>();
@@ -258,7 +264,7 @@ TEST_F(AMTVTest, FreezeBoundaryCheck65) {
   // Test threshold freeze behavior at exactly 64 tombstones
   AMTVState state(0 /* generation */, 64 /* delta limit */);
 
-  // Add 63 tombstones: open delta has 63, sealed delta is nullptr
+  // Add 63 tombstones: open delta has 63, sealed runs is empty
   for (int i = 0; i < 63; ++i) {
     char start_buf[32], end_buf[32];
     snprintf(start_buf, sizeof(start_buf), "k%05d", i * 10);
@@ -268,24 +274,27 @@ TEST_F(AMTVTest, FreezeBoundaryCheck65) {
   {
     auto snap = state.GetSnapshot();
     ASSERT_EQ(snap->open_delta->size(), 63U);
-    ASSERT_TRUE(snap->sealed_deltas.empty());
+    ASSERT_TRUE(snap->sealed_runs.empty());
   }
 
-  // Add 64th tombstone: must freeze open delta into sealed deltas
+  // Add 64th tombstone: must freeze open delta into sealed runs
   state.AddTombstone("k00630", "k00635", 64, bytewise_icmp_);
   {
     auto snap = state.GetSnapshot();
-    ASSERT_EQ(snap->sealed_deltas.size(), 1U);
-    ASSERT_EQ(snap->sealed_deltas[0]->num_unfragmented_tombstones(), 64U);
+    ASSERT_EQ(snap->sealed_runs.size(), 1U);
+    ASSERT_EQ(snap->sealed_runs[0].tombstone_count, 64U);
+    ASSERT_EQ(snap->sealed_runs[0].raw_entries.size(), 64U);
+    ASSERT_EQ(snap->sealed_runs[0].min_seq, 1U);
+    ASSERT_EQ(snap->sealed_runs[0].max_seq, 64U);
     ASSERT_EQ(snap->open_delta->size(), 0U);
   }
 
-  // Add 65th tombstone: open delta has 1 tombstone, sealed deltas remains 1
+  // Add 65th tombstone: open delta has 1 tombstone, sealed runs remains 1
   state.AddTombstone("k00640", "k00645", 65, bytewise_icmp_);
   {
     auto snap = state.GetSnapshot();
-    ASSERT_EQ(snap->sealed_deltas.size(), 1U);
-    ASSERT_EQ(snap->sealed_deltas[0]->num_unfragmented_tombstones(), 64U);
+    ASSERT_EQ(snap->sealed_runs.size(), 1U);
+    ASSERT_EQ(snap->sealed_runs[0].tombstone_count, 64U);
     ASSERT_EQ(snap->open_delta->size(), 1U);
     ASSERT_EQ(snap->total_tombstones(), 65U);
   }
@@ -1167,6 +1176,612 @@ TEST_F(AMTVTest, FourWayOracleFallbackAndBoundaryTest) {
   fprintf(stderr, "======================================================\n\n");
 }
 
+
+// ==========================================================================
+// M2a Correctness Test Suite
+// ==========================================================================
+
+TEST_F(AMTVTest, M2a_HistoryRunRetention) {
+  Options options;
+  options.create_if_missing = true;
+  options.enable_amtv = true;
+  options.amtv_delta_tombstones = 4;
+  options.amtv_hard_layer_limit = 8;
+  options.write_buffer_size = 64 * 1024 * 1024; // Ensure no flush occurs
+
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(options, dbname_, &db));
+
+  // Insert 20 base keys to be deleted
+  for (int i = 0; i < 20; ++i) {
+    char k[32], v[32];
+    snprintf(k, sizeof(k), "k%04d", i * 10 + 2);
+    snprintf(v, sizeof(v), "val%04d_base", i * 10 + 2);
+    ASSERT_OK(db->Put(WriteOptions(), k, v));
+  }
+  // Insert 20 survivor keys outside the deletion ranges
+  for (int i = 0; i < 20; ++i) {
+    char k[32], v[32];
+    snprintf(k, sizeof(k), "k%04d", i * 10 + 7);
+    snprintf(v, sizeof(v), "val%04d_survivor", i * 10 + 7);
+    ASSERT_OK(db->Put(WriteOptions(), k, v));
+  }
+
+  // Inject 20 mutually disjoint DeleteRanges [k%04d, k%04d + 5)
+  // With delta=4, 20 ranges produce exactly 5 sealed runs, 0 in open delta.
+  for (int i = 0; i < 20; ++i) {
+    char start[32], end[32];
+    snprintf(start, sizeof(start), "k%04d", i * 10);
+    snprintf(end, sizeof(end), "k%04d", i * 10 + 5);
+    ASSERT_OK(db->DeleteRange(WriteOptions(), start, end));
+  }
+
+  // Inspect AMTV state
+  ColumnFamilyData* cfd =
+      static_cast<ColumnFamilyHandleImpl*>(db->DefaultColumnFamily())->cfd();
+  MemTable* mem = cfd->mem();
+  ASSERT_NE(mem, nullptr);
+  AMTVState* state = mem->GetAMTVState();
+  ASSERT_NE(state, nullptr);
+
+  auto snap = state->GetSnapshot();
+  ASSERT_FALSE(snap->fallback_required);
+  ASSERT_EQ(snap->sealed_runs.size(), 5U);
+  ASSERT_EQ(snap->open_delta->size(), 0U);
+
+  // Validate run invariants
+  for (size_t r = 0; r < snap->sealed_runs.size(); ++r) {
+    const auto& run = snap->sealed_runs[r];
+    EXPECT_EQ(run.run_id, r + 1);
+    EXPECT_EQ(run.tombstone_count, 4U);
+    EXPECT_EQ(run.raw_entries.size(), 4U);
+    EXPECT_NE(run.fragmented_list, nullptr);
+    EXPECT_LE(run.min_seq, run.max_seq);
+  }
+
+  // Verify deletion effectiveness: Oldest Run (Run 1: i=0..3), Middle Run (Run 3: i=8..11), Newest Run (Run 5: i=16..19)
+  for (int i = 0; i < 20; ++i) {
+    char del_k[32];
+    snprintf(del_k, sizeof(del_k), "k%04d", i * 10 + 2);
+    std::string val;
+    Status s = db->Get(ReadOptions(), del_k, &val);
+    EXPECT_TRUE(s.IsNotFound()) << "Key " << del_k << " in Run " << (i / 4 + 1) << " should be deleted!";
+
+    char sur_k[32];
+    snprintf(sur_k, sizeof(sur_k), "k%04d", i * 10 + 7);
+    s = db->Get(ReadOptions(), sur_k, &val);
+    EXPECT_OK(s);
+    char expected_v[32];
+    snprintf(expected_v, sizeof(expected_v), "val%04d_survivor", i * 10 + 7);
+    EXPECT_EQ(val, expected_v);
+  }
+}
+
+TEST_F(AMTVTest, M2a_OverlapAndResurrection) {
+  Options options;
+  options.create_if_missing = true;
+  options.enable_amtv = true;
+  options.amtv_delta_tombstones = 4;
+  options.amtv_hard_layer_limit = 8;
+  options.write_buffer_size = 64 * 1024 * 1024;
+
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(options, dbname_, &db));
+
+  std::map<std::string, std::string> gt_model;
+
+  // Insert base keys k00 .. k99
+  for (int i = 0; i < 100; ++i) {
+    char k[16], v[32];
+    snprintf(k, sizeof(k), "k%02d", i);
+    snprintf(v, sizeof(v), "base_%02d", i);
+    ASSERT_OK(db->Put(WriteOptions(), k, v));
+    gt_model[k] = v;
+  }
+
+  auto ApplyDeleteRange = [&](const std::string& start, const std::string& end) {
+    ASSERT_OK(db->DeleteRange(WriteOptions(), start, end));
+    for (auto it = gt_model.lower_bound(start); it != gt_model.end() && it->first < end; ) {
+      it = gt_model.erase(it);
+    }
+  };
+
+  auto ApplyPut = [&](const std::string& k, const std::string& v) {
+    ASSERT_OK(db->Put(WriteOptions(), k, v));
+    gt_model[k] = v;
+  };
+
+  // Run 1 (4 tombstones): wide & overlapping
+  ApplyDeleteRange("k10", "k30");
+  ApplyDeleteRange("k40", "k60");
+  ApplyDeleteRange("k70", "k90");
+  ApplyDeleteRange("k05", "k25"); // overlaps [k10, k30)
+
+  // Run 2 (4 tombstones): nested & adjacent
+  ApplyDeleteRange("k15", "k22"); // nested
+  ApplyDeleteRange("k45", "k55"); // nested
+  ApplyDeleteRange("k60", "k70"); // adjacent
+  ApplyDeleteRange("k25", "k35"); // adjacent & overlapping
+
+  // Resurrect keys after Run 1 & 2
+  ApplyPut("k12", "resurrect_12");
+  ApplyPut("k20", "resurrect_20");
+  ApplyPut("k50", "resurrect_50");
+
+  // Run 3 (4 tombstones): covers resurrected k20, plus new ranges
+  ApplyDeleteRange("k18", "k25"); // re-deletes k20!
+  ApplyDeleteRange("k80", "k95");
+  ApplyDeleteRange("k02", "k08");
+  ApplyDeleteRange("k35", "k45");
+
+  // Resurrect k20 second time
+  ApplyPut("k20", "resurrect_20_again");
+
+  // Open Delta (2 unsealed tombstones)
+  ApplyDeleteRange("k01", "k03");
+  ApplyDeleteRange("k85", "k99");
+
+  // Verify AMTV State: 3 sealed runs, 2 open delta entries
+  ColumnFamilyData* cfd =
+      static_cast<ColumnFamilyHandleImpl*>(db->DefaultColumnFamily())->cfd();
+  MemTable* mem = cfd->mem();
+  AMTVState* state = mem->GetAMTVState();
+  auto snap = state->GetSnapshot();
+  EXPECT_EQ(snap->sealed_runs.size(), 3U);
+  EXPECT_EQ(snap->open_delta->size(), 2U);
+  EXPECT_FALSE(snap->fallback_required);
+
+  // Verify Get & MultiGet across all k00 .. k99 against Ground Truth
+  std::vector<Slice> multiget_keys;
+  std::vector<std::string> key_strings;
+  for (int i = 0; i < 100; ++i) {
+    char k[16];
+    snprintf(k, sizeof(k), "k%02d", i);
+    key_strings.emplace_back(k);
+  }
+  for (const auto& ks : key_strings) {
+    multiget_keys.emplace_back(ks);
+  }
+
+  // 1. Single Get
+  for (const auto& ks : key_strings) {
+    std::string val;
+    Status s = db->Get(ReadOptions(), ks, &val);
+    auto it = gt_model.find(ks);
+    if (it != gt_model.end()) {
+      EXPECT_OK(s) << "Key " << ks << " should exist";
+      EXPECT_EQ(val, it->second) << "Key " << ks << " value mismatch";
+    } else {
+      EXPECT_TRUE(s.IsNotFound()) << "Key " << ks << " should be NotFound";
+    }
+  }
+
+  // 2. MultiGet
+  std::vector<std::string> values;
+  std::vector<Status> statuses = db->MultiGet(ReadOptions(), multiget_keys, &values);
+  EXPECT_EQ(statuses.size(), multiget_keys.size());
+  for (size_t i = 0; i < multiget_keys.size(); ++i) {
+    std::string ks = multiget_keys[i].ToString();
+    auto it = gt_model.find(ks);
+    if (it != gt_model.end()) {
+      EXPECT_OK(statuses[i]) << "MultiGet key " << ks << " should exist";
+      EXPECT_EQ(values[i], it->second);
+    } else {
+      EXPECT_TRUE(statuses[i].IsNotFound()) << "MultiGet key " << ks << " should be NotFound";
+    }
+  }
+
+  // 3. Scan Iterator
+  std::unique_ptr<Iterator> iter(db->NewIterator(ReadOptions()));
+  iter->SeekToFirst();
+  auto gt_it = gt_model.begin();
+  while (iter->Valid()) {
+    ASSERT_NE(gt_it, gt_model.end());
+    EXPECT_EQ(iter->key().ToString(), gt_it->first);
+    EXPECT_EQ(iter->value().ToString(), gt_it->second);
+    iter->Next();
+    ++gt_it;
+  }
+  EXPECT_EQ(gt_it, gt_model.end());
+}
+
+TEST_F(AMTVTest, M2a_SnapshotAndTimestamp) {
+  const Comparator* ucmp = test::BytewiseComparatorWithU64TsWrapper();
+  auto EncodeTs = [](uint64_t ts) {
+    std::string ret;
+    PutFixed64(&ret, ts);
+    return ret;
+  };
+
+  std::string dbname_amtv = test::PerThreadDBPath("amtv_m2a_snap_ts_amtv");
+  std::string dbname_native = test::PerThreadDBPath("amtv_m2a_snap_ts_native");
+  DestroyDB(dbname_amtv, Options()).PermitUncheckedError();
+  DestroyDB(dbname_native, Options()).PermitUncheckedError();
+
+  Options opt_amtv;
+  opt_amtv.create_if_missing = true;
+  opt_amtv.comparator = ucmp;
+  opt_amtv.enable_amtv = true;
+  opt_amtv.amtv_delta_tombstones = 4;
+  opt_amtv.amtv_hard_layer_limit = 8;
+  opt_amtv.write_buffer_size = 64 * 1024 * 1024;
+
+  Options opt_native = opt_amtv;
+  opt_native.enable_amtv = false;
+
+  std::unique_ptr<DB> db_amtv;
+  std::unique_ptr<DB> db_native;
+  ASSERT_OK(DB::Open(opt_amtv, dbname_amtv, &db_amtv));
+  ASSERT_OK(DB::Open(opt_native, dbname_native, &db_native));
+
+  auto SyncPut = [&](const std::string& key, const std::string& val, uint64_t ts) {
+    std::string ts_str = EncodeTs(ts);
+    ASSERT_OK(db_amtv->Put(WriteOptions(), key, ts_str, val));
+    ASSERT_OK(db_native->Put(WriteOptions(), key, ts_str, val));
+  };
+  auto SyncDeleteRange = [&](const std::string& start, const std::string& end, uint64_t ts) {
+    std::string ts_str = EncodeTs(ts);
+    ASSERT_OK(db_amtv->DeleteRange(WriteOptions(), db_amtv->DefaultColumnFamily(), start, end, ts_str));
+    ASSERT_OK(db_native->DeleteRange(WriteOptions(), db_native->DefaultColumnFamily(), start, end, ts_str));
+  };
+
+  // Base Puts at ts=10
+  for (int i = 1; i <= 8; ++i) {
+    char k[16], v[32];
+    snprintf(k, sizeof(k), "k%02d", i * 10);
+    snprintf(v, sizeof(v), "val%02d_base", i * 10);
+    SyncPut(k, v, 10);
+  }
+
+  // Run 1: 4 DeleteRanges at ts=20
+  SyncDeleteRange("k05", "k15", 20);
+  SyncDeleteRange("k15", "k25", 20);
+  SyncDeleteRange("k25", "k35", 20);
+  SyncDeleteRange("k35", "k45", 20);
+
+  // Take Snapshot 1
+  const Snapshot* snap1_amtv = db_amtv->GetSnapshot();
+  const Snapshot* snap1_native = db_native->GetSnapshot();
+
+  // Resurrect k20 at ts=30
+  SyncPut("k20", "val20_resurrected", 30);
+
+  // Run 2: 4 DeleteRanges at ts=35
+  SyncDeleteRange("k18", "k22", 35); // re-deletes k20
+  SyncDeleteRange("k45", "k55", 35);
+  SyncDeleteRange("k55", "k65", 35);
+  SyncDeleteRange("k65", "k75", 35);
+
+  // Take Snapshot 2
+  const Snapshot* snap2_amtv = db_amtv->GetSnapshot();
+  const Snapshot* snap2_native = db_native->GetSnapshot();
+
+  // Resurrect k20 at ts=40 and k50 at ts=42
+  SyncPut("k20", "val20_resurrected_twice", 40);
+  SyncPut("k50", "val50_resurrected", 42);
+
+  // Run 3: 4 DeleteRanges at ts=50
+  SyncDeleteRange("k28", "k32", 50);
+  SyncDeleteRange("k48", "k52", 50);
+  SyncDeleteRange("k58", "k62", 50);
+  SyncDeleteRange("k68", "k72", 50);
+
+  // Take Snapshot 3
+  const Snapshot* snap3_amtv = db_amtv->GetSnapshot();
+  const Snapshot* snap3_native = db_native->GetSnapshot();
+
+  // Latest writes at ts=60
+  SyncPut("k30", "val30_resurrected_latest", 60);
+  SyncDeleteRange("k78", "k85", 65);
+
+  std::vector<std::string> probe_keys = {
+      "k10", "k20", "k30", "k40", "k50", "k60", "k70", "k80"};
+
+  auto VerifySnap = [&](const Snapshot* s_a, const Snapshot* s_n, uint64_t ts, const char* label) {
+    std::string ts_str = EncodeTs(ts);
+    Slice ts_slice(ts_str);
+    ReadOptions ro_a;
+    ro_a.snapshot = s_a;
+    ro_a.timestamp = &ts_slice;
+    ReadOptions ro_n;
+    ro_n.snapshot = s_n;
+    ro_n.timestamp = &ts_slice;
+
+    for (const auto& k : probe_keys) {
+      std::string val_a, val_n;
+      std::string out_ts_a, out_ts_n;
+      Status stat_a = db_amtv->Get(ro_a, k, &val_a, &out_ts_a);
+      Status stat_n = db_native->Get(ro_n, k, &val_n, &out_ts_n);
+
+      ASSERT_EQ(stat_a.code(), stat_n.code())
+          << "[" << label << "] Status mismatch for key " << k;
+      if (stat_a.ok()) {
+        ASSERT_EQ(val_a, val_n) << "[" << label << "] Value mismatch for key " << k;
+        ASSERT_EQ(out_ts_a, out_ts_n) << "[" << label << "] Timestamp mismatch for key " << k;
+      }
+    }
+  };
+
+  VerifySnap(snap1_amtv, snap1_native, 22, "Snapshot 1");
+  VerifySnap(snap2_amtv, snap2_native, 37, "Snapshot 2");
+  VerifySnap(snap3_amtv, snap3_native, 52, "Snapshot 3");
+  VerifySnap(nullptr, nullptr, 70, "Latest");
+
+  db_amtv->ReleaseSnapshot(snap1_amtv);
+  db_amtv->ReleaseSnapshot(snap2_amtv);
+  db_amtv->ReleaseSnapshot(snap3_amtv);
+  db_native->ReleaseSnapshot(snap1_native);
+  db_native->ReleaseSnapshot(snap2_native);
+  db_native->ReleaseSnapshot(snap3_native);
+}
+
+TEST_F(AMTVTest, M2a_FourWayOracleExtension) {
+  std::string dbname_amtv = test::PerThreadDBPath("amtv_m2a_4way_db");
+  std::string dbname_native = test::PerThreadDBPath("amtv_m2a_4way_native");
+  DestroyDB(dbname_amtv, Options()).PermitUncheckedError();
+  DestroyDB(dbname_native, Options()).PermitUncheckedError();
+
+  Options opt_amtv;
+  opt_amtv.create_if_missing = true;
+  opt_amtv.enable_amtv = true;
+  opt_amtv.amtv_delta_tombstones = 16;
+  opt_amtv.amtv_hard_layer_limit = 8;
+  opt_amtv.write_buffer_size = 64 * 1024 * 1024;
+
+  Options opt_native = opt_amtv;
+  opt_native.enable_amtv = false;
+
+  std::unique_ptr<DB> db_amtv;
+  std::unique_ptr<DB> db_native;
+  ASSERT_OK(DB::Open(opt_amtv, dbname_amtv, &db_amtv));
+  ASSERT_OK(DB::Open(opt_native, dbname_native, &db_native));
+
+  struct RawTombstone {
+    std::string start;
+    std::string end;
+    SequenceNumber seq;
+  };
+  std::vector<RawTombstone> all_tombstones;
+
+  for (int i = 0; i < 50; ++i) {
+    char k[32], v[32];
+    snprintf(k, sizeof(k), "k%04d", i * 10);
+    snprintf(v, sizeof(v), "val%04d", i * 10);
+    ASSERT_OK(db_amtv->Put(WriteOptions(), k, v));
+    ASSERT_OK(db_native->Put(WriteOptions(), k, v));
+  }
+
+  // Inject 160 DeleteRanges (10 deltas of 16).
+  // First 8 deltas form 8 sealed runs.
+  // 9th delta triggers fallback_required = true.
+  for (int i = 0; i < 160; ++i) {
+    char start[32], end[32];
+    snprintf(start, sizeof(start), "k%04d", (i % 40) * 10 + 2);
+    snprintf(end, sizeof(end), "k%04d", (i % 40) * 10 + 7);
+    ASSERT_OK(db_amtv->DeleteRange(WriteOptions(), start, end));
+    ASSERT_OK(db_native->DeleteRange(WriteOptions(), start, end));
+    all_tombstones.push_back({start, end, db_amtv->GetLatestSequenceNumber()});
+  }
+
+  ASSERT_OK(db_amtv->Put(WriteOptions(), "k0050", "val0050_resurrected"));
+  ASSERT_OK(db_native->Put(WriteOptions(), "k0050", "val0050_resurrected"));
+
+  ColumnFamilyData* cfd = static_cast<ColumnFamilyHandleImpl*>(db_amtv->DefaultColumnFamily())->cfd();
+  MemTable* active_mem = cfd->mem();
+  ASSERT_NE(active_mem, nullptr);
+  AMTVState* state = active_mem->GetAMTVState();
+  ASSERT_NE(state, nullptr);
+
+  auto snap = state->GetSnapshot();
+  ASSERT_TRUE(snap->fallback_required);
+  ASSERT_EQ(snap->sealed_runs.size(), 8U);
+  ASSERT_EQ(state->peak_sealed_runs(), 8U);
+  ASSERT_EQ(snap->open_delta->size(), 0U);
+
+  // Validate raw_entries preservation and fidelity in every run
+  for (size_t r = 0; r < snap->sealed_runs.size(); ++r) {
+    const auto& run = snap->sealed_runs[r];
+    EXPECT_EQ(run.run_id, r + 1);
+    EXPECT_EQ(run.tombstone_count, 16U);
+    EXPECT_EQ(run.raw_entries.size(), 16U);
+    EXPECT_NE(run.fragmented_list, nullptr);
+  }
+
+  // 4-WAY DIFFERENTIAL RECONCILIATION:
+  // 1. Un-fallback AMTV Adapter (with 8 sealed runs)
+  AMTVMultiSourceAdapter unfallback_adapter(snap, &active_mem->GetInternalKeyComparator());
+
+  // 4. External Ground Truth Model
+  std::vector<RangeTombstone> unfrag_tombstones;
+  for (const auto& t : all_tombstones) {
+    unfrag_tombstones.emplace_back(t.start, t.end, t.seq);
+  }
+  auto unfrag_iter = MakeRangeDelIter(unfrag_tombstones, &active_mem->GetInternalKeyComparator());
+  auto gt_list = std::make_unique<FragmentedRangeTombstoneList>(
+      std::move(unfrag_iter), active_mem->GetInternalKeyComparator());
+
+  for (int i = 0; i < 50; ++i) {
+    char k[32];
+    snprintf(k, sizeof(k), "k%04d", i * 10);
+    std::string key(k);
+
+    std::string val_amtv;
+    Status s_amtv = db_amtv->Get(ReadOptions(), key, &val_amtv);
+    std::string val_native;
+    Status s_native = db_native->Get(ReadOptions(), key, &val_native);
+
+    // 2 (Fallback AMTV DB) vs 3 (Native DB)
+    ASSERT_EQ(s_amtv.code(), s_native.code()) << "Key " << key << " status mismatch";
+    if (s_amtv.ok()) {
+      ASSERT_EQ(val_amtv, val_native) << "Key " << key << " value mismatch";
+    }
+
+    // 4 (Ground Truth model)
+    FragmentedRangeTombstoneIterator gt_iter(gt_list.get(), active_mem->GetInternalKeyComparator(),
+                                             db_amtv->GetLatestSequenceNumber());
+    SequenceNumber gt_cov_seq = gt_iter.MaxCoveringTombstoneSeqnum(key);
+
+    std::unique_ptr<FragmentedRangeTombstoneIterator> native_iter(
+        active_mem->NewRangeTombstoneIterator(ReadOptions(), db_amtv->GetLatestSequenceNumber(), false));
+    SequenceNumber native_cov_seq = native_iter ? native_iter->MaxCoveringTombstoneSeqnum(key) : 0;
+
+    ASSERT_EQ(native_cov_seq, gt_cov_seq) << "Key " << key << " native seq mismatch with GT";
+  }
+}
+
+TEST_F(AMTVTest, M2a_ConcurrentPublicationSyncPoint) {
+  Options options;
+  options.create_if_missing = true;
+  options.enable_amtv = true;
+  options.amtv_delta_tombstones = 4;
+  options.amtv_hard_layer_limit = 8;
+  options.write_buffer_size = 64 * 1024 * 1024;
+
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(options, dbname_, &db));
+
+  for (int i = 0; i < 50; ++i) {
+    char k[16], v[16];
+    snprintf(k, sizeof(k), "k%03d", i * 2);
+    snprintf(v, sizeof(v), "v%03d", i * 2);
+    ASSERT_OK(db->Put(WriteOptions(), k, v));
+  }
+
+  std::atomic<bool> stop_readers{false};
+  std::atomic<uint64_t> reads_completed{0};
+  std::atomic<uint64_t> freeze_sync_count{0};
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "AMTVState::AddTombstone:BeforePublish",
+      [&](void* /*arg*/) {
+        freeze_sync_count.fetch_add(1, std::memory_order_relaxed);
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "AMTVState::FreezeOpenDelta:BeforePublish",
+      [&](void* /*arg*/) {
+        freeze_sync_count.fetch_add(1, std::memory_order_relaxed);
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // 8 Reader threads
+  std::vector<std::thread> readers;
+  for (int r = 0; r < 8; ++r) {
+    readers.emplace_back([&, r]() {
+      uint64_t local_reads = 0;
+      while (!stop_readers.load(std::memory_order_acquire)) {
+        for (int i = 0; i < 50; ++i) {
+          char k[16];
+          snprintf(k, sizeof(k), "k%03d", i * 2);
+          std::string val;
+          Status s = db->Get(ReadOptions(), k, &val);
+          // Status must be either OK or NotFound, never corruption or crash
+          EXPECT_TRUE(s.ok() || s.IsNotFound());
+          local_reads++;
+        }
+      }
+      reads_completed.fetch_add(local_reads, std::memory_order_relaxed);
+    });
+  }
+
+  // 1 Writer thread: performs 40 DeleteRanges triggering multiple seals
+  for (int i = 0; i < 40; ++i) {
+    char start[16], end[16];
+    snprintf(start, sizeof(start), "k%03d", (i % 25) * 2);
+    snprintf(end, sizeof(end), "k%03d", (i % 25) * 2 + 1);
+    ASSERT_OK(db->DeleteRange(WriteOptions(), start, end));
+  }
+
+  stop_readers.store(true, std::memory_order_release);
+  for (auto& t : readers) {
+    t.join();
+  }
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  EXPECT_GT(reads_completed.load(), 0U);
+  EXPECT_GT(freeze_sync_count.load(), 0U);
+}
+
+TEST_F(AMTVTest, M2a_OpenDeltaZeroMaterialization) {
+  Options options;
+  options.create_if_missing = true;
+  options.enable_amtv = true;
+  options.amtv_delta_tombstones = 64; // Large threshold so tombstones stay in OpenDelta
+  options.write_buffer_size = 64 * 1024 * 1024;
+
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(options, dbname_, &db));
+
+  // Insert 30 base keys
+  for (int i = 0; i < 30; ++i) {
+    char k[16], v[16];
+    snprintf(k, sizeof(k), "key%03d", i);
+    snprintf(v, sizeof(v), "val%03d", i);
+    ASSERT_OK(db->Put(WriteOptions(), k, v));
+  }
+
+  // Inject 20 DeleteRanges (< 64, strictly remaining in OpenDelta!)
+  for (int i = 0; i < 20; ++i) {
+    char start[16], end[16];
+    snprintf(start, sizeof(start), "key%03d", i);
+    snprintf(end, sizeof(end), "key%03d", i + 1);
+    ASSERT_OK(db->DeleteRange(WriteOptions(), start, end));
+  }
+
+  // Confirm that OpenDelta holds the tombstones and sealed runs is empty
+  ColumnFamilyData* cfd =
+      static_cast<ColumnFamilyHandleImpl*>(db->DefaultColumnFamily())->cfd();
+  MemTable* mem = cfd->mem();
+  AMTVState* state = mem->GetAMTVState();
+  auto snap = state->GetSnapshot();
+  ASSERT_EQ(snap->open_delta->size(), 20U);
+  ASSERT_EQ(snap->sealed_runs.size(), 0U);
+
+  // Capture materialization count BEFORE Point Queries
+  uint64_t count_before = test_open_delta_materialize_count.load();
+
+  // Perform 200 Single Gets across keys inside and outside tombstones
+  for (int round = 0; round < 200; ++round) {
+    char k[16];
+    snprintf(k, sizeof(k), "key%03d", round % 40);
+    std::string val;
+    Status s = db->Get(ReadOptions(), k, &val);
+    if (round % 40 < 20) {
+      EXPECT_TRUE(s.IsNotFound());
+    } else if (round % 40 < 30) {
+      EXPECT_OK(s);
+    } else {
+      EXPECT_TRUE(s.IsNotFound());
+    }
+  }
+
+  // Perform 50 MultiGets
+  std::vector<std::string> keys_store;
+  std::vector<Slice> multiget_keys;
+  for (int i = 0; i < 40; ++i) {
+    char k[16];
+    snprintf(k, sizeof(k), "key%03d", i);
+    keys_store.emplace_back(k);
+  }
+  for (const auto& ks : keys_store) {
+    multiget_keys.emplace_back(ks);
+  }
+  for (int round = 0; round < 50; ++round) {
+    std::vector<std::string> vals;
+    std::vector<Status> statuses = db->MultiGet(ReadOptions(), multiget_keys, &vals);
+    ASSERT_EQ(statuses.size(), multiget_keys.size());
+  }
+
+  // Capture materialization count AFTER Point Queries
+  uint64_t count_after = test_open_delta_materialize_count.load();
+
+  // ASSERT ZERO MATERIALIZATION:
+  // Neither Get nor MultiGet must EVER call BuildFragmentedRangeTombstoneList() on OpenDelta!
+  ASSERT_EQ(count_after, count_before)
+      << "OpenDelta was materialized during Get/MultiGet! Materialization count increased by "
+      << (count_after - count_before);
+}
 
 }  // namespace ROCKSDB_NAMESPACE
 

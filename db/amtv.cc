@@ -7,9 +7,44 @@
 
 #include <algorithm>
 
+#include "test_util/sync_point.h"
 #include "util/vector_iterator.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+std::atomic<uint64_t> test_open_delta_materialize_count{0};
+
+AMTVRun::AMTVRun(uint64_t id, std::vector<OpenDeltaEntry> entries,
+                 const InternalKeyComparator& icmp)
+    : run_id(id),
+      raw_entries(std::move(entries)),
+      tombstone_count(raw_entries.size()),
+      min_seq(kMaxSequenceNumber),
+      max_seq(0) {
+  if (raw_entries.empty()) {
+    return;
+  }
+  std::vector<std::string> keys;
+  std::vector<std::string> values;
+  keys.reserve(raw_entries.size());
+  values.reserve(raw_entries.size());
+
+  for (const auto& entry : raw_entries) {
+    keys.emplace_back(entry.ikey.Encode().ToString());
+    values.emplace_back(entry.end_key);
+    if (entry.sequence() < min_seq) {
+      min_seq = entry.sequence();
+    }
+    if (entry.sequence() > max_seq) {
+      max_seq = entry.sequence();
+    }
+  }
+
+  auto iter = std::make_unique<VectorIterator>(std::move(keys),
+                                               std::move(values), &icmp);
+  fragmented_list =
+      std::make_shared<FragmentedRangeTombstoneList>(std::move(iter), icmp);
+}
 
 void OpenDelta::AddEntry(const Slice& start_user_key,
                          const Slice& end_user_key, SequenceNumber seq) {
@@ -53,6 +88,7 @@ SequenceNumber OpenDelta::MaxCoveringTombstoneSeqnum(
 std::unique_ptr<FragmentedRangeTombstoneList>
 OpenDelta::BuildFragmentedRangeTombstoneList(
     const InternalKeyComparator& icmp) const {
+  test_open_delta_materialize_count.fetch_add(1, std::memory_order_relaxed);
   if (entries_.empty()) {
     return nullptr;
   }
@@ -93,38 +129,24 @@ SequenceNumber AMTVMultiSourceAdapter::MaxCoveringTombstoneSeqnum(
   std::string best_ts;
   const auto* ucmp = icmp_->user_comparator();
 
-  // 1. Query Base
-  if (snapshot_->base && !snapshot_->base->empty()) {
-    FragmentedRangeTombstoneIterator base_iter(snapshot_->base.get(), *icmp_,
-                                               read_seq, ts_upper_bound);
-    SequenceNumber s = base_iter.MaxCoveringTombstoneSeqnum(user_key);
-    if (s > max_seq) {
-      max_seq = s;
-      if (ucmp->timestamp_size() > 0) {
-        best_ts.assign(base_iter.timestamp().data(),
-                       base_iter.timestamp().size());
-      }
-    }
-  }
-
-  // 2. Query Sealed Deltas
-  for (const auto& sealed_delta : snapshot_->sealed_deltas) {
-    if (sealed_delta && !sealed_delta->empty()) {
-      FragmentedRangeTombstoneIterator sealed_iter(sealed_delta.get(),
-                                                   *icmp_, read_seq,
-                                                   ts_upper_bound);
-      SequenceNumber s = sealed_iter.MaxCoveringTombstoneSeqnum(user_key);
+  // 1. Query Sealed Runs (pre-built FragmentedRangeTombstoneList)
+  for (const auto& run : snapshot_->sealed_runs) {
+    if (run.fragmented_list && !run.fragmented_list->empty()) {
+      FragmentedRangeTombstoneIterator run_iter(run.fragmented_list.get(),
+                                                *icmp_, read_seq,
+                                                ts_upper_bound);
+      SequenceNumber s = run_iter.MaxCoveringTombstoneSeqnum(user_key);
       if (s > max_seq) {
         max_seq = s;
         if (ucmp->timestamp_size() > 0) {
-          best_ts.assign(sealed_iter.timestamp().data(),
-                         sealed_iter.timestamp().size());
+          best_ts.assign(run_iter.timestamp().data(),
+                         run_iter.timestamp().size());
         }
       }
     }
   }
 
-  // 3. Query Open Delta
+  // 2. Query Open Delta (direct linear scan on raw entries, ZERO materialization!)
   if (snapshot_->open_delta && !snapshot_->open_delta->empty()) {
     std::string open_ts;
     SequenceNumber s = snapshot_->open_delta->MaxCoveringTombstoneSeqnum(
@@ -151,21 +173,15 @@ void AMTVMultiSourceAdapter::AddToRangeDelAggregator(
         pinned_open_lists) const {
   assert(agg != nullptr);
 
-  // 1. Add Base
-  if (snapshot_->base && !snapshot_->base->empty()) {
-    agg->AddTombstones(std::make_unique<FragmentedRangeTombstoneIterator>(
-        snapshot_->base.get(), *icmp_, read_seq));
-  }
-
-  // 2. Add Sealed Deltas
-  for (const auto& sealed_delta : snapshot_->sealed_deltas) {
-    if (sealed_delta && !sealed_delta->empty()) {
+  // 1. Add Sealed Runs
+  for (const auto& run : snapshot_->sealed_runs) {
+    if (run.fragmented_list && !run.fragmented_list->empty()) {
       agg->AddTombstones(std::make_unique<FragmentedRangeTombstoneIterator>(
-          sealed_delta.get(), *icmp_, read_seq));
+          run.fragmented_list.get(), *icmp_, read_seq));
     }
   }
 
-  // 3. Add Open Delta (via on-the-fly FragmentedRangeTombstoneList)
+  // 2. Add Open Delta (via on-the-fly FragmentedRangeTombstoneList for test reconciliation)
   if (snapshot_->open_delta && !snapshot_->open_delta->empty()) {
     auto open_list =
         snapshot_->open_delta->BuildFragmentedRangeTombstoneList(*icmp_);
@@ -224,11 +240,11 @@ void AMTVState::AddTombstone(const Slice& start_user_key,
   new_open->AddEntry(start_user_key, end_user_key, seq);
 
   if (new_open->size() >= delta_tombstones_limit_) {
-    // P0 constraint 2: projected_sealed_layers > amtv_hard_layer_limit
+    // P0 constraint 2: projected_sealed_runs > amtv_hard_layer_limit
     // triggers fallback_required. Up to hard_layer_limit_ (e.g. 8) sealed
-    // layers are served normally; only when a 9th sealed layer would form do we fall back.
-    uint32_t projected_sealed_layers = cur_snap->sealed_layer_count() + 1;
-    if (projected_sealed_layers > hard_layer_limit_) {
+    // runs are served normally; only when a 9th sealed run would form do we fall back.
+    uint32_t projected_sealed_runs = cur_snap->sealed_run_count() + 1;
+    if (projected_sealed_runs > hard_layer_limit_) {
       new_snap->fallback_required = true;
       new_snap->tombstones_at_fallback =
           cur_snap->total_tombstones() + new_open->size();
@@ -237,33 +253,23 @@ void AMTVState::AddTombstone(const Slice& start_user_key,
       fallback_required_.store(true, std::memory_order_relaxed);
       new_snap->open_delta = std::make_shared<OpenDelta>();
     } else {
-      auto sealed = new_open->BuildFragmentedRangeTombstoneList(icmp);
-      new_snap->sealed_deltas.push_back(std::move(sealed));
+      AMTVRun new_run(next_run_id_++, new_open->entries(), icmp);
+      new_snap->sealed_runs.push_back(std::move(new_run));
       new_snap->open_delta = std::make_shared<OpenDelta>();
-      uint32_t current_layers = new_snap->sealed_layer_count();
-      if (current_layers > peak_sealed_layers_.load(std::memory_order_relaxed)) {
-        peak_sealed_layers_.store(current_layers, std::memory_order_relaxed);
+      uint32_t current_runs = new_snap->sealed_run_count();
+      if (current_runs > peak_sealed_layers_.load(std::memory_order_relaxed)) {
+        peak_sealed_layers_.store(current_runs, std::memory_order_relaxed);
       }
     }
   } else {
     new_snap->open_delta = std::move(new_open);
   }
 
+  TEST_SYNC_POINT("AMTVState::AddTombstone:BeforePublish");
   AtomicSharedPtrStore(&snapshot_,
                        std::shared_ptr<const AMTVSnapshot>(std::move(new_snap)),
                        std::memory_order_release);
-}
-
-void AMTVState::SetBase(
-    std::shared_ptr<FragmentedRangeTombstoneList> base) {
-  MutexLock l(&write_mutex_);
-  auto cur_snap = AtomicSharedPtrLoad(&snapshot_, std::memory_order_relaxed);
-  auto new_snap = std::make_shared<AMTVSnapshot>(*cur_snap);
-  new_snap->publish_epoch++;
-  new_snap->base = std::move(base);
-  AtomicSharedPtrStore(&snapshot_,
-                       std::shared_ptr<const AMTVSnapshot>(std::move(new_snap)),
-                       std::memory_order_release);
+  TEST_SYNC_POINT("AMTVState::AddTombstone:AfterPublish");
 }
 
 void AMTVState::FreezeOpenDelta(const InternalKeyComparator& icmp) {
@@ -281,8 +287,8 @@ void AMTVState::FreezeOpenDelta(const InternalKeyComparator& icmp) {
   auto new_snap = std::make_shared<AMTVSnapshot>(*cur_snap);
   new_snap->publish_epoch++;
 
-  uint32_t projected_sealed_layers = cur_snap->sealed_layer_count() + 1;
-  if (projected_sealed_layers > hard_layer_limit_) {
+  uint32_t projected_sealed_runs = cur_snap->sealed_run_count() + 1;
+  if (projected_sealed_runs > hard_layer_limit_) {
     new_snap->fallback_required = true;
     new_snap->tombstones_at_fallback =
         cur_snap->total_tombstones() + cur_snap->open_delta->size();
@@ -291,18 +297,20 @@ void AMTVState::FreezeOpenDelta(const InternalKeyComparator& icmp) {
     fallback_required_.store(true, std::memory_order_relaxed);
     new_snap->open_delta = std::make_shared<OpenDelta>();
   } else {
-    auto sealed = cur_snap->open_delta->BuildFragmentedRangeTombstoneList(icmp);
-    new_snap->sealed_deltas.push_back(std::move(sealed));
+    AMTVRun new_run(next_run_id_++, cur_snap->open_delta->entries(), icmp);
+    new_snap->sealed_runs.push_back(std::move(new_run));
     new_snap->open_delta = std::make_shared<OpenDelta>();
-    uint32_t current_layers = new_snap->sealed_layer_count();
-    if (current_layers > peak_sealed_layers_.load(std::memory_order_relaxed)) {
-      peak_sealed_layers_.store(current_layers, std::memory_order_relaxed);
+    uint32_t current_runs = new_snap->sealed_run_count();
+    if (current_runs > peak_sealed_layers_.load(std::memory_order_relaxed)) {
+      peak_sealed_layers_.store(current_runs, std::memory_order_relaxed);
     }
   }
 
+  TEST_SYNC_POINT("AMTVState::FreezeOpenDelta:BeforePublish");
   AtomicSharedPtrStore(&snapshot_,
                        std::shared_ptr<const AMTVSnapshot>(std::move(new_snap)),
                        std::memory_order_release);
+  TEST_SYNC_POINT("AMTVState::FreezeOpenDelta:AfterPublish");
 }
 
 }  // namespace ROCKSDB_NAMESPACE

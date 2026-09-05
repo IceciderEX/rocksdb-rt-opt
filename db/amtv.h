@@ -88,16 +88,30 @@ class OpenDelta {
   std::vector<OpenDeltaEntry> entries_;
 };
 
+// Test hook: counter to verify zero materialization of OpenDelta during Get/MultiGet.
+extern std::atomic<uint64_t> test_open_delta_materialize_count;
+
+// Immutable AMTVRun representing a sealed run of range tombstones.
+struct AMTVRun {
+  uint64_t run_id = 0;
+  std::vector<OpenDeltaEntry> raw_entries;
+  std::shared_ptr<FragmentedRangeTombstoneList> fragmented_list;
+  uint64_t tombstone_count = 0;
+  SequenceNumber min_seq = kMaxSequenceNumber;
+  SequenceNumber max_seq = 0;
+
+  AMTVRun() = default;
+  AMTVRun(uint64_t id, std::vector<OpenDeltaEntry> entries,
+          const InternalKeyComparator& icmp);
+};
+
 // Immutable snapshot of AMTV state published atomically.
 struct AMTVSnapshot {
   uint64_t memtable_generation = 0;
   uint64_t publish_epoch = 0;
 
-  // Stable base: fragmented range tombstone list (can be nullptr if empty)
-  std::shared_ptr<FragmentedRangeTombstoneList> base;
-
-  // Sealed deltas: frozen fragmented range tombstone lists
-  std::vector<std::shared_ptr<FragmentedRangeTombstoneList>> sealed_deltas;
+  // Sealed runs: directory of immutable runs
+  std::vector<AMTVRun> sealed_runs;
 
   // Open delta: unsealed range tombstones (< delta_tombstones_limit)
   std::shared_ptr<const OpenDelta> open_delta;
@@ -109,19 +123,17 @@ struct AMTVSnapshot {
   // Total tombstone count when fallback was triggered
   uint64_t tombstones_at_fallback = 0;
 
+  uint32_t sealed_run_count() const {
+    return static_cast<uint32_t>(sealed_runs.size());
+  }
   uint32_t sealed_layer_count() const {
-    return static_cast<uint32_t>(sealed_deltas.size());
+    return sealed_run_count();
   }
 
   uint64_t total_tombstones() const {
     uint64_t count = 0;
-    if (base) {
-      count += base->num_unfragmented_tombstones();
-    }
-    for (const auto& sd : sealed_deltas) {
-      if (sd) {
-        count += sd->num_unfragmented_tombstones();
-      }
+    for (const auto& r : sealed_runs) {
+      count += r.tombstone_count;
     }
     if (open_delta) {
       count += open_delta->size();
@@ -130,21 +142,21 @@ struct AMTVSnapshot {
   }
 };
 
-// Multi-source semantic adapter for M1a/M1b.
-// Aggregates Base + Sealed Deltas + Open Delta without custom sweep-line.
+// Multi-source semantic adapter for M1/M2.
+// Aggregates Sealed Runs + Open Delta without custom sweep-line.
 class AMTVMultiSourceAdapter {
  public:
   AMTVMultiSourceAdapter(std::shared_ptr<const AMTVSnapshot> snapshot,
                          const InternalKeyComparator* icmp)
       : snapshot_(std::move(snapshot)), icmp_(icmp) {}
 
-  // Max covering sequence number across Base, Sealed Deltas, and Open Delta.
+  // Max covering sequence number across Sealed Runs and Open Delta.
   SequenceNumber MaxCoveringTombstoneSeqnum(
       const Slice& user_key, SequenceNumber read_seq,
       std::string* out_ts = nullptr,
       const Slice* ts_upper_bound = nullptr) const;
 
-  // Add Base, Sealed Deltas, and Open Delta to a native ReadRangeDelAggregator.
+  // Add Sealed Runs and Open Delta to a native ReadRangeDelAggregator.
   void AddToRangeDelAggregator(
       ReadRangeDelAggregator* agg, SequenceNumber read_seq,
       std::vector<std::unique_ptr<FragmentedRangeTombstoneList>>*
@@ -175,10 +187,7 @@ class AMTVState {
   void AddTombstone(const Slice& start_user_key, const Slice& end_user_key,
                     SequenceNumber seq, const InternalKeyComparator& icmp);
 
-  // Set base explicitly (used during state initialization or testing).
-  void SetBase(std::shared_ptr<FragmentedRangeTombstoneList> base);
-
-  // Freeze open delta into sealed delta.
+  // Freeze open delta into a new sealed AMTVRun.
   void FreezeOpenDelta(const InternalKeyComparator& icmp);
 
   // Telemetry & metrics (recorded only upon fallback to protect hot paths)
@@ -190,8 +199,11 @@ class AMTVState {
     }
   }
 
-  uint32_t peak_sealed_layers() const {
+  uint32_t peak_sealed_runs() const {
     return peak_sealed_layers_.load(std::memory_order_relaxed);
+  }
+  uint32_t peak_sealed_layers() const {
+    return peak_sealed_runs();
   }
   uint64_t get_fallback_to_native_count() const {
     return fallback_to_native_count_.load(std::memory_order_relaxed);
@@ -222,6 +234,9 @@ class AMTVState {
 
   // Synchronizes write-side mutations. Never entered by readers.
   mutable port::Mutex write_mutex_;
+
+  // Next run_id to assign to a newly sealed AMTVRun. Protected by write_mutex_.
+  uint64_t next_run_id_{1};
 
   // Atomic pointer holding current immutable snapshot.
   std::shared_ptr<const AMTVSnapshot> snapshot_;
