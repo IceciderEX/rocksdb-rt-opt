@@ -145,7 +145,7 @@ void VerifyDifferentialOracle(
 
     ReadRangeDelAggregator amtv_agg(&icmp, seq);
     std::vector<std::unique_ptr<FragmentedRangeTombstoneList>> pinned;
-    adapter.AddToRangeDelAggregator(&amtv_agg, seq, &pinned);
+    adapter.AddToRangeDelAggregator(&amtv_agg, seq, pinned);
 
     for (const auto& key : probe_keys) {
       ParsedInternalKey pik(key, seq, kTypeValue);
@@ -1097,7 +1097,7 @@ TEST_F(AMTVTest, FourWayOracleFallbackAndBoundaryTest) {
   ASSERT_EQ(snap->sealed_layer_count(), 8U);
   // P0 check 1: CEASED DELTA ACCUMULATION AFTER FALLBACK
   ASSERT_EQ(snap->open_delta->size(), 0U);
-  ASSERT_GT(state->tombstones_at_fallback(), 0U);
+  ASSERT_EQ(state->tombstones_at_fallback(), 144U);
   uint64_t fallback_tombstones = state->tombstones_at_fallback();
 
   // 4-WAY DIFFERENTIAL RECONCILIATION
@@ -1577,6 +1577,7 @@ TEST_F(AMTVTest, M2a_FourWayOracleExtension) {
   ASSERT_EQ(snap->sealed_runs.size(), 8U);
   ASSERT_EQ(state->peak_sealed_runs(), 8U);
   ASSERT_EQ(snap->open_delta->size(), 0U);
+  ASSERT_EQ(state->tombstones_at_fallback(), 144U);
 
   // Validate raw_entries preservation and fidelity in every run
   for (size_t r = 0; r < snap->sealed_runs.size(); ++r) {
@@ -1781,6 +1782,90 @@ TEST_F(AMTVTest, M2a_OpenDeltaZeroMaterialization) {
   ASSERT_EQ(count_after, count_before)
       << "OpenDelta was materialized during Get/MultiGet! Materialization count increased by "
       << (count_after - count_before);
+}
+
+TEST_F(AMTVTest, M2a1_FallbackTombstoneCountPrecision) {
+  // Test 1 & 2: delta=16, hard_layer_limit=8
+  // 143 DeleteRanges: 8 sealed runs (128 tombstones) + 15 open delta = 143 total.
+  // 144th DeleteRange: attempts to seal 9th run (projected = 9 > 8) -> triggers fallback.
+  // tombstones_at_fallback MUST be exactly 144.
+  AMTVState state1(/*memtable_generation=*/0, /*delta_limit=*/16,
+                   /*merge_soft_limit=*/4, /*hard_limit=*/8);
+  for (int i = 0; i < 143; ++i) {
+    char start[16], end[16];
+    snprintf(start, sizeof(start), "k%04d", i * 10);
+    snprintf(end, sizeof(end), "k%04d", i * 10 + 5);
+    state1.AddTombstone(start, end, i + 1, bytewise_icmp_);
+  }
+  EXPECT_FALSE(state1.is_fallback_required());
+  auto snap1_before = state1.GetSnapshot();
+  EXPECT_EQ(snap1_before->sealed_run_count(), 8U);
+  EXPECT_EQ(snap1_before->open_delta->size(), 15U);
+  EXPECT_EQ(snap1_before->total_tombstones(), 143U);
+  EXPECT_EQ(state1.tombstones_at_fallback(), 0U);
+
+  // 144th tombstone triggers fallback
+  state1.AddTombstone("k1430", "k1435", 144, bytewise_icmp_);
+  EXPECT_TRUE(state1.is_fallback_required());
+  EXPECT_EQ(state1.tombstones_at_fallback(), 144U);
+  auto snap1_fallback = state1.GetSnapshot();
+  EXPECT_TRUE(snap1_fallback->fallback_required);
+  EXPECT_EQ(snap1_fallback->tombstones_at_fallback, 144U);
+  EXPECT_EQ(snap1_fallback->open_delta->size(), 0U);
+  EXPECT_EQ(snap1_fallback->sealed_run_count(), 8U);
+
+  // Continue injecting to 160 tombstones (16 more)
+  for (int i = 144; i < 160; ++i) {
+    char start[16], end[16];
+    snprintf(start, sizeof(start), "k%04d", i * 10);
+    snprintf(end, sizeof(end), "k%04d", i * 10 + 5);
+    state1.AddTombstone(start, end, i + 1, bytewise_icmp_);
+  }
+  // Value remains exactly 144 and shadow entries do not accumulate
+  EXPECT_EQ(state1.tombstones_at_fallback(), 144U);
+  auto snap1_after = state1.GetSnapshot();
+  EXPECT_EQ(snap1_after->tombstones_at_fallback, 144U);
+  EXPECT_EQ(snap1_after->open_delta->size(), 0U);
+  EXPECT_EQ(snap1_after->sealed_run_count(), 8U);
+
+  // Test 3: Construct 8 sealed runs + non-empty Open Delta, then FreezeOpenDelta().
+  // Verify entry value equals canonical shadow total without double-counting Open Delta.
+  AMTVState state2(/*memtable_generation=*/0, /*delta_limit=*/16,
+                   /*merge_soft_limit=*/4, /*hard_limit=*/8);
+  // 8 sealed runs = 128 tombstones
+  for (int i = 0; i < 128; ++i) {
+    char start[16], end[16];
+    snprintf(start, sizeof(start), "k%04d", i * 10);
+    snprintf(end, sizeof(end), "k%04d", i * 10 + 5);
+    state2.AddTombstone(start, end, i + 1, bytewise_icmp_);
+  }
+  auto snap2_8runs = state2.GetSnapshot();
+  ASSERT_EQ(snap2_8runs->sealed_run_count(), 8U);
+  ASSERT_EQ(snap2_8runs->open_delta->size(), 0U);
+  ASSERT_EQ(snap2_8runs->total_tombstones(), 128U);
+
+  // Add 5 tombstones to open delta (total = 133)
+  for (int i = 128; i < 133; ++i) {
+    char start[16], end[16];
+    snprintf(start, sizeof(start), "k%04d", i * 10);
+    snprintf(end, sizeof(end), "k%04d", i * 10 + 5);
+    state2.AddTombstone(start, end, i + 1, bytewise_icmp_);
+  }
+  auto snap2_with_open = state2.GetSnapshot();
+  ASSERT_EQ(snap2_with_open->sealed_run_count(), 8U);
+  ASSERT_EQ(snap2_with_open->open_delta->size(), 5U);
+  ASSERT_EQ(snap2_with_open->total_tombstones(), 133U);
+  ASSERT_FALSE(state2.is_fallback_required());
+
+  // Explicitly freeze open delta -> attempts to seal 9th run (projected = 9 > 8)
+  state2.FreezeOpenDelta(bytewise_icmp_);
+  EXPECT_TRUE(state2.is_fallback_required());
+  EXPECT_EQ(state2.tombstones_at_fallback(), 133U);
+  auto snap2_frozen = state2.GetSnapshot();
+  EXPECT_TRUE(snap2_frozen->fallback_required);
+  EXPECT_EQ(snap2_frozen->tombstones_at_fallback, 133U);
+  EXPECT_EQ(snap2_frozen->open_delta->size(), 0U);
+  EXPECT_EQ(snap2_frozen->sealed_run_count(), 8U);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

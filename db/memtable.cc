@@ -1640,7 +1640,7 @@ bool MemTable::Get(const LookupKey& key, std::string* value,
       auto snap = amtv_state_->GetSnapshot();
       if (snap && snap->fallback_required) {
         // Fallback safety path: Record fallback event and use native range tombstone query
-        amtv_state_->RecordGetFallback(snap->tombstones_at_fallback);
+        amtv_state_->RecordGetFallback();
         std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
             NewRangeTombstoneIterator(read_opts,
                                       GetInternalKeySeqno(key.internal_key()),
@@ -1911,7 +1911,7 @@ void MemTable::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
       amtv_snap = amtv_state_->GetSnapshot();
       if (amtv_snap && amtv_snap->fallback_required) {
         use_amtv = false;
-        amtv_state_->RecordGetFallback(amtv_snap->tombstones_at_fallback);
+        amtv_state_->RecordGetFallback();
       }
     }
     for (auto iter = temp_range.begin(); iter != temp_range.end(); ++iter) {
@@ -2072,7 +2072,7 @@ void MemTable::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
       amtv_snap = amtv_state_->GetSnapshot();
       if (amtv_snap && amtv_snap->fallback_required) {
         use_amtv = false;
-        amtv_state_->RecordGetFallback(amtv_snap->tombstones_at_fallback);
+        amtv_state_->RecordGetFallback();
       }
     }
     for (auto iter = temp_range.begin(); iter != temp_range.end(); ++iter) {

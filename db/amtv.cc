@@ -169,7 +169,7 @@ SequenceNumber AMTVMultiSourceAdapter::MaxCoveringTombstoneSeqnum(
 
 void AMTVMultiSourceAdapter::AddToRangeDelAggregator(
     ReadRangeDelAggregator* agg, SequenceNumber read_seq,
-    std::vector<std::unique_ptr<FragmentedRangeTombstoneList>>*
+    std::vector<std::unique_ptr<FragmentedRangeTombstoneList>>&
         pinned_open_lists) const {
   assert(agg != nullptr);
 
@@ -187,9 +187,7 @@ void AMTVMultiSourceAdapter::AddToRangeDelAggregator(
         snapshot_->open_delta->BuildFragmentedRangeTombstoneList(*icmp_);
     if (open_list && !open_list->empty()) {
       auto* raw_ptr = open_list.get();
-      if (pinned_open_lists != nullptr) {
-        pinned_open_lists->push_back(std::move(open_list));
-      }
+      pinned_open_lists.push_back(std::move(open_list));
       agg->AddTombstones(std::make_unique<FragmentedRangeTombstoneIterator>(
           raw_ptr, *icmp_, read_seq));
     }
@@ -246,8 +244,9 @@ void AMTVState::AddTombstone(const Slice& start_user_key,
     uint32_t projected_sealed_runs = cur_snap->sealed_run_count() + 1;
     if (projected_sealed_runs > hard_layer_limit_) {
       new_snap->fallback_required = true;
-      new_snap->tombstones_at_fallback =
-          cur_snap->total_tombstones() + new_open->size();
+      // Fixed in M2a.1: cur_snap->total_tombstones() + 1 exactly reflects total
+      // tombstones at fallback entry (current snap total + 1 newly added tombstone).
+      new_snap->tombstones_at_fallback = cur_snap->total_tombstones() + 1;
       tombstones_at_fallback_.store(new_snap->tombstones_at_fallback,
                                     std::memory_order_relaxed);
       fallback_required_.store(true, std::memory_order_relaxed);
@@ -290,8 +289,9 @@ void AMTVState::FreezeOpenDelta(const InternalKeyComparator& icmp) {
   uint32_t projected_sealed_runs = cur_snap->sealed_run_count() + 1;
   if (projected_sealed_runs > hard_layer_limit_) {
     new_snap->fallback_required = true;
-    new_snap->tombstones_at_fallback =
-        cur_snap->total_tombstones() + cur_snap->open_delta->size();
+    // Fixed in M2a.1: cur_snap->total_tombstones() already includes cur_snap->open_delta->size().
+    // Must NOT add open_delta again.
+    new_snap->tombstones_at_fallback = cur_snap->total_tombstones();
     tombstones_at_fallback_.store(new_snap->tombstones_at_fallback,
                                   std::memory_order_relaxed);
     fallback_required_.store(true, std::memory_order_relaxed);

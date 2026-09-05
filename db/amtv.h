@@ -157,10 +157,11 @@ class AMTVMultiSourceAdapter {
       const Slice* ts_upper_bound = nullptr) const;
 
   // Add Sealed Runs and Open Delta to a native ReadRangeDelAggregator.
+  // Mandatory reference prevents dangling pointer hazards when open_delta creates temporary fragmented lists.
   void AddToRangeDelAggregator(
       ReadRangeDelAggregator* agg, SequenceNumber read_seq,
-      std::vector<std::unique_ptr<FragmentedRangeTombstoneList>>*
-          pinned_open_lists = nullptr) const;
+      std::vector<std::unique_ptr<FragmentedRangeTombstoneList>>&
+          pinned_open_lists) const;
 
   const AMTVSnapshot* snapshot() const { return snapshot_.get(); }
 
@@ -191,12 +192,8 @@ class AMTVState {
   void FreezeOpenDelta(const InternalKeyComparator& icmp);
 
   // Telemetry & metrics (recorded only upon fallback to protect hot paths)
-  void RecordGetFallback(uint64_t tombstones = 0) {
+  void RecordGetFallback() {
     fallback_to_native_count_.fetch_add(1, std::memory_order_relaxed);
-    if (tombstones > 0) {
-      total_fallback_tombstones_.fetch_add(tombstones, std::memory_order_relaxed);
-      last_fallback_tombstones_.store(tombstones, std::memory_order_relaxed);
-    }
   }
 
   uint32_t peak_sealed_runs() const {
@@ -207,12 +204,6 @@ class AMTVState {
   }
   uint64_t get_fallback_to_native_count() const {
     return fallback_to_native_count_.load(std::memory_order_relaxed);
-  }
-  uint64_t total_fallback_tombstones() const {
-    return total_fallback_tombstones_.load(std::memory_order_relaxed);
-  }
-  uint64_t last_fallback_tombstones() const {
-    return last_fallback_tombstones_.load(std::memory_order_relaxed);
   }
   uint64_t tombstones_at_fallback() const {
     return tombstones_at_fallback_.load(std::memory_order_relaxed);
@@ -246,8 +237,6 @@ class AMTVState {
   std::atomic<uint64_t> tombstones_at_fallback_{0};
   std::atomic<uint32_t> peak_sealed_layers_{0};
   std::atomic<uint64_t> fallback_to_native_count_{0};
-  std::atomic<uint64_t> total_fallback_tombstones_{0};
-  std::atomic<uint64_t> last_fallback_tombstones_{0};
 };
 
 }  // namespace ROCKSDB_NAMESPACE
