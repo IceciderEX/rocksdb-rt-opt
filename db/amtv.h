@@ -5,7 +5,13 @@
 
 #pragma once
 
+#include <algorithm>
+#include <chrono>
+#include <fstream>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -129,6 +135,23 @@ bool FindMergePair(
 bool HasMergeablePair(
     const std::vector<std::shared_ptr<const AMTVRun>>& sealed_runs);
 
+inline std::string FormatRunLevelHistogram(
+    const std::vector<std::shared_ptr<const AMTVRun>>& sealed_runs) {
+  std::map<uint32_t, uint32_t> hist;
+  for (const auto& r : sealed_runs) {
+    if (r) hist[r->level]++;
+  }
+  std::string s = "{";
+  bool first = true;
+  for (const auto& p : hist) {
+    if (!first) s += ", ";
+    s += "L" + std::to_string(p.first) + ":" + std::to_string(p.second);
+    first = false;
+  }
+  s += "}";
+  return s;
+}
+
 // Immutable snapshot of AMTV state published atomically.
 struct AMTVSnapshot {
   uint64_t memtable_generation = 0;
@@ -197,6 +220,188 @@ class AMTVMultiSourceAdapter {
   std::shared_ptr<const AMTVSnapshot> snapshot_;
   const InternalKeyComparator* icmp_;
 };
+
+// Structure for recording low-frequency AMTV timeline events
+struct AMTVTimelineRecord {
+  uint64_t monotonic_timestamp_us = 0;
+  std::string phase;
+  uint64_t foreground_ops_completed = 0;
+  uint64_t delete_ranges_issued = 0;
+  std::string event_type;  // SEAL, MERGE_SUBMIT, MERGE_START, MERGE_DONE, MERGE_PUBLISH, MERGE_DISCARD, FALLBACK
+  uint32_t open_delta_size = 0;
+  uint32_t sealed_run_count = 0;
+  uint32_t hard_run_limit = 0;
+  std::string input_run_ids;
+  std::string output_run_id;
+  std::string input_levels;
+  std::string output_level;
+  std::string input_chunks;
+  std::string output_chunk_count;
+  std::string input_tombstones;
+  std::string output_tombstone_count;
+  uint64_t merge_queue_wait_us = 0;
+  uint64_t merge_wall_time_us = 0;
+  uint64_t merge_cpu_time_us = 0;
+  std::string pre_publish_hist;
+  std::string post_publish_hist;
+  std::string fallback_details;
+};
+
+// Thread-safe low-frequency event timeline logger for AMTV
+class AMTVTimelineLogger {
+ public:
+  static AMTVTimelineLogger& Get() {
+    static AMTVTimelineLogger instance;
+    return instance;
+  }
+
+  void Reset() {
+    std::lock_guard<std::mutex> lock(mu_);
+    records_.clear();
+    phase_ = "INIT";
+    foreground_ops_.store(0, std::memory_order_relaxed);
+    delete_ranges_.store(0, std::memory_order_relaxed);
+    enabled_.store(true, std::memory_order_relaxed);
+  }
+
+  void SetEnabled(bool enabled) {
+    enabled_.store(enabled, std::memory_order_relaxed);
+  }
+
+  bool IsEnabled() const {
+    return enabled_.load(std::memory_order_relaxed);
+  }
+
+  void SetPhase(const std::string& phase) {
+    std::lock_guard<std::mutex> lock(mu_);
+    phase_ = phase;
+  }
+
+  std::string GetPhase() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return phase_;
+  }
+
+  void RecordForegroundOp(uint64_t n = 1) {
+    foreground_ops_.fetch_add(n, std::memory_order_relaxed);
+  }
+
+  void RecordDeleteRange(uint64_t n = 1) {
+    delete_ranges_.fetch_add(n, std::memory_order_relaxed);
+  }
+
+  uint64_t GetForegroundOps() const {
+    return foreground_ops_.load(std::memory_order_relaxed);
+  }
+
+  uint64_t GetDeleteRanges() const {
+    return delete_ranges_.load(std::memory_order_relaxed);
+  }
+
+  void LogEvent(const AMTVTimelineRecord& record) {
+    if (!enabled_.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::mutex> lock(mu_);
+    AMTVTimelineRecord rec = record;
+    if (rec.monotonic_timestamp_us == 0) {
+      rec.monotonic_timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    if (rec.phase.empty()) {
+      rec.phase = phase_;
+    }
+    if (rec.foreground_ops_completed == 0) {
+      rec.foreground_ops_completed = foreground_ops_.load(std::memory_order_relaxed);
+    }
+    if (rec.delete_ranges_issued == 0) {
+      rec.delete_ranges_issued = delete_ranges_.load(std::memory_order_relaxed);
+    }
+    records_.push_back(std::move(rec));
+  }
+
+  bool DumpToCsv(const std::string& file_path) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    std::ofstream out(file_path);
+    if (!out.is_open()) return false;
+    out << "monotonic_timestamp_us,phase,foreground_ops_completed,delete_ranges_issued,"
+        << "event_type,open_delta_size,sealed_run_count,hard_run_limit,"
+        << "input_run_ids,output_run_id,input_levels,output_level,"
+        << "input_chunks,output_chunk_count,input_tombstones,output_tombstone_count,"
+        << "merge_queue_wait_us,merge_wall_time_us,merge_cpu_time_us,"
+        << "pre_publish_hist,post_publish_hist,fallback_details\n";
+    for (const auto& r : records_) {
+      out << r.monotonic_timestamp_us << ","
+          << r.phase << ","
+          << r.foreground_ops_completed << ","
+          << r.delete_ranges_issued << ","
+          << r.event_type << ","
+          << r.open_delta_size << ","
+          << r.sealed_run_count << ","
+          << r.hard_run_limit << ","
+          << "\"" << r.input_run_ids << "\","
+          << "\"" << r.output_run_id << "\","
+          << "\"" << r.input_levels << "\","
+          << "\"" << r.output_level << "\","
+          << "\"" << r.input_chunks << "\","
+          << "\"" << r.output_chunk_count << "\","
+          << "\"" << r.input_tombstones << "\","
+          << "\"" << r.output_tombstone_count << "\","
+          << r.merge_queue_wait_us << ","
+          << r.merge_wall_time_us << ","
+          << r.merge_cpu_time_us << ","
+          << "\"" << r.pre_publish_hist << "\","
+          << "\"" << r.post_publish_hist << "\","
+          << "\"" << r.fallback_details << "\"\n";
+    }
+    return true;
+  }
+
+  std::vector<AMTVTimelineRecord> GetRecords() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return records_;
+  }
+
+ private:
+  AMTVTimelineLogger() = default;
+  mutable std::mutex mu_;
+  std::vector<AMTVTimelineRecord> records_;
+  std::string phase_{"INIT"};
+  std::atomic<uint64_t> foreground_ops_{0};
+  std::atomic<uint64_t> delete_ranges_{0};
+  std::atomic<bool> enabled_{true};
+};
+
+// Thread-local statistics for inspecting sealed runs and open delta during Get
+struct AMTVGetProbeStats {
+  uint64_t get_count = 0;
+  uint64_t sealed_runs_sum = 0;
+  uint64_t open_delta_entries_sum = 0;
+  uint32_t sealed_runs_max = 0;
+  uint32_t open_delta_entries_max = 0;
+  uint64_t sealed_runs_hist[64] = {0};
+  uint64_t open_delta_hist[1024] = {0};
+
+  void Reset() {
+    get_count = 0;
+    sealed_runs_sum = 0;
+    open_delta_entries_sum = 0;
+    sealed_runs_max = 0;
+    open_delta_entries_max = 0;
+    std::fill(std::begin(sealed_runs_hist), std::end(sealed_runs_hist), 0);
+    std::fill(std::begin(open_delta_hist), std::end(open_delta_hist), 0);
+  }
+
+  void MergeFrom(const AMTVGetProbeStats& o) {
+    get_count += o.get_count;
+    sealed_runs_sum += o.sealed_runs_sum;
+    open_delta_entries_sum += o.open_delta_entries_sum;
+    if (o.sealed_runs_max > sealed_runs_max) sealed_runs_max = o.sealed_runs_max;
+    if (o.open_delta_entries_max > open_delta_entries_max) open_delta_entries_max = o.open_delta_entries_max;
+    for (size_t i = 0; i < 64; ++i) sealed_runs_hist[i] += o.sealed_runs_hist[i];
+    for (size_t i = 0; i < 1024; ++i) open_delta_hist[i] += o.open_delta_hist[i];
+  }
+};
+extern thread_local AMTVGetProbeStats tl_amtv_get_probe_stats;
+extern std::atomic<bool> g_amtv_get_probe_stats_enabled;
 
 // Lifecycle state of AMTV background merge task (M2c.1)
 enum class MergeTaskState {
@@ -334,6 +539,41 @@ class AMTVState : public std::enable_shared_from_this<AMTVState> {
     return fallback_event_count_.load(std::memory_order_relaxed);
   }
 
+  uint64_t max_single_merge_wall_time_nanos() const {
+    return max_single_merge_wall_time_nanos_.load(std::memory_order_relaxed);
+  }
+  uint64_t max_single_merge_cpu_time_nanos() const {
+    return max_single_merge_cpu_time_nanos_.load(std::memory_order_relaxed);
+  }
+  uint32_t max_single_merge_level() const {
+    return max_single_merge_level_.load(std::memory_order_relaxed);
+  }
+
+  std::map<uint32_t, uint64_t> merge_count_per_level() const {
+    MutexLock l(&write_mutex_);
+    return merge_count_per_level_;
+  }
+  std::map<uint32_t, uint64_t> merge_input_tombstones_per_level() const {
+    MutexLock l(&write_mutex_);
+    return merge_input_tombstones_per_level_;
+  }
+  std::map<uint32_t, uint64_t> merge_wall_time_nanos_per_level() const {
+    MutexLock l(&write_mutex_);
+    return merge_wall_time_nanos_per_level_;
+  }
+  std::map<uint32_t, uint64_t> merge_cpu_time_nanos_per_level() const {
+    MutexLock l(&write_mutex_);
+    return merge_cpu_time_nanos_per_level_;
+  }
+  std::map<uint32_t, uint64_t> merge_queue_wait_nanos_per_level() const {
+    MutexLock l(&write_mutex_);
+    return merge_queue_wait_nanos_per_level_;
+  }
+  std::map<uint32_t, uint32_t> peak_run_level_histogram() const {
+    MutexLock l(&write_mutex_);
+    return peak_run_level_histogram_;
+  }
+
   uint64_t memtable_generation() const { return memtable_generation_; }
   uint32_t delta_tombstones_limit() const { return delta_tombstones_limit_; }
   uint32_t merge_soft_limit() const { return merge_soft_limit_; }
@@ -394,10 +634,16 @@ class AMTVState : public std::enable_shared_from_this<AMTVState> {
   std::atomic<uint32_t> runs_at_fallback_{0};
   std::atomic<uint64_t> raw_entries_struct_bytes_peak_{0};
   std::atomic<uint64_t> in_flight_merge_struct_bytes_peak_{0};
+  std::atomic<uint64_t> max_single_merge_wall_time_nanos_{0};
+  std::atomic<uint64_t> max_single_merge_cpu_time_nanos_{0};
+  std::atomic<uint32_t> max_single_merge_level_{0};
 
   // Per-level breakdown (protected by write_mutex_)
   std::map<uint32_t, uint64_t> merge_count_per_level_;
   std::map<uint32_t, uint64_t> merge_input_tombstones_per_level_;
+  std::map<uint32_t, uint64_t> merge_wall_time_nanos_per_level_;
+  std::map<uint32_t, uint64_t> merge_cpu_time_nanos_per_level_;
+  std::map<uint32_t, uint64_t> merge_queue_wait_nanos_per_level_;
   std::map<uint32_t, uint32_t> peak_run_level_histogram_;
 };
 

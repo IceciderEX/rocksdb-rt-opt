@@ -16,6 +16,8 @@
 namespace ROCKSDB_NAMESPACE {
 
 std::atomic<uint64_t> test_open_delta_materialize_count{0};
+thread_local AMTVGetProbeStats tl_amtv_get_probe_stats;
+std::atomic<bool> g_amtv_get_probe_stats_enabled{false};
 
 AMTVRun::AMTVRun(uint64_t id, uint32_t lvl, uint64_t chunk_count, bool partial,
                  std::vector<OpenDeltaEntry> entries,
@@ -196,6 +198,26 @@ SequenceNumber AMTVMultiSourceAdapter::MaxCoveringTombstoneSeqnum(
   SequenceNumber max_seq = 0;
   std::string best_ts;
   const auto* ucmp = icmp_->user_comparator();
+
+  if (g_amtv_get_probe_stats_enabled.load(std::memory_order_relaxed)) {
+    size_t n_runs = snapshot_->sealed_runs.size();
+    size_t n_open = snapshot_->open_delta ? snapshot_->open_delta->size() : 0;
+    tl_amtv_get_probe_stats.get_count++;
+    tl_amtv_get_probe_stats.sealed_runs_sum += n_runs;
+    tl_amtv_get_probe_stats.open_delta_entries_sum += n_open;
+    if (n_runs > tl_amtv_get_probe_stats.sealed_runs_max) {
+      tl_amtv_get_probe_stats.sealed_runs_max = static_cast<uint32_t>(n_runs);
+    }
+    if (n_open > tl_amtv_get_probe_stats.open_delta_entries_max) {
+      tl_amtv_get_probe_stats.open_delta_entries_max = static_cast<uint32_t>(n_open);
+    }
+    if (n_runs < 64) {
+      tl_amtv_get_probe_stats.sealed_runs_hist[n_runs]++;
+    }
+    if (n_open < 1024) {
+      tl_amtv_get_probe_stats.open_delta_hist[n_open]++;
+    }
+  }
 
   // 1. Query Sealed Runs (pre-built FragmentedRangeTombstoneList)
   for (const auto& run : snapshot_->sealed_runs) {
@@ -427,10 +449,24 @@ void AMTVState::AddTombstone(const Slice& start_user_key,
         fallback_required_.store(true, std::memory_order_relaxed);
         fallback_event_count_.fetch_add(1, std::memory_order_relaxed);
         new_snap->open_delta = std::make_shared<OpenDelta>();
+
+        AMTVTimelineRecord rec;
+        rec.event_type = "FALLBACK";
+        rec.open_delta_size = static_cast<uint32_t>(new_open->size());
+        rec.sealed_run_count = cur_snap->sealed_run_count();
+        rec.hard_run_limit = hard_layer_limit_;
+        rec.pre_publish_hist = FormatRunLevelHistogram(cur_snap->sealed_runs);
+        rec.post_publish_hist = rec.pre_publish_hist;
+        rec.fallback_details = "tombstones=" + std::to_string(new_snap->tombstones_at_fallback) +
+                               ",delete_range_idx=" + std::to_string(AMTVTimelineLogger::Get().GetDeleteRanges()) +
+                               ",projected_runs=" + std::to_string(projected_sealed_runs) +
+                               ",hard_limit=" + std::to_string(hard_layer_limit_);
+        AMTVTimelineLogger::Get().LogEvent(rec);
       } else {
         auto new_run = std::make_shared<const AMTVRun>(
             next_run_id_++, /*level=*/0, /*chunk_count=*/1, /*is_partial=*/false,
             new_open->entries(), icmp);
+        uint64_t new_run_id = new_run->run_id;
         new_snap->sealed_runs.push_back(std::move(new_run));
         new_snap->open_delta = std::make_shared<OpenDelta>();
         uint32_t current_runs = new_snap->sealed_run_count();
@@ -447,6 +483,19 @@ void AMTVState::AddTombstone(const Slice& start_user_key,
           peak_run_level_histogram_[p.first] =
               std::max(peak_run_level_histogram_[p.first], p.second);
         }
+
+        AMTVTimelineRecord rec;
+        rec.event_type = "SEAL";
+        rec.open_delta_size = 0;
+        rec.sealed_run_count = new_snap->sealed_run_count();
+        rec.hard_run_limit = hard_layer_limit_;
+        rec.output_run_id = std::to_string(new_run_id);
+        rec.output_level = "0";
+        rec.output_chunk_count = "1";
+        rec.output_tombstone_count = std::to_string(delta_tombstones_limit_);
+        rec.pre_publish_hist = FormatRunLevelHistogram(cur_snap->sealed_runs);
+        rec.post_publish_hist = FormatRunLevelHistogram(new_snap->sealed_runs);
+        AMTVTimelineLogger::Get().LogEvent(rec);
 
         uint64_t current_raw_bytes = 0;
         for (const auto& r : new_snap->sealed_runs) {
@@ -510,6 +559,16 @@ void AMTVState::FreezeOpenDelta(const InternalKeyComparator& icmp) {
       fallback_required_.store(true, std::memory_order_relaxed);
       fallback_event_count_.fetch_add(1, std::memory_order_relaxed);
       new_snap->open_delta = std::make_shared<OpenDelta>();
+
+      AMTVTimelineRecord rec;
+      rec.event_type = "FALLBACK";
+      rec.open_delta_size = static_cast<uint32_t>(cur_snap->open_delta ? cur_snap->open_delta->size() : 0);
+      rec.sealed_run_count = cur_snap->sealed_run_count();
+      rec.hard_run_limit = hard_layer_limit_;
+      rec.pre_publish_hist = FormatRunLevelHistogram(cur_snap->sealed_runs);
+      rec.post_publish_hist = rec.pre_publish_hist;
+      rec.fallback_details = "FreezeOpenDelta:tombstones=" + std::to_string(new_snap->tombstones_at_fallback);
+      AMTVTimelineLogger::Get().LogEvent(rec);
     } else {
       bool is_partial =
           (cur_snap->open_delta->size() < delta_tombstones_limit_);
@@ -517,6 +576,8 @@ void AMTVState::FreezeOpenDelta(const InternalKeyComparator& icmp) {
       auto new_run = std::make_shared<const AMTVRun>(
           next_run_id_++, /*level=*/0, chunk_count, is_partial,
           cur_snap->open_delta->entries(), icmp);
+      uint64_t new_run_id = new_run->run_id;
+      uint64_t t_count = new_run->tombstone_count;
       new_snap->sealed_runs.push_back(std::move(new_run));
       new_snap->open_delta = std::make_shared<OpenDelta>();
       uint32_t current_runs = new_snap->sealed_run_count();
@@ -533,6 +594,19 @@ void AMTVState::FreezeOpenDelta(const InternalKeyComparator& icmp) {
         peak_run_level_histogram_[p.first] =
             std::max(peak_run_level_histogram_[p.first], p.second);
       }
+
+      AMTVTimelineRecord rec;
+      rec.event_type = "SEAL";
+      rec.open_delta_size = 0;
+      rec.sealed_run_count = new_snap->sealed_run_count();
+      rec.hard_run_limit = hard_layer_limit_;
+      rec.output_run_id = std::to_string(new_run_id);
+      rec.output_level = "0";
+      rec.output_chunk_count = std::to_string(chunk_count);
+      rec.output_tombstone_count = std::to_string(t_count);
+      rec.pre_publish_hist = FormatRunLevelHistogram(cur_snap->sealed_runs);
+      rec.post_publish_hist = FormatRunLevelHistogram(new_snap->sealed_runs);
+      AMTVTimelineLogger::Get().LogEvent(rec);
 
       if (!is_partial && current_runs >= merge_soft_limit_ &&
           HasMergeablePair(new_snap->sealed_runs)) {
@@ -620,6 +694,15 @@ void AMTVState::MaybeScheduleMerge() {
     task_state_ = MergeTaskState::kQueued;
     task_cond_.SignalAll();
   }
+
+  AMTVTimelineRecord rec;
+  rec.event_type = "MERGE_SUBMIT";
+  rec.sealed_run_count = snap->sealed_run_count();
+  rec.hard_run_limit = hard_layer_limit_;
+  rec.open_delta_size = static_cast<uint32_t>(snap->open_delta ? snap->open_delta->size() : 0);
+  rec.pre_publish_hist = FormatRunLevelHistogram(snap->sealed_runs);
+  rec.post_publish_hist = rec.pre_publish_hist;
+  AMTVTimelineLogger::Get().LogEvent(rec);
 }
 
 void AMTVState::BGMergeWrapper(void* arg) {
@@ -680,14 +763,15 @@ void AMTVState::BGMergeTask() {
   struct timespec start_cpu_ts;
   clock_gettime(CLOCK_THREAD_CPUTIME_ID, &start_cpu_ts);
 
+  uint64_t queue_wait_us = 0;
   {
     MutexLock l(&task_mu_);
     task_state_ = MergeTaskState::kRunning;
     if (last_scheduled_time_nanos_ > 0 &&
         start_wall_time >= last_scheduled_time_nanos_) {
-      task_queue_wait_time_nanos_.fetch_add(
-          start_wall_time - last_scheduled_time_nanos_,
-          std::memory_order_relaxed);
+      uint64_t wait_nanos = start_wall_time - last_scheduled_time_nanos_;
+      task_queue_wait_time_nanos_.fetch_add(wait_nanos, std::memory_order_relaxed);
+      queue_wait_us = wait_nanos / 1000;
     }
   }
 
@@ -710,6 +794,14 @@ void AMTVState::BGMergeTask() {
       is_invalidated_.load(std::memory_order_relaxed) ||
       snap->sealed_runs.size() < merge_soft_limit_) {
     merge_discarded_.fetch_add(1, std::memory_order_relaxed);
+    AMTVTimelineRecord rec;
+    rec.event_type = "MERGE_DISCARD";
+    rec.merge_queue_wait_us = queue_wait_us;
+    rec.sealed_run_count = snap ? snap->sealed_run_count() : 0;
+    rec.hard_run_limit = hard_layer_limit_;
+    rec.pre_publish_hist = snap ? FormatRunLevelHistogram(snap->sealed_runs) : "";
+    rec.post_publish_hist = rec.pre_publish_hist;
+    AMTVTimelineLogger::Get().LogEvent(rec);
     cleanup_running();
     return;
   }
@@ -718,6 +810,14 @@ void AMTVState::BGMergeTask() {
   std::shared_ptr<const AMTVRun> run_a, run_b;
   if (!FindMergePair(snap->sealed_runs, &run_a, &run_b)) {
     merge_discarded_.fetch_add(1, std::memory_order_relaxed);
+    AMTVTimelineRecord rec;
+    rec.event_type = "MERGE_DISCARD";
+    rec.merge_queue_wait_us = queue_wait_us;
+    rec.sealed_run_count = snap ? snap->sealed_run_count() : 0;
+    rec.hard_run_limit = hard_layer_limit_;
+    rec.pre_publish_hist = snap ? FormatRunLevelHistogram(snap->sealed_runs) : "";
+    rec.post_publish_hist = rec.pre_publish_hist;
+    AMTVTimelineLogger::Get().LogEvent(rec);
     cleanup_running();
     return;
   }
@@ -731,6 +831,21 @@ void AMTVState::BGMergeTask() {
       run_a->source_chunk_count + run_b->source_chunk_count;
   uint64_t total_input_tombstones =
       run_a->raw_entries.size() + run_b->raw_entries.size();
+
+  {
+    AMTVTimelineRecord rec;
+    rec.event_type = "MERGE_START";
+    rec.merge_queue_wait_us = queue_wait_us;
+    rec.sealed_run_count = snap->sealed_run_count();
+    rec.hard_run_limit = hard_layer_limit_;
+    rec.input_run_ids = "[" + std::to_string(run_a_id) + "," + std::to_string(run_b_id) + "]";
+    rec.input_levels = "[" + std::to_string(input_level) + "," + std::to_string(input_level) + "]";
+    rec.input_chunks = "[" + std::to_string(input_chunk_count) + "," + std::to_string(input_chunk_count) + "]";
+    rec.input_tombstones = "[" + std::to_string(run_a->raw_entries.size()) + "," + std::to_string(run_b->raw_entries.size()) + "]";
+    rec.pre_publish_hist = FormatRunLevelHistogram(snap->sealed_runs);
+    rec.post_publish_hist = rec.pre_publish_hist;
+    AMTVTimelineLogger::Get().LogEvent(rec);
+  }
 
   uint64_t in_flight_bytes = total_input_tombstones * sizeof(OpenDeltaEntry);
   uint64_t prev_in_flight =
@@ -758,6 +873,26 @@ void AMTVState::BGMergeTask() {
   auto merged_run = std::make_shared<const AMTVRun>(
       merged_run_id, new_level, new_chunk_count, /*is_partial=*/false,
       std::move(merged_entries), *icmp_to_use);
+
+  uint64_t compute_wall_nanos = env->NowNanos() - start_wall_time;
+  struct timespec mid_cpu_ts;
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mid_cpu_ts);
+  uint64_t compute_cpu_nanos =
+      (mid_cpu_ts.tv_sec - start_cpu_ts.tv_sec) * 1000000000ULL +
+      (mid_cpu_ts.tv_nsec - start_cpu_ts.tv_nsec);
+
+  {
+    AMTVTimelineRecord rec;
+    rec.event_type = "MERGE_DONE";
+    rec.merge_queue_wait_us = queue_wait_us;
+    rec.merge_wall_time_us = compute_wall_nanos / 1000;
+    rec.merge_cpu_time_us = compute_cpu_nanos / 1000;
+    rec.output_run_id = std::to_string(merged_run_id);
+    rec.output_level = std::to_string(new_level);
+    rec.output_chunk_count = std::to_string(new_chunk_count);
+    rec.output_tombstone_count = std::to_string(total_input_tombstones);
+    AMTVTimelineLogger::Get().LogEvent(rec);
+  }
 
   TEST_SYNC_POINT("AMTVState::BGMerge:AfterMergeBeforePublish");
 
@@ -850,8 +985,46 @@ void AMTVState::BGMergeTask() {
           (end_cpu_ts.tv_sec - start_cpu_ts.tv_sec) * 1000000000ULL +
           (end_cpu_ts.tv_nsec - start_cpu_ts.tv_nsec);
       merge_cpu_time_nanos_.fetch_add(elapsed_cpu, std::memory_order_relaxed);
+
+      merge_wall_time_nanos_per_level_[input_level] += elapsed_wall;
+      merge_cpu_time_nanos_per_level_[input_level] += elapsed_cpu;
+      merge_queue_wait_nanos_per_level_[input_level] += queue_wait_us * 1000ULL;
+
+      uint64_t prev_max_wall = max_single_merge_wall_time_nanos_.load(std::memory_order_relaxed);
+      while (elapsed_wall > prev_max_wall &&
+             !max_single_merge_wall_time_nanos_.compare_exchange_weak(
+                 prev_max_wall, elapsed_wall, std::memory_order_relaxed)) {}
+      if (elapsed_wall >= prev_max_wall) {
+        max_single_merge_cpu_time_nanos_.store(elapsed_cpu, std::memory_order_relaxed);
+        max_single_merge_level_.store(input_level, std::memory_order_relaxed);
+      }
+
+      AMTVTimelineRecord rec;
+      rec.event_type = "MERGE_PUBLISH";
+      rec.merge_queue_wait_us = queue_wait_us;
+      rec.merge_wall_time_us = elapsed_wall / 1000;
+      rec.merge_cpu_time_us = elapsed_cpu / 1000;
+      rec.sealed_run_count = AtomicSharedPtrLoad(&snapshot_, std::memory_order_relaxed)->sealed_run_count();
+      rec.hard_run_limit = hard_layer_limit_;
+      rec.output_run_id = std::to_string(merged_run_id);
+      rec.output_level = std::to_string(new_level);
+      rec.output_chunk_count = std::to_string(new_chunk_count);
+      rec.output_tombstone_count = std::to_string(total_input_tombstones);
+      rec.pre_publish_hist = FormatRunLevelHistogram(cur_snap->sealed_runs);
+      rec.post_publish_hist = FormatRunLevelHistogram(AtomicSharedPtrLoad(&snapshot_, std::memory_order_relaxed)->sealed_runs);
+      AMTVTimelineLogger::Get().LogEvent(rec);
     } else {
       merge_discarded_.fetch_add(1, std::memory_order_relaxed);
+
+      AMTVTimelineRecord rec;
+      rec.event_type = "MERGE_DISCARD";
+      rec.merge_queue_wait_us = queue_wait_us;
+      rec.merge_wall_time_us = (env->NowNanos() - start_wall_time) / 1000;
+      rec.sealed_run_count = cur_snap ? cur_snap->sealed_run_count() : 0;
+      rec.hard_run_limit = hard_layer_limit_;
+      rec.pre_publish_hist = cur_snap ? FormatRunLevelHistogram(cur_snap->sealed_runs) : "";
+      rec.post_publish_hist = rec.pre_publish_hist;
+      AMTVTimelineLogger::Get().LogEvent(rec);
     }
     TEST_SYNC_POINT("AMTVState::BGMerge:AfterPublish");
   }
