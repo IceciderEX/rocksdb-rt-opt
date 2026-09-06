@@ -16,8 +16,10 @@
 namespace ROCKSDB_NAMESPACE {
 
 std::atomic<uint64_t> test_open_delta_materialize_count{0};
+#ifdef ROCKSDB_READ_PATH_AUDIT
 thread_local AMTVGetProbeStats tl_amtv_get_probe_stats;
 std::atomic<bool> g_amtv_get_probe_stats_enabled{false};
+#endif
 
 AMTVRun::AMTVRun(uint64_t id, uint32_t lvl, uint64_t chunk_count, bool partial,
                  std::vector<OpenDeltaEntry> entries,
@@ -29,7 +31,10 @@ AMTVRun::AMTVRun(uint64_t id, uint32_t lvl, uint64_t chunk_count, bool partial,
       raw_entries(std::move(entries)),
       tombstone_count(raw_entries.size()),
       min_seq(kMaxSequenceNumber),
-      max_seq(0) {
+      max_seq(0),
+      raw_payload_bytes(0),
+      raw_capacity_proxy_bytes(0),
+      fragment_payload_bytes(0) {
   if (raw_entries.empty()) {
     return;
   }
@@ -39,6 +44,7 @@ AMTVRun::AMTVRun(uint64_t id, uint32_t lvl, uint64_t chunk_count, bool partial,
   values.reserve(raw_entries.size());
 
   for (const auto& entry : raw_entries) {
+    raw_payload_bytes += entry.ikey.size() + entry.end_key.size();
     keys.emplace_back(entry.ikey.Encode().ToString());
     values.emplace_back(entry.end_key);
     if (entry.sequence() < min_seq) {
@@ -48,11 +54,16 @@ AMTVRun::AMTVRun(uint64_t id, uint32_t lvl, uint64_t chunk_count, bool partial,
       max_seq = entry.sequence();
     }
   }
+  raw_capacity_proxy_bytes =
+      raw_entries.capacity() * sizeof(OpenDeltaEntry) + raw_payload_bytes;
 
   auto iter = std::make_unique<VectorIterator>(std::move(keys),
                                                std::move(values), &icmp);
   fragmented_list =
       std::make_shared<FragmentedRangeTombstoneList>(std::move(iter), icmp);
+  if (fragmented_list) {
+    fragment_payload_bytes = fragmented_list->total_tombstone_payload_bytes();
+  }
 }
 
 bool FindMergePair(
@@ -199,6 +210,7 @@ SequenceNumber AMTVMultiSourceAdapter::MaxCoveringTombstoneSeqnum(
   std::string best_ts;
   const auto* ucmp = icmp_->user_comparator();
 
+#ifdef ROCKSDB_READ_PATH_AUDIT
   if (g_amtv_get_probe_stats_enabled.load(std::memory_order_relaxed)) {
     size_t n_runs = snapshot_->sealed_runs.size();
     size_t n_open = snapshot_->open_delta ? snapshot_->open_delta->size() : 0;
@@ -218,6 +230,7 @@ SequenceNumber AMTVMultiSourceAdapter::MaxCoveringTombstoneSeqnum(
       tl_amtv_get_probe_stats.open_delta_hist[n_open]++;
     }
   }
+#endif
 
   // 1. Query Sealed Runs (pre-built FragmentedRangeTombstoneList)
   for (const auto& run : snapshot_->sealed_runs) {
@@ -405,6 +418,32 @@ std::string AMTVState::priority_used() const {
   return priority_used_;
 }
 
+void AMTVState::UpdateMemoryProxyPeaks(const AMTVSnapshot* snap) {
+  if (!snap) return;
+  uint64_t total_payload = 0;
+  uint64_t total_capacity = 0;
+  uint64_t total_fragment = 0;
+  for (const auto& r : snap->sealed_runs) {
+    if (r) {
+      total_payload += r->raw_payload_bytes;
+      total_capacity += r->raw_capacity_proxy_bytes;
+      total_fragment += r->fragment_payload_bytes;
+    }
+  }
+  if (snap->open_delta) {
+    total_payload += snap->open_delta->raw_payload_bytes();
+    total_capacity += snap->open_delta->raw_capacity_proxy_bytes();
+  }
+
+  auto update_peak = [](std::atomic<uint64_t>& peak, uint64_t val) {
+    uint64_t cur = peak.load(std::memory_order_relaxed);
+    while (val > cur && !peak.compare_exchange_weak(cur, val, std::memory_order_relaxed)) {}
+  };
+  update_peak(raw_entry_payload_bytes_peak_, total_payload);
+  update_peak(raw_entry_capacity_proxy_bytes_peak_, total_capacity);
+  update_peak(fragment_payload_proxy_bytes_peak_, total_fragment);
+}
+
 void AMTVState::AddTombstone(const Slice& start_user_key,
                              const Slice& end_user_key, SequenceNumber seq,
                              const InternalKeyComparator& icmp) {
@@ -516,6 +555,7 @@ void AMTVState::AddTombstone(const Slice& start_user_key,
       new_snap->open_delta = std::move(new_open);
     }
 
+    UpdateMemoryProxyPeaks(new_snap.get());
     TEST_SYNC_POINT("AMTVState::AddTombstone:BeforePublish");
     AtomicSharedPtrStore(&snapshot_,
                          std::shared_ptr<const AMTVSnapshot>(std::move(new_snap)),
@@ -614,6 +654,7 @@ void AMTVState::FreezeOpenDelta(const InternalKeyComparator& icmp) {
       }
     }
 
+    UpdateMemoryProxyPeaks(new_snap.get());
     TEST_SYNC_POINT("AMTVState::FreezeOpenDelta:BeforePublish");
     AtomicSharedPtrStore(&snapshot_,
                          std::shared_ptr<const AMTVSnapshot>(std::move(new_snap)),
@@ -664,6 +705,7 @@ void AMTVState::MaybeScheduleMerge() {
       return;
     }
     task_state_ = MergeTaskState::kSubmitting;
+    diagnostic_phase_.store(AMTVDiagnosticPhase::kSubmitting, std::memory_order_relaxed);
     merge_in_progress_.store(true, std::memory_order_release);
     last_scheduled_priority_ = priority;
     priority_used_ = std::move(pri_str);
@@ -678,6 +720,7 @@ void AMTVState::MaybeScheduleMerge() {
   } catch (const std::bad_weak_ptr&) {
     MutexLock l(&task_mu_);
     task_state_ = MergeTaskState::kIdle;
+    diagnostic_phase_.store(AMTVDiagnosticPhase::kIdle, std::memory_order_relaxed);
     merge_in_progress_.store(false, std::memory_order_release);
     task_cond_.SignalAll();
     return;
@@ -692,6 +735,7 @@ void AMTVState::MaybeScheduleMerge() {
   {
     MutexLock l(&task_mu_);
     task_state_ = MergeTaskState::kQueued;
+    diagnostic_phase_.store(AMTVDiagnosticPhase::kQueued, std::memory_order_relaxed);
     task_cond_.SignalAll();
   }
 
@@ -727,10 +771,12 @@ void AMTVState::OnTaskUnscheduled() {
   {
     MutexLock l(&task_mu_);
     task_state_ = MergeTaskState::kIdle;
+    diagnostic_phase_.store(AMTVDiagnosticPhase::kIdle, std::memory_order_relaxed);
+    claimed_input_runs_.store(0, std::memory_order_relaxed);
     merge_in_progress_.store(false, std::memory_order_release);
-    merge_unscheduled_.fetch_add(1, std::memory_order_relaxed);
     task_cond_.SignalAll();
   }
+  merge_unscheduled_.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool AMTVState::TEST_RunMergeSynchronously() {
@@ -749,6 +795,7 @@ bool AMTVState::TEST_RunMergeSynchronously() {
       return false;
     }
     task_state_ = MergeTaskState::kRunning;
+    diagnostic_phase_.store(AMTVDiagnosticPhase::kComputing, std::memory_order_relaxed);
     merge_in_progress_.store(true, std::memory_order_release);
   }
   merge_requested_.fetch_add(1, std::memory_order_relaxed);
@@ -767,6 +814,7 @@ void AMTVState::BGMergeTask() {
   {
     MutexLock l(&task_mu_);
     task_state_ = MergeTaskState::kRunning;
+    diagnostic_phase_.store(AMTVDiagnosticPhase::kComputing, std::memory_order_relaxed);
     if (last_scheduled_time_nanos_ > 0 &&
         start_wall_time >= last_scheduled_time_nanos_) {
       uint64_t wait_nanos = start_wall_time - last_scheduled_time_nanos_;
@@ -779,6 +827,8 @@ void AMTVState::BGMergeTask() {
     {
       MutexLock l(&task_mu_);
       task_state_ = MergeTaskState::kIdle;
+      diagnostic_phase_.store(AMTVDiagnosticPhase::kIdle, std::memory_order_relaxed);
+      claimed_input_runs_.store(0, std::memory_order_relaxed);
       merge_in_progress_.store(false, std::memory_order_release);
       task_cond_.SignalAll();
     }
@@ -832,6 +882,13 @@ void AMTVState::BGMergeTask() {
   uint64_t total_input_tombstones =
       run_a->raw_entries.size() + run_b->raw_entries.size();
 
+  claimed_input_runs_.store(2, std::memory_order_relaxed);
+  uint64_t in_flight_payload = run_a->raw_payload_bytes + run_b->raw_payload_bytes;
+  uint64_t prev_inflight_peak = inflight_payload_proxy_bytes_peak_.load(std::memory_order_relaxed);
+  while (in_flight_payload > prev_inflight_peak &&
+         !inflight_payload_proxy_bytes_peak_.compare_exchange_weak(
+             prev_inflight_peak, in_flight_payload, std::memory_order_relaxed)) {}
+
   {
     AMTVTimelineRecord rec;
     rec.event_type = "MERGE_START";
@@ -881,6 +938,19 @@ void AMTVState::BGMergeTask() {
       (mid_cpu_ts.tv_sec - start_cpu_ts.tv_sec) * 1000000000ULL +
       (mid_cpu_ts.tv_nsec - start_cpu_ts.tv_nsec);
 
+  merge_computed_.fetch_add(1, std::memory_order_relaxed);
+  total_computed_merge_wall_time_nanos_.fetch_add(compute_wall_nanos, std::memory_order_relaxed);
+  total_computed_merge_cpu_time_nanos_.fetch_add(compute_cpu_nanos, std::memory_order_relaxed);
+
+  uint64_t prev_c_wall = max_computed_merge_wall_time_nanos_.load(std::memory_order_relaxed);
+  while (compute_wall_nanos > prev_c_wall &&
+         !max_computed_merge_wall_time_nanos_.compare_exchange_weak(
+             prev_c_wall, compute_wall_nanos, std::memory_order_relaxed)) {}
+  if (compute_wall_nanos >= prev_c_wall) {
+    max_computed_merge_cpu_time_nanos_.store(compute_cpu_nanos, std::memory_order_relaxed);
+    max_computed_merge_level_.store(input_level, std::memory_order_relaxed);
+  }
+
   {
     AMTVTimelineRecord rec;
     rec.event_type = "MERGE_DONE";
@@ -895,6 +965,8 @@ void AMTVState::BGMergeTask() {
   }
 
   TEST_SYNC_POINT("AMTVState::BGMerge:AfterMergeBeforePublish");
+
+  diagnostic_phase_.store(AMTVDiagnosticPhase::kPublishing, std::memory_order_relaxed);
 
   // 4. Critical Section: check conditions and publish
   {
@@ -965,11 +1037,13 @@ void AMTVState::BGMergeTask() {
       }
 
       TEST_SYNC_POINT("AMTVState::BGMerge:BeforeAtomicPublish");
+      UpdateMemoryProxyPeaks(new_snap.get());
       AtomicSharedPtrStore(&snapshot_,
                            std::shared_ptr<const AMTVSnapshot>(std::move(new_snap)),
                            std::memory_order_release);
 
       merge_completed_.fetch_add(1, std::memory_order_relaxed);
+      merge_published_.fetch_add(1, std::memory_order_relaxed);
       merge_input_run_count_.fetch_add(2, std::memory_order_relaxed);
       merge_input_tombstones_.fetch_add(total_input_tombstones,
                                         std::memory_order_relaxed);
@@ -978,6 +1052,7 @@ void AMTVState::BGMergeTask() {
 
       uint64_t elapsed_wall = env->NowNanos() - start_wall_time;
       merge_wall_time_nanos_.fetch_add(elapsed_wall, std::memory_order_relaxed);
+      total_published_merge_wall_time_nanos_.fetch_add(elapsed_wall, std::memory_order_relaxed);
 
       struct timespec end_cpu_ts;
       clock_gettime(CLOCK_THREAD_CPUTIME_ID, &end_cpu_ts);
@@ -985,6 +1060,7 @@ void AMTVState::BGMergeTask() {
           (end_cpu_ts.tv_sec - start_cpu_ts.tv_sec) * 1000000000ULL +
           (end_cpu_ts.tv_nsec - start_cpu_ts.tv_nsec);
       merge_cpu_time_nanos_.fetch_add(elapsed_cpu, std::memory_order_relaxed);
+      total_published_merge_cpu_time_nanos_.fetch_add(elapsed_cpu, std::memory_order_relaxed);
 
       merge_wall_time_nanos_per_level_[input_level] += elapsed_wall;
       merge_cpu_time_nanos_per_level_[input_level] += elapsed_cpu;
@@ -997,6 +1073,15 @@ void AMTVState::BGMergeTask() {
       if (elapsed_wall >= prev_max_wall) {
         max_single_merge_cpu_time_nanos_.store(elapsed_cpu, std::memory_order_relaxed);
         max_single_merge_level_.store(input_level, std::memory_order_relaxed);
+      }
+
+      uint64_t prev_pub_wall = max_published_merge_wall_time_nanos_.load(std::memory_order_relaxed);
+      while (elapsed_wall > prev_pub_wall &&
+             !max_published_merge_wall_time_nanos_.compare_exchange_weak(
+                 prev_pub_wall, elapsed_wall, std::memory_order_relaxed)) {}
+      if (elapsed_wall >= prev_pub_wall) {
+        max_published_merge_cpu_time_nanos_.store(elapsed_cpu, std::memory_order_relaxed);
+        max_published_merge_level_.store(input_level, std::memory_order_relaxed);
       }
 
       AMTVTimelineRecord rec;

@@ -91,6 +91,17 @@ class OpenDelta {
   // Deep clone ensuring memory independence.
   std::shared_ptr<OpenDelta> Clone() const;
 
+  uint64_t raw_payload_bytes() const {
+    uint64_t b = 0;
+    for (const auto& e : entries_) {
+      b += e.ikey.size() + e.end_key.size();
+    }
+    return b;
+  }
+  uint64_t raw_capacity_proxy_bytes() const {
+    return entries_.capacity() * sizeof(OpenDeltaEntry) + raw_payload_bytes();
+  }
+
  private:
   std::vector<OpenDeltaEntry> entries_;
 };
@@ -109,6 +120,9 @@ struct AMTVRun {
   uint64_t tombstone_count = 0;
   SequenceNumber min_seq = kMaxSequenceNumber;
   SequenceNumber max_seq = 0;
+  uint64_t raw_payload_bytes = 0;
+  uint64_t raw_capacity_proxy_bytes = 0;
+  uint64_t fragment_payload_bytes = 0;
 
   AMTVRun() = default;
   AMTVRun(uint64_t id, uint32_t lvl, uint64_t chunk_count, bool partial,
@@ -370,6 +384,7 @@ class AMTVTimelineLogger {
   std::atomic<bool> enabled_{true};
 };
 
+#ifdef ROCKSDB_READ_PATH_AUDIT
 // Thread-local statistics for inspecting sealed runs and open delta during Get
 struct AMTVGetProbeStats {
   uint64_t get_count = 0;
@@ -402,6 +417,7 @@ struct AMTVGetProbeStats {
 };
 extern thread_local AMTVGetProbeStats tl_amtv_get_probe_stats;
 extern std::atomic<bool> g_amtv_get_probe_stats_enabled;
+#endif
 
 // Lifecycle state of AMTV background merge task (M2c.1)
 enum class MergeTaskState {
@@ -409,6 +425,15 @@ enum class MergeTaskState {
   kSubmitting,
   kQueued,
   kRunning
+};
+
+// Purely diagnostic phase; does NOT participate in lifecycle control logic
+enum class AMTVDiagnosticPhase {
+  kIdle,
+  kSubmitting,
+  kQueued,
+  kComputing,
+  kPublishing
 };
 
 // AMTVState manages the lifecycle and atomic publication of AMTVSnapshot.
@@ -491,6 +516,68 @@ class AMTVState : public std::enable_shared_from_this<AMTVState> {
   }
   bool is_merge_in_progress() const;
   MergeTaskState task_state() const;
+  AMTVDiagnosticPhase diagnostic_phase() const {
+    return diagnostic_phase_.load(std::memory_order_relaxed);
+  }
+  uint32_t claimed_input_runs() const {
+    return claimed_input_runs_.load(std::memory_order_relaxed);
+  }
+
+  uint64_t merge_computed_count() const {
+    return merge_computed_.load(std::memory_order_relaxed);
+  }
+  uint64_t merge_published_count() const {
+    return merge_published_.load(std::memory_order_relaxed);
+  }
+  uint64_t merge_discarded_count() const {
+    return merge_discarded_.load(std::memory_order_relaxed);
+  }
+
+  uint64_t max_computed_merge_wall_time_nanos() const {
+    return max_computed_merge_wall_time_nanos_.load(std::memory_order_relaxed);
+  }
+  uint64_t max_computed_merge_cpu_time_nanos() const {
+    return max_computed_merge_cpu_time_nanos_.load(std::memory_order_relaxed);
+  }
+  uint32_t max_computed_merge_level() const {
+    return max_computed_merge_level_.load(std::memory_order_relaxed);
+  }
+
+  uint64_t max_published_merge_wall_time_nanos() const {
+    return max_published_merge_wall_time_nanos_.load(std::memory_order_relaxed);
+  }
+  uint64_t max_published_merge_cpu_time_nanos() const {
+    return max_published_merge_cpu_time_nanos_.load(std::memory_order_relaxed);
+  }
+  uint32_t max_published_merge_level() const {
+    return max_published_merge_level_.load(std::memory_order_relaxed);
+  }
+
+  uint64_t total_computed_merge_wall_time_nanos() const {
+    return total_computed_merge_wall_time_nanos_.load(std::memory_order_relaxed);
+  }
+  uint64_t total_computed_merge_cpu_time_nanos() const {
+    return total_computed_merge_cpu_time_nanos_.load(std::memory_order_relaxed);
+  }
+  uint64_t total_published_merge_wall_time_nanos() const {
+    return total_published_merge_wall_time_nanos_.load(std::memory_order_relaxed);
+  }
+  uint64_t total_published_merge_cpu_time_nanos() const {
+    return total_published_merge_cpu_time_nanos_.load(std::memory_order_relaxed);
+  }
+
+  uint64_t raw_entry_payload_bytes_peak() const {
+    return raw_entry_payload_bytes_peak_.load(std::memory_order_relaxed);
+  }
+  uint64_t raw_entry_capacity_proxy_bytes_peak() const {
+    return raw_entry_capacity_proxy_bytes_peak_.load(std::memory_order_relaxed);
+  }
+  uint64_t fragment_payload_proxy_bytes_peak() const {
+    return fragment_payload_proxy_bytes_peak_.load(std::memory_order_relaxed);
+  }
+  uint64_t inflight_payload_proxy_bytes_peak() const {
+    return inflight_payload_proxy_bytes_peak_.load(std::memory_order_relaxed);
+  }
   int queued_tasks() const;
   int running_tasks() const;
 
@@ -584,6 +671,8 @@ class AMTVState : public std::enable_shared_from_this<AMTVState> {
   std::string GetAuditSummary(uint64_t original_tombstones = 0) const;
 
  private:
+  void UpdateMemoryProxyPeaks(const AMTVSnapshot* snap);
+
   const uint64_t memtable_generation_;
   const uint32_t delta_tombstones_limit_;
   const uint32_t merge_soft_limit_;
@@ -616,9 +705,34 @@ class AMTVState : public std::enable_shared_from_this<AMTVState> {
   mutable port::Mutex task_mu_;
   mutable port::CondVar task_cond_;
   MergeTaskState task_state_{MergeTaskState::kIdle};
+  std::atomic<AMTVDiagnosticPhase> diagnostic_phase_{AMTVDiagnosticPhase::kIdle};
+  std::atomic<uint32_t> claimed_input_runs_{0};
   Env::Priority last_scheduled_priority_{Env::Priority::LOW};
   std::string priority_used_{"UNKNOWN"};
   uint64_t last_scheduled_time_nanos_{0};
+
+  // Fine-grained merge counters and timing
+  std::atomic<uint64_t> merge_computed_{0};
+  std::atomic<uint64_t> merge_published_{0};
+
+  std::atomic<uint64_t> max_computed_merge_wall_time_nanos_{0};
+  std::atomic<uint64_t> max_computed_merge_cpu_time_nanos_{0};
+  std::atomic<uint32_t> max_computed_merge_level_{0};
+
+  std::atomic<uint64_t> max_published_merge_wall_time_nanos_{0};
+  std::atomic<uint64_t> max_published_merge_cpu_time_nanos_{0};
+  std::atomic<uint32_t> max_published_merge_level_{0};
+
+  std::atomic<uint64_t> total_computed_merge_wall_time_nanos_{0};
+  std::atomic<uint64_t> total_computed_merge_cpu_time_nanos_{0};
+  std::atomic<uint64_t> total_published_merge_wall_time_nanos_{0};
+  std::atomic<uint64_t> total_published_merge_cpu_time_nanos_{0};
+
+  // Memory proxy metrics
+  std::atomic<uint64_t> raw_entry_payload_bytes_peak_{0};
+  std::atomic<uint64_t> raw_entry_capacity_proxy_bytes_peak_{0};
+  std::atomic<uint64_t> fragment_payload_proxy_bytes_peak_{0};
+  std::atomic<uint64_t> inflight_payload_proxy_bytes_peak_{0};
 
   // M2c Audit metrics
   std::atomic<uint64_t> merge_requested_{0};
