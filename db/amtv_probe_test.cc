@@ -35,13 +35,13 @@ TEST_F(AMTVProbeTest, Probe1_PointLookupDecoupling) {
 
   // Run 1: [k10, k50) @ seq 10
   std::vector<OpenDeltaEntry> r1_entries;
-  r1_entries.emplace_back(InternalKey("k10", 10, kTypeRangeDeletion), "k50");
+  r1_entries.emplace_back("k10", "k50", 10);
   auto r1 = std::make_shared<const AMTVRun>(1, 0, 1, false, std::move(r1_entries), bytewise_icmp_);
   snapshot->sealed_runs.push_back(r1);
 
   // Run 2: [k30, k70) @ seq 20
   std::vector<OpenDeltaEntry> r2_entries;
-  r2_entries.emplace_back(InternalKey("k30", 20, kTypeRangeDeletion), "k70");
+  r2_entries.emplace_back("k30", "k70", 20);
   auto r2 = std::make_shared<const AMTVRun>(2, 0, 1, false, std::move(r2_entries), bytewise_icmp_);
   snapshot->sealed_runs.push_back(r2);
 
