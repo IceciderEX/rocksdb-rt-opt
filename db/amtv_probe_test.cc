@@ -9,7 +9,6 @@
 #include <string>
 #include <vector>
 
-#include "db/db_test_util.h"
 #include "db/dbformat.h"
 #include "db/range_del_aggregator.h"
 #include "db/range_tombstone_fragmenter.h"
