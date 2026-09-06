@@ -33,23 +33,17 @@ class AMTVProbeTest : public testing::Test {
 TEST_F(AMTVProbeTest, Probe1_PointLookupDecoupling) {
   auto snapshot = std::make_shared<AMTVSnapshot>();
 
-  // Base: [k10, k50) @ seq 10
-  std::vector<std::string> b_keys = {
-      RangeTombstone("k10", "k50", 10).Serialize().first.Encode().ToString()};
-  std::vector<std::string> b_vals = {"k50"};
-  auto b_iter = std::make_unique<VectorIterator>(
-      std::move(b_keys), std::move(b_vals), &bytewise_icmp_);
-  snapshot->base = std::make_unique<FragmentedRangeTombstoneList>(
-      std::move(b_iter), bytewise_icmp_);
+  // Run 1: [k10, k50) @ seq 10
+  std::vector<OpenDeltaEntry> r1_entries;
+  r1_entries.emplace_back(InternalKey("k10", 10, kTypeRangeDeletion), "k50");
+  auto r1 = std::make_shared<const AMTVRun>(1, 0, 1, false, std::move(r1_entries), bytewise_icmp_);
+  snapshot->sealed_runs.push_back(r1);
 
-  // Sealed Delta: [k30, k70) @ seq 20
-  std::vector<std::string> s_keys = {
-      RangeTombstone("k30", "k70", 20).Serialize().first.Encode().ToString()};
-  std::vector<std::string> s_vals = {"k70"};
-  auto s_iter = std::make_unique<VectorIterator>(
-      std::move(s_keys), std::move(s_vals), &bytewise_icmp_);
-  snapshot->sealed_delta = std::make_unique<FragmentedRangeTombstoneList>(
-      std::move(s_iter), bytewise_icmp_);
+  // Run 2: [k30, k70) @ seq 20
+  std::vector<OpenDeltaEntry> r2_entries;
+  r2_entries.emplace_back(InternalKey("k30", 20, kTypeRangeDeletion), "k70");
+  auto r2 = std::make_shared<const AMTVRun>(2, 0, 1, false, std::move(r2_entries), bytewise_icmp_);
+  snapshot->sealed_runs.push_back(r2);
 
   // Open Delta: [k60, k90) @ seq 30
   auto open_delta = std::make_shared<OpenDelta>();
