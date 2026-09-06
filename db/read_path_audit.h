@@ -15,20 +15,20 @@
 namespace ROCKSDB_NAMESPACE {
 
 struct ReadPathAuditStats {
-  // 1. 范围墓碑分段视图物化次数及构建耗时 (exclusive time)
+  // 1. Range tombstone fragmented view materialization count and time (exclusive time)
   uint64_t range_tombstone_view_materialization_count = 0;
   uint64_t range_tombstone_view_materialization_nanos = 0;
 
-  // 写端缓存失效次数
+  // Write-side cache invalidation count
   uint64_t memtable_cache_invalidation_count = 0;
 
-  // 4. 锁尝试、排队争用与并发竞争命中统计 (exclusive time)
+  // 4. Lock attempts, queuing contention, and race hit statistics (exclusive time)
   uint64_t fragment_build_lock_attempt_count = 0;
   uint64_t fragment_build_lock_contended_count = 0;
   uint64_t fragment_build_lock_contended_wait_nanos = 0;
   uint64_t fragment_build_cache_race_hit_count = 0;
 
-  // 3. 拆分“迭代器准备”与“覆盖查询”时间 (区分活跃与不可变 MemTable)
+  // 3. Breakdown of iterator prepare and covering lookup time (active vs imm memtable)
   uint64_t active_mem_tombstone_iter_prepare_count = 0;
   uint64_t active_mem_tombstone_iter_prepare_nanos = 0;
   uint64_t active_mem_tombstone_cover_lookup_count = 0;
@@ -39,7 +39,7 @@ struct ReadPathAuditStats {
   uint64_t imm_mem_tombstone_cover_lookup_count = 0;
   uint64_t imm_mem_tombstone_cover_lookup_nanos = 0;
 
-  // 迭代器构造来源统计 (exclusive time)
+  // Iterator construction source statistics (exclusive time)
   uint64_t active_mem_iter_construct_count = 0;
   uint64_t active_mem_iter_construct_nanos = 0;
   uint64_t imm_mem_iter_construct_count = 0;
@@ -47,13 +47,12 @@ struct ReadPathAuditStats {
   uint64_t sst_iter_construct_count = 0;
   uint64_t sst_iter_construct_nanos = 0;
 
-  // 5. Scan 事件计数
-  uint64_t scan_range_del_reseek_count = 0;       // 范围墓碑触发的 reseek 次数
-  uint64_t scan_boundary_advance_count = 0;       // 边界推进次数 (START pop + END pop)
-  uint64_t scan_range_del_child_next_count = 0;   // 范围删除相关分支触发的底层 Next 次数
-  uint64_t scan_covered_skip_count = 0;           // 同层被墓碑遮蔽跳过的键数
-
-  // 6. 活跃 MemTable 信息记录 (物化/争用时的 MemTable generation 及墓碑数)
+  // 5. Scan event counters
+  uint64_t scan_range_del_reseek_count = 0;       // Reseek count triggered by range tombstones
+  uint64_t scan_boundary_advance_count = 0;       // Boundary advance count (START pop + END pop)
+  uint64_t scan_range_del_child_next_count = 0;   // Underlying Next count triggered by range del branches
+  uint64_t scan_covered_skip_count = 0;           // Keys skipped due to tombstone covering
+  // 6. Active MemTable telemetry (generation and tombstone count at materialization/contention)
   uint64_t last_materialization_memtable_id = 0;
   uint64_t last_materialization_tombstone_count = 0;
   uint64_t last_contended_memtable_id = 0;

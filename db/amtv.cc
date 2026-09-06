@@ -297,32 +297,42 @@ AMTVState::~AMTVState() {
 }
 
 void AMTVState::CancelAndDrain() {
+  // 1. Prohibit any new task submissions
   is_invalidated_.store(true, std::memory_order_release);
+  TEST_SYNC_POINT("AMTVState::CancelAndDrain:AfterInvalidate");
 
-  // Unschedule any pending tasks from BOTTOM and LOW queues
-  if (env_) {
-    env_->UnSchedule(this, Env::Priority::BOTTOM);
-    env_->UnSchedule(this, Env::Priority::LOW);
-  }
-
-  // Wait for all queued and running tasks to drain completely without holding write_mutex_
+  // 2. If a thread is currently in kSubmitting, wait for it to finish submitting (transitions to kQueued or kIdle)
   {
     MutexLock l(&task_mu_);
-    while (queued_tasks_ > 0 || running_tasks_ > 0) {
+    while (task_state_ == MergeTaskState::kSubmitting) {
+      task_cond_.Wait();
+    }
+  }
+
+  // 3. Now that no thread is submitting and no new thread can enter submitting,
+  // revoke any queued tasks from BOTTOM and LOW queues in Env.
+  Env* env = env_ ? env_ : Env::Default();
+  if (env) {
+    env->UnSchedule(this, Env::Priority::BOTTOM);
+    env->UnSchedule(this, Env::Priority::LOW);
+  }
+
+  // 4. Wait until task_state_ is strictly kIdle without holding write_mutex_
+  {
+    MutexLock l(&task_mu_);
+    while (task_state_ != MergeTaskState::kIdle) {
       task_cond_.Wait();
     }
   }
 }
 
 bool AMTVState::IsMergeStable() const {
-  if (merge_in_progress_.load(std::memory_order_acquire)) {
+  MutexLock l(&task_mu_);
+  if (task_state_ != MergeTaskState::kIdle) {
     return false;
   }
-  {
-    MutexLock l(&task_mu_);
-    if (queued_tasks_ > 0 || running_tasks_ > 0) {
-      return false;
-    }
+  if (is_invalidated_.load(std::memory_order_relaxed)) {
+    return true;
   }
   auto snap = GetSnapshot();
   if (!snap || snap->fallback_required) {
@@ -334,8 +344,10 @@ bool AMTVState::IsMergeStable() const {
 void AMTVState::WaitForMergeStable() {
   MutexLock l(&task_mu_);
   while (true) {
-    if (!merge_in_progress_.load(std::memory_order_acquire) &&
-        queued_tasks_ == 0 && running_tasks_ == 0) {
+    if (task_state_ == MergeTaskState::kIdle) {
+      if (is_invalidated_.load(std::memory_order_relaxed)) {
+        break;
+      }
       auto snap = GetSnapshot();
       if (!snap || snap->fallback_required ||
           !HasMergeablePair(snap->sealed_runs)) {
@@ -346,14 +358,24 @@ void AMTVState::WaitForMergeStable() {
   }
 }
 
+MergeTaskState AMTVState::task_state() const {
+  MutexLock l(&task_mu_);
+  return task_state_;
+}
+
 int AMTVState::queued_tasks() const {
   MutexLock l(&task_mu_);
-  return queued_tasks_;
+  return task_state_ == MergeTaskState::kQueued ? 1 : 0;
 }
 
 int AMTVState::running_tasks() const {
   MutexLock l(&task_mu_);
-  return running_tasks_;
+  return task_state_ == MergeTaskState::kRunning ? 1 : 0;
+}
+
+bool AMTVState::is_merge_in_progress() const {
+  MutexLock l(&task_mu_);
+  return task_state_ != MergeTaskState::kIdle;
 }
 
 std::string AMTVState::priority_used() const {
@@ -417,16 +439,22 @@ void AMTVState::AddTombstone(const Slice& start_user_key,
                !peak_sealed_layers_.compare_exchange_weak(
                    prev_peak, current_runs, std::memory_order_relaxed)) {
         }
-        peak_run_level_histogram_[0] =
-            std::max(peak_run_level_histogram_[0], 1U);
+        std::map<uint32_t, uint32_t> current_level_runs;
+        for (const auto& r : new_snap->sealed_runs) {
+          if (r) current_level_runs[r->level]++;
+        }
+        for (const auto& p : current_level_runs) {
+          peak_run_level_histogram_[p.first] =
+              std::max(peak_run_level_histogram_[p.first], p.second);
+        }
 
         uint64_t current_raw_bytes = 0;
         for (const auto& r : new_snap->sealed_runs) {
           if (r) current_raw_bytes += r->raw_entries.size() * sizeof(OpenDeltaEntry);
         }
-        uint64_t prev_raw_peak = raw_entries_bytes_peak_.load(std::memory_order_relaxed);
+        uint64_t prev_raw_peak = raw_entries_struct_bytes_peak_.load(std::memory_order_relaxed);
         while (current_raw_bytes > prev_raw_peak &&
-               !raw_entries_bytes_peak_.compare_exchange_weak(
+               !raw_entries_struct_bytes_peak_.compare_exchange_weak(
                    prev_raw_peak, current_raw_bytes, std::memory_order_relaxed)) {
         }
 
@@ -497,8 +525,14 @@ void AMTVState::FreezeOpenDelta(const InternalKeyComparator& icmp) {
              !peak_sealed_layers_.compare_exchange_weak(
                  prev_peak, current_runs, std::memory_order_relaxed)) {
       }
-      peak_run_level_histogram_[0] =
-          std::max(peak_run_level_histogram_[0], 1U);
+      std::map<uint32_t, uint32_t> current_level_runs;
+      for (const auto& r : new_snap->sealed_runs) {
+        if (r) current_level_runs[r->level]++;
+      }
+      for (const auto& p : current_level_runs) {
+        peak_run_level_histogram_[p.first] =
+            std::max(peak_run_level_histogram_[p.first], p.second);
+      }
 
       if (!is_partial && current_runs >= merge_soft_limit_ &&
           HasMergeablePair(new_snap->sealed_runs)) {
@@ -531,21 +565,6 @@ void AMTVState::MaybeScheduleMerge() {
     return;
   }
 
-  bool expected = false;
-  if (!merge_in_progress_.compare_exchange_strong(expected, true)) {
-    return;
-  }
-
-  merge_requested_.fetch_add(1, std::memory_order_relaxed);
-
-  std::shared_ptr<AMTVState> self;
-  try {
-    self = shared_from_this();
-  } catch (const std::bad_weak_ptr&) {
-    merge_in_progress_.store(false, std::memory_order_release);
-    return;
-  }
-
   Env* env = env_ ? env_ : Env::Default();
   Env::Priority priority = Env::Priority::LOW;
   std::string pri_str;
@@ -558,18 +577,49 @@ void AMTVState::MaybeScheduleMerge() {
   }
 
   uint64_t sched_time = env->NowNanos();
+
+  // Enter kSubmitting under task_mu_
   {
     MutexLock l(&task_mu_);
-    queued_tasks_++;
+    if (is_invalidated_.load(std::memory_order_relaxed) ||
+        is_immutable_.load(std::memory_order_relaxed) ||
+        fallback_required_.load(std::memory_order_relaxed)) {
+      return;
+    }
+    if (task_state_ != MergeTaskState::kIdle) {
+      return;
+    }
+    task_state_ = MergeTaskState::kSubmitting;
+    merge_in_progress_.store(true, std::memory_order_release);
     last_scheduled_priority_ = priority;
     priority_used_ = std::move(pri_str);
     last_scheduled_time_nanos_ = sched_time;
+  }
+
+  merge_requested_.fetch_add(1, std::memory_order_relaxed);
+
+  std::shared_ptr<AMTVState> self;
+  try {
+    self = shared_from_this();
+  } catch (const std::bad_weak_ptr&) {
+    MutexLock l(&task_mu_);
+    task_state_ = MergeTaskState::kIdle;
+    merge_in_progress_.store(false, std::memory_order_release);
+    task_cond_.SignalAll();
+    return;
   }
 
   auto* arg = new std::shared_ptr<AMTVState>(self);
   TEST_SYNC_POINT("AMTVState::MaybeScheduleMerge:BeforeSchedule");
   env->Schedule(&AMTVState::BGMergeWrapper, arg, priority, this,
                 &AMTVState::BGMergeUnschedule);
+
+  // Transition from kSubmitting to kQueued under task_mu_
+  {
+    MutexLock l(&task_mu_);
+    task_state_ = MergeTaskState::kQueued;
+    task_cond_.SignalAll();
+  }
 }
 
 void AMTVState::BGMergeWrapper(void* arg) {
@@ -593,25 +643,30 @@ void AMTVState::BGMergeUnschedule(void* arg) {
 void AMTVState::OnTaskUnscheduled() {
   {
     MutexLock l(&task_mu_);
-    if (queued_tasks_ > 0) {
-      queued_tasks_--;
-    }
+    task_state_ = MergeTaskState::kIdle;
+    merge_in_progress_.store(false, std::memory_order_release);
     merge_unscheduled_.fetch_add(1, std::memory_order_relaxed);
     task_cond_.SignalAll();
   }
-  merge_in_progress_.store(false, std::memory_order_release);
 }
 
-bool AMTVState::RunMergeSynchronously() {
+bool AMTVState::TEST_RunMergeSynchronously() {
   auto snap = GetSnapshot();
   if (!snap || snap->fallback_required ||
       snap->sealed_runs.size() < merge_soft_limit_ ||
       !HasMergeablePair(snap->sealed_runs)) {
     return false;
   }
-  bool expected = false;
-  if (!merge_in_progress_.compare_exchange_strong(expected, true)) {
-    return false;
+  {
+    MutexLock l(&task_mu_);
+    if (is_invalidated_.load(std::memory_order_relaxed) ||
+        is_immutable_.load(std::memory_order_relaxed) ||
+        fallback_required_.load(std::memory_order_relaxed) ||
+        task_state_ != MergeTaskState::kIdle) {
+      return false;
+    }
+    task_state_ = MergeTaskState::kRunning;
+    merge_in_progress_.store(true, std::memory_order_release);
   }
   merge_requested_.fetch_add(1, std::memory_order_relaxed);
   BGMergeTask();
@@ -627,10 +682,7 @@ void AMTVState::BGMergeTask() {
 
   {
     MutexLock l(&task_mu_);
-    if (queued_tasks_ > 0) {
-      queued_tasks_--;
-    }
-    running_tasks_++;
+    task_state_ = MergeTaskState::kRunning;
     if (last_scheduled_time_nanos_ > 0 &&
         start_wall_time >= last_scheduled_time_nanos_) {
       task_queue_wait_time_nanos_.fetch_add(
@@ -642,10 +694,10 @@ void AMTVState::BGMergeTask() {
   auto cleanup_running = [&]() {
     {
       MutexLock l(&task_mu_);
-      running_tasks_--;
+      task_state_ = MergeTaskState::kIdle;
+      merge_in_progress_.store(false, std::memory_order_release);
       task_cond_.SignalAll();
     }
-    merge_in_progress_.store(false, std::memory_order_release);
     TEST_SYNC_POINT("AMTVState::BGMerge:TaskEnd");
     // P0-2: Unconditionally try to schedule the next merge before exiting
     MaybeScheduleMerge();
@@ -682,9 +734,9 @@ void AMTVState::BGMergeTask() {
 
   uint64_t in_flight_bytes = total_input_tombstones * sizeof(OpenDeltaEntry);
   uint64_t prev_in_flight =
-      in_flight_merge_bytes_peak_.load(std::memory_order_relaxed);
+      in_flight_merge_struct_bytes_peak_.load(std::memory_order_relaxed);
   while (in_flight_bytes > prev_in_flight &&
-         !in_flight_merge_bytes_peak_.compare_exchange_weak(
+         !in_flight_merge_struct_bytes_peak_.compare_exchange_weak(
              prev_in_flight, in_flight_bytes, std::memory_order_relaxed)) {
   }
 
@@ -768,6 +820,15 @@ void AMTVState::BGMergeTask() {
         }
       }
 
+      std::map<uint32_t, uint32_t> current_level_runs;
+      for (const auto& r : new_snap->sealed_runs) {
+        if (r) current_level_runs[r->level]++;
+      }
+      for (const auto& p : current_level_runs) {
+        peak_run_level_histogram_[p.first] =
+            std::max(peak_run_level_histogram_[p.first], p.second);
+      }
+
       TEST_SYNC_POINT("AMTVState::BGMerge:BeforeAtomicPublish");
       AtomicSharedPtrStore(&snapshot_,
                            std::shared_ptr<const AMTVSnapshot>(std::move(new_snap)),
@@ -779,8 +840,6 @@ void AMTVState::BGMergeTask() {
                                         std::memory_order_relaxed);
       merge_count_per_level_[input_level]++;
       merge_input_tombstones_per_level_[input_level] += total_input_tombstones;
-      peak_run_level_histogram_[new_level] =
-          std::max(peak_run_level_histogram_[new_level], 1U);
 
       uint64_t elapsed_wall = env->NowNanos() - start_wall_time;
       merge_wall_time_nanos_.fetch_add(elapsed_wall, std::memory_order_relaxed);
@@ -876,12 +935,12 @@ std::string AMTVState::GetAuditSummary(uint64_t original_tombstones) const {
       "merge_unscheduled: %llu\n"
       "merge_input_runs: %llu\n"
       "merge_input_tombstones: %llu\n"
-      "amplification (merge_input_tombstones / original_tombstones): %.2fx\n"
+      "AMTV Run reconstruction input amplification (merge_input_tombstones / original_tombstones): %.2fx\n"
       "merge_wall_time_us: %llu\n"
       "merge_cpu_time_us: %llu\n"
       "task_queue_wait_time_us: %llu\n"
-      "raw_entries_bytes_peak: %llu\n"
-      "in_flight_merge_bytes_peak: %llu\n"
+      "raw_entries_struct_bytes_peak (proxy only; excludes heap strings, FragmentedRangeTombstoneList, vector capacity, coexisting snapshots): %llu\n"
+      "in_flight_merge_struct_bytes_peak (proxy only; excludes heap strings, FragmentedRangeTombstoneList, vector capacity, coexisting snapshots): %llu\n"
       "priority_used: %s\n"
       "fallback_event_count: %llu\n"
       "fallback_get_count: %llu\n"
@@ -902,9 +961,9 @@ std::string AMTVState::GetAuditSummary(uint64_t original_tombstones) const {
       static_cast<unsigned long long>(
           task_queue_wait_time_nanos_.load(std::memory_order_relaxed) / 1000),
       static_cast<unsigned long long>(
-          raw_entries_bytes_peak_.load(std::memory_order_relaxed)),
+          raw_entries_struct_bytes_peak_.load(std::memory_order_relaxed)),
       static_cast<unsigned long long>(
-          in_flight_merge_bytes_peak_.load(std::memory_order_relaxed)),
+          in_flight_merge_struct_bytes_peak_.load(std::memory_order_relaxed)),
       priority_used().c_str(),
       static_cast<unsigned long long>(fallback_event_count()),
       static_cast<unsigned long long>(get_fallback_to_native_count()),

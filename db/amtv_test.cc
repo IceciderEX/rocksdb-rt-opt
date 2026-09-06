@@ -2400,8 +2400,8 @@ TEST_F(AMTVTest, M2c_PartialRunIsolation) {
   EXPECT_FALSE(CanMergeRuns(*snap2->sealed_runs[0], *snap2->sealed_runs[1]));
   EXPECT_FALSE(HasMergeablePair(snap2->sealed_runs));
 
-  // Verify RunMergeSynchronously does not merge them
-  EXPECT_FALSE(state->RunMergeSynchronously());
+  // Verify TEST_RunMergeSynchronously does not merge them
+  EXPECT_FALSE(state->TEST_RunMergeSynchronously());
   EXPECT_EQ(state->merge_completed(), 0U);
   EXPECT_EQ(state->GetSnapshot()->sealed_runs.size(), 2U);
 
@@ -2410,6 +2410,222 @@ TEST_F(AMTVTest, M2c_PartialRunIsolation) {
   EXPECT_EQ(adapter.MaxCoveringTombstoneSeqnum("k0052", 1000), 6U);
   EXPECT_EQ(adapter.MaxCoveringTombstoneSeqnum("k0702", 1000), 71U);
 }
+
+#if !defined(NDEBUG)
+TEST_F(AMTVTest, M2c_CancelDuringSubmitting) {
+  // Test M2c.1: Cancel during kSubmitting state
+  std::shared_ptr<AMTVState> state = std::make_shared<AMTVState>(
+      /*memtable_generation=*/1, /*delta_limit=*/4, /*merge_soft_limit=*/2,
+      /*hard_limit=*/8, &bytewise_icmp_);
+
+  port::Mutex mu;
+  port::CondVar cv(&mu);
+  bool submitting_paused = false;
+  bool allow_submit = false;
+  std::atomic<bool> cancel_returned{false};
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "AMTVState::MaybeScheduleMerge:BeforeSchedule", [&](void* /*arg*/) {
+        MutexLock l(&mu);
+        submitting_paused = true;
+        cv.SignalAll();
+        while (!allow_submit) {
+          cv.Wait();
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // 1. Initial 8 tombstones form 2 sealed runs and trigger MaybeScheduleMerge
+  std::thread submit_thread([&]() {
+    for (int i = 0; i < 8; ++i) {
+      char s[16], e[16];
+      snprintf(s, sizeof(s), "k%04d", i * 10);
+      snprintf(e, sizeof(e), "k%04d", i * 10 + 5);
+      state->AddTombstone(s, e, i + 1, bytewise_icmp_);
+    }
+  });
+
+  // Wait until thread enters kSubmitting and pauses before Env::Schedule
+  {
+    MutexLock l(&mu);
+    while (!submitting_paused) {
+      cv.Wait();
+    }
+  }
+
+  // Assert state is strictly kSubmitting
+  EXPECT_EQ(state->task_state(), MergeTaskState::kSubmitting);
+
+  // 2. Start CancelAndDrain in concurrent thread
+  std::atomic<bool> cancel_started{false};
+  port::Mutex cancel_mu;
+  port::CondVar cancel_cv(&cancel_mu);
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "AMTVState::CancelAndDrain:AfterInvalidate", [&](void* /*arg*/) {
+        MutexLock l(&cancel_mu);
+        cancel_started.store(true, std::memory_order_release);
+        cancel_cv.SignalAll();
+      });
+
+  std::thread cancel_thread([&]() {
+    state->CancelAndDrain();
+    cancel_returned.store(true, std::memory_order_release);
+  });
+
+  // Wait until CancelAndDrain has invalidated state and reached wait on kSubmitting
+  {
+    MutexLock l(&cancel_mu);
+    while (!cancel_started.load(std::memory_order_acquire)) {
+      cancel_cv.Wait();
+    }
+  }
+
+  // Verify CancelAndDrain cannot return early while task is in kSubmitting
+  EXPECT_TRUE(state->is_invalidated());
+  EXPECT_FALSE(cancel_returned.load(std::memory_order_acquire));
+
+  // 3. Resume submission
+  {
+    MutexLock l(&mu);
+    allow_submit = true;
+    cv.SignalAll();
+  }
+
+  submit_thread.join();
+  cancel_thread.join();
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // 4. Assert strict Idle state and no dangling activity
+  EXPECT_TRUE(cancel_returned.load());
+  EXPECT_EQ(state->task_state(), MergeTaskState::kIdle);
+  EXPECT_EQ(state->queued_tasks(), 0);
+  EXPECT_EQ(state->running_tasks(), 0);
+  EXPECT_EQ(state->merge_completed(), 0U);
+  EXPECT_TRUE(state->merge_unscheduled() > 0 || state->merge_discarded() > 0);
+}
+
+TEST_F(AMTVTest, M2c_WaiterWakeupAfterTaskCompletion) {
+  // Test M2c.1: Waiter is properly woken up when task completes
+  std::shared_ptr<AMTVState> state = std::make_shared<AMTVState>(
+      /*memtable_generation=*/1, /*delta_limit=*/4, /*merge_soft_limit=*/2,
+      /*hard_limit=*/8, &bytewise_icmp_);
+
+  port::Mutex mu;
+  port::CondVar cv(&mu);
+  bool task_paused = false;
+  bool allow_publish = false;
+  std::atomic<bool> waiter_returned{false};
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "AMTVState::BGMerge:BeforeAtomicPublish", [&](void* /*arg*/) {
+        MutexLock l(&mu);
+        task_paused = true;
+        cv.SignalAll();
+        while (!allow_publish) {
+          cv.Wait();
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  for (int i = 0; i < 8; ++i) {
+    char s[16], e[16];
+    snprintf(s, sizeof(s), "k%04d", i * 10);
+    snprintf(e, sizeof(e), "k%04d", i * 10 + 5);
+    state->AddTombstone(s, e, i + 1, bytewise_icmp_);
+  }
+
+  // Wait until task is paused before publish
+  {
+    MutexLock l(&mu);
+    while (!task_paused) {
+      cv.Wait();
+    }
+  }
+
+  EXPECT_EQ(state->task_state(), MergeTaskState::kRunning);
+
+  // Independent waiter thread enters WaitForMergeStable
+  std::thread waiter_thread([&]() {
+    state->WaitForMergeStable();
+    waiter_returned.store(true, std::memory_order_release);
+  });
+
+  // Verify waiter cannot return before task completes
+  for (int i = 0; i < 50; ++i) {
+    std::this_thread::yield();
+    EXPECT_FALSE(waiter_returned.load(std::memory_order_acquire));
+  }
+
+  // Resume task
+  {
+    MutexLock l(&mu);
+    allow_publish = true;
+    cv.SignalAll();
+  }
+
+  waiter_thread.join();
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  EXPECT_TRUE(waiter_returned.load());
+  EXPECT_EQ(state->task_state(), MergeTaskState::kIdle);
+  EXPECT_EQ(state->queued_tasks(), 0);
+  EXPECT_EQ(state->running_tasks(), 0);
+  EXPECT_EQ(state->merge_completed(), 1U);
+  EXPECT_FALSE(HasMergeablePair(state->GetSnapshot()->sealed_runs));
+}
+
+TEST_F(AMTVTest, M2c_WaiterWakeupAfterUnschedule) {
+  // Test M2c.1: Waiter is properly woken up when task is UnScheduled
+  Env* env = Env::Default();
+  env->SetBackgroundThreads(0, Env::Priority::BOTTOM);
+  env->SetBackgroundThreads(1, Env::Priority::LOW);
+
+  test::SleepingBackgroundTask sleeping_task;
+  env->Schedule(&test::SleepingBackgroundTask::DoSleepTask, &sleeping_task,
+                Env::Priority::LOW);
+  sleeping_task.WaitUntilSleeping();
+
+  std::shared_ptr<AMTVState> state = std::make_shared<AMTVState>(
+      /*memtable_generation=*/1, /*delta_limit=*/4, /*merge_soft_limit=*/2,
+      /*hard_limit=*/8, &bytewise_icmp_, env);
+
+  // Add 8 tombstones to schedule merge
+  for (int i = 0; i < 8; ++i) {
+    char s[16], e[16];
+    snprintf(s, sizeof(s), "k%04d", i * 10);
+    snprintf(e, sizeof(e), "k%04d", i * 10 + 5);
+    state->AddTombstone(s, e, i + 1, bytewise_icmp_);
+  }
+
+  // Verify task is in queue
+  EXPECT_EQ(state->task_state(), MergeTaskState::kQueued);
+  EXPECT_EQ(state->queued_tasks(), 1);
+
+  std::atomic<bool> waiter_returned{false};
+  std::thread waiter_thread([&]() {
+    state->WaitForMergeStable();
+    waiter_returned.store(true, std::memory_order_release);
+  });
+
+  // Call CancelAndDrain to trigger UnSchedule
+  state->CancelAndDrain();
+
+  waiter_thread.join();
+  sleeping_task.WakeUp();
+
+  EXPECT_TRUE(waiter_returned.load());
+  EXPECT_EQ(state->task_state(), MergeTaskState::kIdle);
+  EXPECT_EQ(state->queued_tasks(), 0);
+  EXPECT_EQ(state->running_tasks(), 0);
+  EXPECT_EQ(state->merge_unscheduled(), 1U);
+  EXPECT_EQ(state->merge_completed(), 0U);
+}
+#endif  // !defined(NDEBUG)
 
 }  // namespace ROCKSDB_NAMESPACE
 

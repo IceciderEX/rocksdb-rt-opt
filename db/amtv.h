@@ -198,6 +198,14 @@ class AMTVMultiSourceAdapter {
   const InternalKeyComparator* icmp_;
 };
 
+// Lifecycle state of AMTV background merge task (M2c.1)
+enum class MergeTaskState {
+  kIdle,
+  kSubmitting,
+  kQueued,
+  kRunning
+};
+
 // AMTVState manages the lifecycle and atomic publication of AMTVSnapshot.
 class AMTVState : public std::enable_shared_from_this<AMTVState> {
  public:
@@ -227,12 +235,15 @@ class AMTVState : public std::enable_shared_from_this<AMTVState> {
   static void BGMergeUnschedule(void* arg);
   void OnTaskUnscheduled();
   void BGMergeTask();
-  bool RunMergeSynchronously();
 
-  // Explicit drain and cancellation protocol (P0-1)
+  // TEST-ONLY: For deterministic testing. Not used in production path.
+  bool TEST_RunMergeSynchronously();
+  bool RunMergeSynchronously() { return TEST_RunMergeSynchronously(); }
+
+  // Explicit drain and cancellation protocol (P0-1, M2c.1)
   void CancelAndDrain();
 
-  // Precise stability check and wait protocol (P0-2)
+  // Precise stability check and wait protocol (P0-2, M2c.1)
   bool IsMergeStable() const;
   void WaitForMergeStable();
 
@@ -273,9 +284,8 @@ class AMTVState : public std::enable_shared_from_this<AMTVState> {
   bool is_fallback_required() const {
     return fallback_required_.load(std::memory_order_relaxed);
   }
-  bool is_merge_in_progress() const {
-    return merge_in_progress_.load(std::memory_order_relaxed);
-  }
+  bool is_merge_in_progress() const;
+  MergeTaskState task_state() const;
   int queued_tasks() const;
   int running_tasks() const;
 
@@ -306,11 +316,19 @@ class AMTVState : public std::enable_shared_from_this<AMTVState> {
   uint64_t task_queue_wait_time_nanos() const {
     return task_queue_wait_time_nanos_.load(std::memory_order_relaxed);
   }
+  // Byte proxy metrics: only accounts for sizeof(OpenDeltaEntry) * entry_count.
+  // Does not include string heap memory, FragmentedRangeTombstoneList, vector capacity, or coexisting snapshots.
+  uint64_t raw_entries_struct_bytes_peak() const {
+    return raw_entries_struct_bytes_peak_.load(std::memory_order_relaxed);
+  }
+  uint64_t in_flight_merge_struct_bytes_peak() const {
+    return in_flight_merge_struct_bytes_peak_.load(std::memory_order_relaxed);
+  }
   uint64_t raw_entries_bytes_peak() const {
-    return raw_entries_bytes_peak_.load(std::memory_order_relaxed);
+    return raw_entries_struct_bytes_peak();
   }
   uint64_t in_flight_merge_bytes_peak() const {
-    return in_flight_merge_bytes_peak_.load(std::memory_order_relaxed);
+    return in_flight_merge_struct_bytes_peak();
   }
   uint64_t fallback_event_count() const {
     return fallback_event_count_.load(std::memory_order_relaxed);
@@ -354,11 +372,10 @@ class AMTVState : public std::enable_shared_from_this<AMTVState> {
   std::atomic<uint32_t> peak_sealed_layers_{0};
   std::atomic<uint64_t> fallback_to_native_count_{0};
 
-  // Task synchronization and lifecycle tracking (P0-1, P0-2)
+  // Task synchronization and lifecycle tracking (P0-1, P0-2, M2c.1)
   mutable port::Mutex task_mu_;
   mutable port::CondVar task_cond_;
-  int queued_tasks_{0};
-  int running_tasks_{0};
+  MergeTaskState task_state_{MergeTaskState::kIdle};
   Env::Priority last_scheduled_priority_{Env::Priority::LOW};
   std::string priority_used_{"UNKNOWN"};
   uint64_t last_scheduled_time_nanos_{0};
@@ -375,8 +392,8 @@ class AMTVState : public std::enable_shared_from_this<AMTVState> {
   std::atomic<uint64_t> task_queue_wait_time_nanos_{0};
   std::atomic<uint64_t> fallback_event_count_{0};
   std::atomic<uint32_t> runs_at_fallback_{0};
-  std::atomic<uint64_t> raw_entries_bytes_peak_{0};
-  std::atomic<uint64_t> in_flight_merge_bytes_peak_{0};
+  std::atomic<uint64_t> raw_entries_struct_bytes_peak_{0};
+  std::atomic<uint64_t> in_flight_merge_struct_bytes_peak_{0};
 
   // Per-level breakdown (protected by write_mutex_)
   std::map<uint32_t, uint64_t> merge_count_per_level_;
