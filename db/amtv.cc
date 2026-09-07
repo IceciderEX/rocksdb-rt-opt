@@ -457,8 +457,8 @@ void AMTVState::AddTombstone(const Slice& start_user_key,
   }
 
   bool should_schedule_merge = false;
-  uint64_t lock_wait_start_ns = 0;
 #ifdef ROCKSDB_READ_PATH_AUDIT
+  uint64_t lock_wait_start_ns = 0;
   if (IsReadPathAuditEnabled()) {
     lock_wait_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -478,8 +478,8 @@ void AMTVState::AddTombstone(const Slice& start_user_key,
       return;
     }
 
-    uint64_t clone_start_ns = 0;
 #ifdef ROCKSDB_READ_PATH_AUDIT
+    uint64_t clone_start_ns = 0;
     if (IsReadPathAuditEnabled()) {
       clone_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -549,8 +549,8 @@ void AMTVState::AddTombstone(const Slice& start_user_key,
                                ",hard_limit=" + std::to_string(hard_layer_limit_);
         AMTVTimelineLogger::Get().LogEvent(rec);
       } else {
-        uint64_t seal_start_ns = 0;
 #ifdef ROCKSDB_READ_PATH_AUDIT
+        uint64_t seal_start_ns = 0;
         if (IsReadPathAuditEnabled()) {
           seal_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
               std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -620,8 +620,8 @@ void AMTVState::AddTombstone(const Slice& start_user_key,
     UpdateMemoryProxyPeaks(new_snap.get());
     TEST_SYNC_POINT("AMTVState::AddTombstone:BeforePublish");
 
-    uint64_t pub_start_ns = 0;
 #ifdef ROCKSDB_READ_PATH_AUDIT
+    uint64_t pub_start_ns = 0;
     if (IsReadPathAuditEnabled()) {
       pub_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now().time_since_epoch()).count();
