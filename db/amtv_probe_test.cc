@@ -7,6 +7,7 @@
 
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "db/dbformat.h"
@@ -124,6 +125,114 @@ TEST_F(AMTVProbeTest, Probe3_CompositeWithoutFullRefragmentation) {
   ASSERT_TRUE(trunc_iter->Valid());
   ASSERT_EQ(trunc_iter->seq(), static_cast<SequenceNumber>(100));
 }
+
+#ifdef ROCKSDB_READ_PATH_AUDIT
+// Probe 4: Validates multi-threaded audit and probe thread_local statistics
+// aggregation protocol (TakeAndReset).
+// 8 worker threads each write known quantities of events. First TakeAndReset
+// aggregation must strictly match the 8-thread sum; second TakeAndReset must be all 0.
+TEST_F(AMTVProbeTest, Probe4_ThreadLocalAuditStatsAggregation) {
+  constexpr int kNumThreads = 8;
+  struct ThreadAuditSnapshot {
+    ReadPathAuditStats audit_stats;
+    AMTVGetProbeStats probe_stats;
+  };
+
+  std::vector<ThreadAuditSnapshot> first_snapshots(kNumThreads);
+  std::vector<ThreadAuditSnapshot> second_snapshots(kNumThreads);
+
+  SetReadPathAuditEnabled(true);
+  g_amtv_get_probe_stats_enabled.store(true, std::memory_order_relaxed);
+
+  std::vector<std::thread> threads;
+  threads.reserve(kNumThreads);
+
+  for (int tid = 0; tid < kNumThreads; ++tid) {
+    threads.emplace_back([tid, &first_snapshots, &second_snapshots]() {
+      auto* astats = GetReadPathAuditStats();
+      astats->Reset();
+      tl_amtv_get_probe_stats.Reset();
+
+      uint64_t mat_count = (tid + 1) * 10;
+      uint64_t mat_nanos = (tid + 1) * 1000;
+      uint64_t lock_contended = (tid + 1) * 2;
+      uint64_t lock_wait_nanos = (tid + 1) * 500;
+      uint64_t gets = (tid + 1) * 100;
+      uint64_t probed_runs = (tid + 1) * 300;
+
+      astats->range_tombstone_view_materialization_count += mat_count;
+      astats->range_tombstone_view_materialization_nanos += mat_nanos;
+      astats->fragment_build_lock_contended_count += lock_contended;
+      astats->fragment_build_lock_contended_wait_nanos += lock_wait_nanos;
+
+      tl_amtv_get_probe_stats.get_count += gets;
+      tl_amtv_get_probe_stats.sealed_runs_sum += probed_runs;
+
+      // First TakeAndReset
+      first_snapshots[tid].audit_stats = *astats;
+      first_snapshots[tid].probe_stats = tl_amtv_get_probe_stats;
+      astats->Reset();
+      tl_amtv_get_probe_stats.Reset();
+
+      // Second TakeAndReset
+      second_snapshots[tid].audit_stats = *astats;
+      second_snapshots[tid].probe_stats = tl_amtv_get_probe_stats;
+      astats->Reset();
+      tl_amtv_get_probe_stats.Reset();
+    });
+  }
+
+  for (auto& t : threads) {
+    t.join();
+  }
+
+  uint64_t agg_mat_count = 0;
+  uint64_t agg_mat_nanos = 0;
+  uint64_t agg_lock_contended = 0;
+  uint64_t agg_lock_wait_nanos = 0;
+  uint64_t agg_gets = 0;
+  uint64_t agg_probed_runs = 0;
+
+  uint64_t exp_mat_count = 0;
+  uint64_t exp_mat_nanos = 0;
+  uint64_t exp_lock_contended = 0;
+  uint64_t exp_lock_wait_nanos = 0;
+  uint64_t exp_gets = 0;
+  uint64_t exp_probed_runs = 0;
+
+  for (int tid = 0; tid < kNumThreads; ++tid) {
+    exp_mat_count += (tid + 1) * 10;
+    exp_mat_nanos += (tid + 1) * 1000;
+    exp_lock_contended += (tid + 1) * 2;
+    exp_lock_wait_nanos += (tid + 1) * 500;
+    exp_gets += (tid + 1) * 100;
+    exp_probed_runs += (tid + 1) * 300;
+
+    agg_mat_count += first_snapshots[tid].audit_stats.range_tombstone_view_materialization_count;
+    agg_mat_nanos += first_snapshots[tid].audit_stats.range_tombstone_view_materialization_nanos;
+    agg_lock_contended += first_snapshots[tid].audit_stats.fragment_build_lock_contended_count;
+    agg_lock_wait_nanos += first_snapshots[tid].audit_stats.fragment_build_lock_contended_wait_nanos;
+    agg_gets += first_snapshots[tid].probe_stats.get_count;
+    agg_probed_runs += first_snapshots[tid].probe_stats.sealed_runs_sum;
+  }
+
+  EXPECT_EQ(agg_mat_count, exp_mat_count);
+  EXPECT_EQ(agg_mat_nanos, exp_mat_nanos);
+  EXPECT_EQ(agg_lock_contended, exp_lock_contended);
+  EXPECT_EQ(agg_lock_wait_nanos, exp_lock_wait_nanos);
+  EXPECT_EQ(agg_gets, exp_gets);
+  EXPECT_EQ(agg_probed_runs, exp_probed_runs);
+
+  for (int tid = 0; tid < kNumThreads; ++tid) {
+    EXPECT_EQ(second_snapshots[tid].audit_stats.range_tombstone_view_materialization_count, 0U);
+    EXPECT_EQ(second_snapshots[tid].audit_stats.range_tombstone_view_materialization_nanos, 0U);
+    EXPECT_EQ(second_snapshots[tid].audit_stats.fragment_build_lock_contended_count, 0U);
+    EXPECT_EQ(second_snapshots[tid].audit_stats.fragment_build_lock_contended_wait_nanos, 0U);
+    EXPECT_EQ(second_snapshots[tid].probe_stats.get_count, 0U);
+    EXPECT_EQ(second_snapshots[tid].probe_stats.sealed_runs_sum, 0U);
+  }
+}
+#endif
 
 }  // namespace ROCKSDB_NAMESPACE
 

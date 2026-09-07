@@ -457,11 +457,34 @@ void AMTVState::AddTombstone(const Slice& start_user_key,
   }
 
   bool should_schedule_merge = false;
+  uint64_t lock_wait_start_ns = 0;
+#ifdef ROCKSDB_READ_PATH_AUDIT
+  if (IsReadPathAuditEnabled()) {
+    lock_wait_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+#endif
   {
     MutexLock l(&write_mutex_);
+#ifdef ROCKSDB_READ_PATH_AUDIT
+    if (lock_wait_start_ns > 0) {
+      uint64_t lock_acq_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+      write_state_lock_wait_nanos_.fetch_add(lock_acq_ns - lock_wait_start_ns,
+                                             std::memory_order_relaxed);
+    }
+#endif
     if (fallback_required_.load(std::memory_order_relaxed)) {
       return;
     }
+
+    uint64_t clone_start_ns = 0;
+#ifdef ROCKSDB_READ_PATH_AUDIT
+    if (IsReadPathAuditEnabled()) {
+      clone_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+#endif
 
     auto cur_snap = AtomicSharedPtrLoad(&snapshot_, std::memory_order_relaxed);
     auto new_snap = std::make_shared<AMTVSnapshot>(*cur_snap);
@@ -470,7 +493,31 @@ void AMTVState::AddTombstone(const Slice& start_user_key,
     std::shared_ptr<OpenDelta> new_open =
         cur_snap->open_delta ? cur_snap->open_delta->Clone()
                              : std::make_shared<OpenDelta>();
+
+#ifdef ROCKSDB_READ_PATH_AUDIT
+    if (clone_start_ns > 0) {
+      uint64_t clone_end_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+      write_snapshot_clone_nanos_.fetch_add(clone_end_ns - clone_start_ns,
+                                            std::memory_order_relaxed);
+    }
+    uint64_t append_start_ns = 0;
+    if (IsReadPathAuditEnabled()) {
+      append_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+#endif
+
     new_open->AddEntry(start_user_key, end_user_key, seq);
+
+#ifdef ROCKSDB_READ_PATH_AUDIT
+    if (append_start_ns > 0) {
+      uint64_t append_end_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+      write_append_nanos_.fetch_add(append_end_ns - append_start_ns,
+                                    std::memory_order_relaxed);
+    }
+#endif
 
     if (new_open->size() >= delta_tombstones_limit_) {
       // P0 constraint 2: projected_sealed_runs > amtv_hard_layer_limit (hard_run_limit)
@@ -502,9 +549,24 @@ void AMTVState::AddTombstone(const Slice& start_user_key,
                                ",hard_limit=" + std::to_string(hard_layer_limit_);
         AMTVTimelineLogger::Get().LogEvent(rec);
       } else {
+        uint64_t seal_start_ns = 0;
+#ifdef ROCKSDB_READ_PATH_AUDIT
+        if (IsReadPathAuditEnabled()) {
+          seal_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch()).count();
+        }
+#endif
         auto new_run = std::make_shared<const AMTVRun>(
             next_run_id_++, /*level=*/0, /*chunk_count=*/1, /*is_partial=*/false,
             new_open->entries(), icmp);
+#ifdef ROCKSDB_READ_PATH_AUDIT
+        if (seal_start_ns > 0) {
+          uint64_t seal_end_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch()).count();
+          write_seal_build_nanos_.fetch_add(seal_end_ns - seal_start_ns,
+                                            std::memory_order_relaxed);
+        }
+#endif
         uint64_t new_run_id = new_run->run_id;
         new_snap->sealed_runs.push_back(std::move(new_run));
         new_snap->open_delta = std::make_shared<OpenDelta>();
@@ -557,9 +619,25 @@ void AMTVState::AddTombstone(const Slice& start_user_key,
 
     UpdateMemoryProxyPeaks(new_snap.get());
     TEST_SYNC_POINT("AMTVState::AddTombstone:BeforePublish");
+
+    uint64_t pub_start_ns = 0;
+#ifdef ROCKSDB_READ_PATH_AUDIT
+    if (IsReadPathAuditEnabled()) {
+      pub_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+#endif
     AtomicSharedPtrStore(&snapshot_,
                          std::shared_ptr<const AMTVSnapshot>(std::move(new_snap)),
                          std::memory_order_release);
+#ifdef ROCKSDB_READ_PATH_AUDIT
+    if (pub_start_ns > 0) {
+      uint64_t pub_end_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+      write_publish_nanos_.fetch_add(pub_end_ns - pub_start_ns,
+                                     std::memory_order_relaxed);
+    }
+#endif
     TEST_SYNC_POINT("AMTVState::AddTombstone:AfterPublish");
   }
 
@@ -1100,6 +1178,8 @@ void AMTVState::BGMergeTask() {
       AMTVTimelineLogger::Get().LogEvent(rec);
     } else {
       merge_discarded_.fetch_add(1, std::memory_order_relaxed);
+      total_discarded_merge_wall_time_nanos_.fetch_add(compute_wall_nanos, std::memory_order_relaxed);
+      total_discarded_merge_cpu_time_nanos_.fetch_add(compute_cpu_nanos, std::memory_order_relaxed);
 
       AMTVTimelineRecord rec;
       rec.event_type = "MERGE_DISCARD";

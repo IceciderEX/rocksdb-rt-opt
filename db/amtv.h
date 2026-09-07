@@ -636,6 +636,31 @@ class AMTVState : public std::enable_shared_from_this<AMTVState> {
     return max_single_merge_level_.load(std::memory_order_relaxed);
   }
 
+  uint64_t total_discarded_merge_wall_time_nanos() const {
+    return total_discarded_merge_wall_time_nanos_.load(std::memory_order_relaxed);
+  }
+  uint64_t total_discarded_merge_cpu_time_nanos() const {
+    return total_discarded_merge_cpu_time_nanos_.load(std::memory_order_relaxed);
+  }
+
+#ifdef ROCKSDB_READ_PATH_AUDIT
+  uint64_t amtv_write_state_lock_wait_nanos() const {
+    return write_state_lock_wait_nanos_.load(std::memory_order_relaxed);
+  }
+  uint64_t amtv_write_append_nanos() const {
+    return write_append_nanos_.load(std::memory_order_relaxed);
+  }
+  uint64_t amtv_write_snapshot_clone_nanos() const {
+    return write_snapshot_clone_nanos_.load(std::memory_order_relaxed);
+  }
+  uint64_t amtv_write_seal_build_nanos() const {
+    return write_seal_build_nanos_.load(std::memory_order_relaxed);
+  }
+  uint64_t amtv_write_publish_nanos() const {
+    return write_publish_nanos_.load(std::memory_order_relaxed);
+  }
+#endif
+
   std::map<uint32_t, uint64_t> merge_count_per_level() const {
     MutexLock l(&write_mutex_);
     return merge_count_per_level_;
@@ -727,6 +752,17 @@ class AMTVState : public std::enable_shared_from_this<AMTVState> {
   std::atomic<uint64_t> total_computed_merge_cpu_time_nanos_{0};
   std::atomic<uint64_t> total_published_merge_wall_time_nanos_{0};
   std::atomic<uint64_t> total_published_merge_cpu_time_nanos_{0};
+
+  std::atomic<uint64_t> total_discarded_merge_wall_time_nanos_{0};
+  std::atomic<uint64_t> total_discarded_merge_cpu_time_nanos_{0};
+
+#ifdef ROCKSDB_READ_PATH_AUDIT
+  std::atomic<uint64_t> write_state_lock_wait_nanos_{0};
+  std::atomic<uint64_t> write_append_nanos_{0};
+  std::atomic<uint64_t> write_snapshot_clone_nanos_{0};
+  std::atomic<uint64_t> write_seal_build_nanos_{0};
+  std::atomic<uint64_t> write_publish_nanos_{0};
+#endif
 
   // Memory proxy metrics
   std::atomic<uint64_t> raw_entry_payload_bytes_peak_{0};
