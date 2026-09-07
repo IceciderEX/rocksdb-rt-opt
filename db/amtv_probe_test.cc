@@ -4,6 +4,7 @@
 //  (found in the LICENSE.Apache file in the root directory).
 
 #include "db/amtv.h"
+#include "db/read_path_audit.h"
 
 #include <memory>
 #include <string>
