@@ -955,8 +955,9 @@ FragmentedRangeTombstoneIterator* MemTable::NewRangeTombstoneIteratorInternal(
 #ifdef ROCKSDB_READ_PATH_AUDIT
       wait_timer.Start(&g_read_path_audit_stats.fragment_build_lock_contended_wait_nanos);
       if (ROCKSDB_NAMESPACE::IsReadPathAuditEnabled()) {
-        ROCKSDB_NAMESPACE::g_read_path_audit_stats.last_contended_memtable_id = GetID();
-        ROCKSDB_NAMESPACE::g_read_path_audit_stats.last_contended_tombstone_count = NumRangeDeletion();
+        auto* cur_stats = ROCKSDB_NAMESPACE::GetReadPathAuditStats();
+        cur_stats->last_contended_memtable_id = GetID();
+        cur_stats->last_contended_tombstone_count = NumRangeDeletion();
       }
 #endif
       cache->reader_mutex.lock();
@@ -969,8 +970,9 @@ FragmentedRangeTombstoneIterator* MemTable::NewRangeTombstoneIteratorInternal(
 #ifdef ROCKSDB_READ_PATH_AUDIT
       build_timer.Start(&g_read_path_audit_stats.range_tombstone_view_materialization_nanos);
       if (ROCKSDB_NAMESPACE::IsReadPathAuditEnabled()) {
-        ROCKSDB_NAMESPACE::g_read_path_audit_stats.last_materialization_memtable_id = GetID();
-        ROCKSDB_NAMESPACE::g_read_path_audit_stats.last_materialization_tombstone_count = NumRangeDeletion();
+        auto* cur_stats = ROCKSDB_NAMESPACE::GetReadPathAuditStats();
+        cur_stats->last_materialization_memtable_id = GetID();
+        cur_stats->last_materialization_tombstone_count = NumRangeDeletion();
       }
 #endif
       auto* unfragmented_iter = new MemTableIterator(

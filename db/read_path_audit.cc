@@ -9,9 +9,11 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-thread_local ReadPathAuditStats g_read_path_audit_stats;
+thread_local AuditOpType g_current_audit_op_type = AuditOpType::kNone;
+thread_local ReadPathAuditStats g_read_path_audit_stats_bucket[static_cast<size_t>(AuditOpType::kMax)];
 std::atomic<bool> g_read_path_audit_enabled{false};
 
 }  // namespace ROCKSDB_NAMESPACE
 
 #endif
+
