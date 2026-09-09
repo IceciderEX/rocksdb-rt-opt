@@ -79,7 +79,7 @@
 | **Q1** | `AMTVSnapshot`、`AMTVRun`、`OpenDelta` 保存了什么原始信息？ | `AMTVRun` 保存 `std::vector<OpenDeltaEntry> raw_entries` 与预分片的 `std::shared_ptr<FragmentedRangeTombstoneList> fragmented_list`；`OpenDelta` 保存扁平 `entries_`；条目中完整包含 start/end key、sequence、timestamp、type。`AMTVSnapshot` 仅保存 `sealed_runs` 与 `open_delta`，不存在 `base_memtable` 字段。 | [db/amtv.h:35-51, 113-134, 170-208](file:///home/wam/grad/rocksdb-v11.8.0/db/amtv.h#L35-L51), [db/amtv.cc:25-68](file:///home/wam/grad/rocksdb-v11.8.0/db/amtv.cc#L25-L68) | **已从源码核实**：墓碑原始语义信息在各 Run 与 Delta 中完整保留；Snapshot 仅持有 sealed runs 与 Open Delta。 | P1 原型只能以 sealed runs 与 Open Delta 的 raw entries 作为输入来源，严禁假设 `base_memtable`。 |
 | **Q2** | 对象所有权与生命周期在归并、变只读、销毁时如何保证安全？ | `AMTVSnapshot` 内部持有 `std::vector<std::shared_ptr<const AMTVRun>> sealed_runs` 与 `std::shared_ptr<const OpenDelta> open_delta`。通过 `std::shared_ptr` 保证旧 Snapshot 引用的 Run 不会被析构。 | [db/amtv.h:170-208](file:///home/wam/grad/rocksdb-v11.8.0/db/amtv.h#L170-L208), [db/amtv.cc:295-318](file:///home/wam/grad/rocksdb-v11.8.0/db/amtv.cc#L295-L318) | **已从源码核实**：即使后台发生 Run 归并、MemTable 冻结为 Immutable 或触发 Fallback，已创建的 Snapshot 依然完全只读且引用计数自保。 | P1 局部视图可安全持有 `AMTVSnapshot` 句柄，不存在悬垂指针或竞态风险。 |
 | **Q3** | 对给定半开区间 $[L, U)$，能否从原始条目或分片列表提取所有相交片段，尤其是跨左边界片段（$start < L < end$）？ | 原始 DeleteRange 存在 $start < L$ 但 $end > L$ 的跨左界长墓碑。由于未切分的 raw entries 缺乏 prefix-max-end 索引，**不能仅按 start 二分提取**，必须做完整安全遍历；在已分片的单调互斥分片流中，可二分定位首个 $end > L$。 | [db/range_tombstone_fragmenter.cc:387-397](file:///home/wam/grad/rocksdb-v11.8.0/db/range_tombstone_fragmenter.cc#L387-L397), [db/range_tombstone_fragmenter.h:50-75](file:///home/wam/grad/rocksdb-v11.8.0/db/range_tombstone_fragmenter.h#L50-L75) | **已从源码核实**：原始墓碑提取必须满足 $start < U \land end > L$；二分优化在未建 prefix-max-end 索引前属于**待验证假设**。 | P1 原型必须对 raw entries 执行 `start < U && end > L` 的完整安全遍历筛选，严禁在现阶段声称二分优化。 |
-| **Q4** | `OpenDelta` 能否在不扫描无关历史 Run 的前提下完成完整相交提取？ | `OpenDelta` 硬上限为 64 条，以 `std::vector<OpenDeltaEntry>` 存储。仅需线性遍历至多 64 条内存条目即可判定与 $[L, U)$ 的相交性，耗时仅数十纳秒，完全独立于历史 Run。 | [db/amtv.h:67-107](file:///home/wam/grad/rocksdb-v11.8.0/db/amtv.h#L67-L107), [include/rocksdb/advanced_options.h:434](file:///home/wam/grad/rocksdb-v11.8.0/include/rocksdb/advanced_options.h#L434) | **已从源码核实**：Open Delta 具备完全的局部独立提取能力，开销确定且极低。 | P1 原型可直接内存安全遍历 Open Delta 相交条目，无需回溯历史 Run。 |
+| **Q4** | `OpenDelta` 能否在不扫描无关历史 Run 的前提下完成完整相交提取？ | `OpenDelta` 硬上限为 64 条，以 `std::vector<OpenDeltaEntry>` 存储。Open Delta 至多 64 条，采用线性遍历即可判定与 $[L, U)$ 的相交性，完全独立于历史 Run。 | [db/amtv.h:67-107](file:///home/wam/grad/rocksdb-v11.8.0/db/amtv.h#L67-L107), [include/rocksdb/advanced_options.h:434](file:///home/wam/grad/rocksdb-v11.8.0/include/rocksdb/advanced_options.h#L434) | **已从源码核实**：Open Delta 具备完全的局部独立提取能力，条目上限固定（至多 64 条）。 | P1 原型可直接内存安全遍历 Open Delta 相交条目，无需回溯历史 Run。 |
 | **Q5** | 活跃 MemTable 的 `cached_range_tombstone_` 如何生成与失效？ | `MemTable::Add` 在遇到 `kTypeRangeDeletion` 时，直接将 `cached_range_tombstone_.Access()->initialized` 置为 false；Reader 读到未初始化时争抢 `reader_mutex`，由一个 Reader 全量扫描 `range_del_table_` 重构。 | [db/memtable.cc:945-989, 1294-1310](file:///home/wam/grad/rocksdb-v11.8.0/db/memtable.cc#L945-L989) | **已从源码核实**：高频写入时该缓存频繁失效，导致读线程反复遭遇 `reader_mutex` 锁竞争与全量重建开销。 | P1 局部视图若能按需局部构建，将彻底避免争抢该全局粗粒度锁。 |
 | **Q6** | `TruncatedRangeDelIterator` 的类型契约与约束是什么？ | `TruncatedRangeDelIterator` 是非虚类，强绑定 `std::unique_ptr<FragmentedRangeTombstoneIterator>`，其 `Next/Prev/Seek/SeekForPrev` 直接内联调用子成员的非虚成员函数。 | [db/range_del_aggregator.h:31-105](file:///home/wam/grad/rocksdb-v11.8.0/db/range_del_aggregator.h#L31-L105), [db/range_del_aggregator.cc:24-175](file:///home/wam/grad/rocksdb-v11.8.0/db/range_del_aggregator.cc#L24-L175) | **已从源码核实**：上层无法通过派生实现多态接入，必须向其提供真实的 `FragmentedRangeTombstoneIterator`。 | P1 不能伪造迭代器类，必须通过原生 Fragmenter 生成真实且合法的原生分片迭代器。 |
 | **Q7** | `MergingIterator` 对范围墓碑槽位有何性质要求？ | `MergingIterator` 槽位 0 专属于 MemTable。要求墓碑流：1) 全局严格有序；2) 区间两两互斥；3) 支持 `TopNext/TopPrev/SeekInternalKey` 前后双向导航；4) 携带完整版本栈用于 MVCC 屏蔽。 | [table/merging_iterator.h:61-76](file:///home/wam/grad/rocksdb-v11.8.0/table/merging_iterator.h#L61-L76), [table/merging_iterator.cc:163-200, 776-890](file:///home/wam/grad/rocksdb-v11.8.0/table/merging_iterator.cc#L163-L200) | **已从源码核实**：该单槽必须是完全规范化的单一流，任何乱序或重叠都将破坏二叉堆不变式与 Reseek 正确性。 | P1 局部视图生成物必须完全符合原生 `FragmentedRangeTombstoneList` 的不变式契约。 |
@@ -121,11 +121,11 @@
    - **输入类别 2：已 Fragment 的 span/stack**：
      在已分片的 `FragmentedRangeTombstoneList` 中，片段是两两互斥且按 $S$ 严格递增排序的，此时 $E$ 亦单调递增，二分找 $E > L$ 才在数学上成立。
 3. **已切分列表（FragmentedRangeTombstoneList）重输入的语义风险**：
-   - `FragmentedRangeTombstoneList` 内部包含私有的 `tombstones_`（`vector<RangeTombstoneStack>`）和版本索引。它并未暴露可安全无损重构原始墓碑流的公共导出接口。
+   - 该结构公开了 fragment stack 的遍历接口，但没有可安全、无损重构原始未切分 tombstone 流的接口；因此当前禁止将既有 fragment 直接重新输入 Fragmenter。
    - 原生 Fragmenter 假定输入为未分片的内部键流。**在形式化证明其等价性之前，禁止将既有 fragment 直接重新喂给 Fragmenter 并声称语义等价**。
    - **M4-P1a 必须以 raw entries 作为唯一事实来源**。
 4. **Open Delta 提取的确定性**：
-   - `OpenDelta` 最多仅包含 64 条记录。对其进行线性安全遍历（至多 64 次比较）耗时在 100ns 量级，可完整提取所有满足 $S < U \land E > L$ 的条目，无需回溯历史 Run。
+   - `OpenDelta` 最多仅包含 64 条记录。对其进行线性安全遍历（至多 64 次比较），可完整提取所有满足 $S < U \land E > L$ 的条目，无需回溯历史 Run。
 
 #### A.3 并发演进下的可读性与持有关系保障
 - **Run 归并**：归并产生新的 `AMTVRun`，并通过 COW（Copy-On-Write）原子更新 `AMTVState::sealed_runs_`。旧 Snapshot 依然持有旧 `AMTVRun` 的 `shared_ptr`，其底层的内存块与分片列表完全不受归并影响。
@@ -240,6 +240,7 @@ DBImpl::NewInternalIterator (db/db_impl.cc:2573-2624)
 
 ### 4.1 原型定位与边界约束
 - **严正声明**：M4-P1a 仅为**测试专用局部视图语义参考原型（Test-Only Local Scan Semantic Reference View）**，建立正确性 Oracle，不作任何性能宣称，严禁侵入生产 `DB::NewIterator`。
+- **已证明范围说明**：**P1a 当前只证明：局部筛选后的 raw tombstone 集合保持窗口内覆盖语义等价**。不得称其已构成可直接供 MergingIterator 消费的有边界 Scan 事件流。
 - **核心目标**：证明“从实际 AMTV 来源安全全量遍历筛选相交原始墓碑（$start < U \land end > L$） + 原生 Fragmenter 构造局部视图”，在各种极端边界、时间戳与重叠拓扑下，与全量参考真值达到 100% 位级语义等价。
 
 ### 4.2 原型输入、提取行为与参考真值比对
