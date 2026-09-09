@@ -22,6 +22,7 @@
 | :--- | :--- | :--- | :--- | :--- |
 | **RocksDB 核心代码基线** | `rocksdb-v11.8.0` | `main` | `395ce9863fc4ecef4fba75f1b9e1e2510edf45c1` | 固定的 AMTV 核心实现基线（`feat(amtv): M1c-P0 multi-run scan semantics audit and test-only differential oracle`） |
 | **M4-P0 文档提交** | `rocksdb-v11.8.0` | `main` | `8d96435a607b7824a32632fd79e7c4caf81668e3` | M4-P0 审计文档初始提交（`docs(amtv): M4-P0 local scan view source adaptation audit`） |
+| **M4-P1a.1 阶段提交** | `rocksdb-v11.8.0` | `main` | `7eacb09c556d0cfe7ebcf58948c97150428a529c` | M4-P1a.1 输出边界裁剪与独立 Oracle 修订（`feat(amtv): M4-P1a.1 output boundary clipping, 3-way oracle, and audit revision`） |
 | **Study 研究仓提交** | `s14-range-delete-study` | `main` | `869a25044afd1baaddf777cd27ceaa5478aa0192` | 固定的实验与基线配置（`docs(audit): fix T512 tail typography and document overall quantiles calculation method`） |
 
 - **工作树状态**：两仓在基线点均保持 clean（无未提交的脏改动）。
@@ -240,7 +241,7 @@ DBImpl::NewInternalIterator (db/db_impl.cc:2573-2624)
 
 ### 4.1 原型定位与边界约束
 - **严正声明**：M4-P1a 仅为**测试专用局部视图语义参考原型（Test-Only Local Scan Semantic Reference View）**，建立正确性 Oracle，不作任何性能宣称，严禁侵入生产 `DB::NewIterator`。
-- **已证明范围说明**：**P1a 当前只证明：局部筛选后的 raw tombstone 集合保持窗口内覆盖语义等价**。不得称其已构成可直接供 MergingIterator 消费的有边界 Scan 事件流。
+- **已证明范围说明**：**P1a 当前只证明：局部筛选后的 raw tombstone 集合保持窗口内覆盖语义等价**。不得称其已构成可直接供 MergingIterator 消费的有边界 Scan 事件流。测试中实现的 `GetClippedFragmentStreamForward/Backward` 只是测试专用输出裁剪适配器，用于建立有边界的真值流以供差分比对，**尚不是可直接交给 MergingIterator 的生产 InternalIterator**。
 - **核心目标**：证明“从实际 AMTV 来源安全全量遍历筛选相交原始墓碑（$start < U \land end > L$） + 原生 Fragmenter 构造局部视图”，在各种极端边界、时间戳与重叠拓扑下，与全量参考真值达到 100% 位级语义等价。
 
 ### 4.2 原型输入、提取行为与参考真值比对
@@ -290,3 +291,16 @@ DBImpl::NewInternalIterator (db/db_impl.cc:2573-2624)
 
 > ### 闸门结论：【准予进入 M4-P1a 测试专用语义原型（GO TO M4-P1a）】
 > 审计文档已完成严谨修订，所有来源、假设与约束已彻底澄清。
+
+---
+
+## 6. M4-P1b-0 Run 内 Prefix-Max-End 区间索引语义原型结论
+
+### 6.1 核心结论与范围声明
+1. **测试专用边界声明**：M4-P1b-0 仅证明**“Run 内 Prefix-Max-End 区间索引筛选出的候选原始条目集合与全量线性安全遍历候选集合 100% 等价”**。
+2. **非端到端宣称**：P1b-0 **尚未证明**端到端 Scan 加速，亦**尚未允许**将索引或裁剪流接入真实 DB Scan/MergingIterator 生产路径；严禁将索引字段写入 `AMTVRun` 正式生产结构。
+3. **数据结构与复杂度**：
+   - 索引目录严格采用 `size_t` 保存下标，零字符串拷贝；内存开销固定为 $2N \times \text{sizeof(size_t)} = 16N$ 字节（当 $N \le 64$ 时单 Run 索引仅 1 KB）；
+   - 二分查找确定候选范围 $[left, right)$，利用 Prefix-Max-End 单调性证明了 $i < left$ 必有 $end \le L$，$i \ge right$ 必有 $start \ge U$，候选截断数学完备；
+   - 经 10,000 轮蒙特卡洛随机差分及 7 组确定性反例拓扑验证，候选多重集与裁剪流在 Debug 与全隔离 Release 静态构建下均 100% 通过。
+
