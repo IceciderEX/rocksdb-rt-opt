@@ -2190,6 +2190,9 @@ amtv_probe_test: $(OBJ_DIR)/db/amtv_probe_test.o $(TEST_LIBRARY) $(LIBRARY)
 amtv_scan_oracle_test: $(OBJ_DIR)/db/amtv_scan_oracle_test.o $(OBJ_DIR)/db/amtv_scan_oracle.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+amtv_local_scan_reference_test: $(OBJ_DIR)/db/amtv_local_scan_reference_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 sst_file_reader_test: $(OBJ_DIR)/table/sst_file_reader_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
