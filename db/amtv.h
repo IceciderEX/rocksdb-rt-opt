@@ -109,6 +109,17 @@ class OpenDelta {
 // Test hook: counter to verify zero materialization of OpenDelta during Get/MultiGet.
 extern std::atomic<uint64_t> test_open_delta_materialize_count;
 
+// Structural audit metrics for sidecar interval index (M4-P1b-1).
+// Strictly for structural and memory auditing; not for latency/throughput claims.
+struct AMTVRunIntervalIndexAuditInfo {
+  size_t left = 0;
+  size_t right = 0;
+  size_t span = 0;                  // right - left
+  size_t raw_entries_count = 0;
+  size_t candidate_count = 0;
+  size_t index_bytes = 0;
+};
+
 // Immutable AMTVRun representing a sealed run of range tombstones.
 struct AMTVRun {
   uint64_t run_id = 0;
@@ -124,6 +135,11 @@ struct AMTVRun {
   uint64_t raw_capacity_proxy_bytes = 0;
   uint64_t fragment_payload_bytes = 0;
 
+  // Sidecar interval index (M4-P1b-1): immutable once built in constructor.
+  // Stores strictly size_t indices, zero copying of start/end key payload.
+  std::vector<size_t> sorted_indices;
+  std::vector<size_t> prefix_max_end_index;
+
   AMTVRun() = default;
   AMTVRun(uint64_t id, uint32_t lvl, uint64_t chunk_count, bool partial,
           std::vector<OpenDeltaEntry> entries,
@@ -131,6 +147,21 @@ struct AMTVRun {
   AMTVRun(uint64_t id, std::vector<OpenDeltaEntry> entries,
           const InternalKeyComparator& icmp)
       : AMTVRun(id, 0, 1, false, std::move(entries), icmp) {}
+
+  // Read-only candidate query: collects indices of raw_entries intersecting [L, U).
+  // Strictly returns indices in out_indices without copying OpenDeltaEntry objects.
+  void CollectIntersectingRawEntryIndices(
+      const Slice* lower_bound, const Slice* upper_bound,
+      const InternalKeyComparator& icmp,
+      std::vector<size_t>* out_indices,
+      AMTVRunIntervalIndexAuditInfo* out_audit = nullptr) const;
+
+  size_t index_bytes() const {
+    return (sorted_indices.size() + prefix_max_end_index.size()) * sizeof(size_t);
+  }
+
+ private:
+  void BuildIntervalIndex(const InternalKeyComparator& icmp);
 };
 
 // Returns true if r1 and r2 are eligible for binary size-tiered merge.
@@ -448,9 +479,7 @@ class AMTVState : public std::enable_shared_from_this<AMTVState> {
   ~AMTVState();
 
   // Read path: acquire snapshot lock-free.
-  std::shared_ptr<const AMTVSnapshot> GetSnapshot() const {
-    return AtomicSharedPtrLoad(&snapshot_, std::memory_order_acquire);
-  }
+  std::shared_ptr<const AMTVSnapshot> GetSnapshot() const;
 
   // Write path: append tombstone and publish snapshot atomically.
   void AddTombstone(const Slice& start_user_key, const Slice& end_user_key,

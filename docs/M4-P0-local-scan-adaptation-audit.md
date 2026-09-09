@@ -300,7 +300,8 @@ DBImpl::NewInternalIterator (db/db_impl.cc:2573-2624)
 1. **测试专用边界声明**：M4-P1b-0 仅证明**“Run 内 Prefix-Max-End 区间索引筛选出的候选原始条目集合与全量线性安全遍历候选集合 100% 等价”**。
 2. **非端到端宣称**：P1b-0 **尚未证明**端到端 Scan 加速，亦**尚未允许**将索引或裁剪流接入真实 DB Scan/MergingIterator 生产路径；严禁将索引字段写入 `AMTVRun` 正式生产结构。
 3. **数据结构与复杂度**：
-   - 索引目录严格采用 `size_t` 保存下标，零字符串拷贝；内存开销固定为 $2N \times \text{sizeof(size_t)} = 16N$ 字节（当 $N \le 64$ 时单 Run 索引仅 1 KB）；
-   - 二分查找确定候选范围 $[left, right)$，利用 Prefix-Max-End 单调性证明了 $i < left$ 必有 $end \le L$，$i \ge right$ 必有 $start \ge U$，候选截断数学完备；
+   - 索引仅分配两个下标数组（`sorted_indices` 与 `prefix_max_end_index`），不复制 start/end key payload；
+   - 64 是 Open Delta 封箱阈值；归并后的 sealed run 可包含多个 chunk。索引内存为 $2N \times \text{sizeof(size_t)} = 16N$ 字节，随 run 大小线性增长；
+   - 二分查找确定候选范围 $[left, right)$，利用 Prefix-Max-End 单调性证明了 $i < left$ 必有 $end \le L$，$i \ge right$ 必有 $start \ge U$，候选截断数学完备；多 Run 审计严格记录每个 run 的 $left_i, right_i, span_i = right_i - left_i$，并以 $\sum span_i$ 核算总跨度，不将各 Run 的边界绝对值累加混淆为全局窗口；
    - 经 10,000 轮蒙特卡洛随机差分及 7 组确定性反例拓扑验证，候选多重集与裁剪流在 Debug 与全隔离 Release 静态构建下均 100% 通过。
 
