@@ -120,6 +120,51 @@ struct AMTVRunIntervalIndexAuditInfo {
   size_t index_bytes = 0;
 };
 
+// Sidecar interval index for an AMTVRun.
+// Encapsulates sorted start index directory and prefix-max-end tracking.
+// Immutable once constructed; external callers can only invoke read-only query
+// and audit inspection methods.
+class AMTVRunSidecarIndex {
+ public:
+  AMTVRunSidecarIndex() = default;
+  AMTVRunSidecarIndex(const std::vector<OpenDeltaEntry>& raw_entries,
+                      const InternalKeyComparator& icmp);
+
+  // Read-only candidate query: overwrites out_indices with indices of raw_entries
+  // that intersect [lower_bound, upper_bound).
+  // Strictly enforces "覆盖式输出" contract: calls out_indices->clear() at entry.
+  void CollectIntersectingIndices(
+      const std::vector<OpenDeltaEntry>& raw_entries,
+      const Slice* lower_bound, const Slice* upper_bound,
+      const InternalKeyComparator& icmp,
+      std::vector<size_t>* out_indices,
+      AMTVRunIntervalIndexAuditInfo* out_audit = nullptr) const;
+
+  size_t memory_bytes() const {
+    return (sorted_indices_.size() + prefix_max_end_index_.size()) * sizeof(size_t);
+  }
+
+  size_t size() const { return sorted_indices_.size(); }
+  bool empty() const { return sorted_indices_.empty(); }
+
+  // Read-only inspection for structural auditing and invariant validation
+  const std::vector<size_t>& sorted_indices() const { return sorted_indices_; }
+  const std::vector<size_t>& prefix_max_end_index() const { return prefix_max_end_index_; }
+
+  // Validates all mathematical invariants of the sidecar index:
+  // 1. Array lengths match raw_entries.size()
+  // 2. sorted_indices is monotonically sorted by start key (with tie-breakers)
+  // 3. prefix_max_end_index tracks monotonically non-decreasing end keys
+  // 4. All indices are valid (< raw_entries.size())
+  bool VerifyInvariants(const std::vector<OpenDeltaEntry>& raw_entries,
+                        const InternalKeyComparator& icmp,
+                        std::string* out_error = nullptr) const;
+
+ private:
+  std::vector<size_t> sorted_indices_;
+  std::vector<size_t> prefix_max_end_index_;
+};
+
 // Immutable AMTVRun representing a sealed run of range tombstones.
 struct AMTVRun {
   uint64_t run_id = 0;
@@ -135,11 +180,6 @@ struct AMTVRun {
   uint64_t raw_capacity_proxy_bytes = 0;
   uint64_t fragment_payload_bytes = 0;
 
-  // Sidecar interval index (M4-P1b-1): immutable once built in constructor.
-  // Stores strictly size_t indices, zero copying of start/end key payload.
-  std::vector<size_t> sorted_indices;
-  std::vector<size_t> prefix_max_end_index;
-
   AMTVRun() = default;
   AMTVRun(uint64_t id, uint32_t lvl, uint64_t chunk_count, bool partial,
           std::vector<OpenDeltaEntry> entries,
@@ -148,20 +188,29 @@ struct AMTVRun {
           const InternalKeyComparator& icmp)
       : AMTVRun(id, 0, 1, false, std::move(entries), icmp) {}
 
-  // Read-only candidate query: collects indices of raw_entries intersecting [L, U).
-  // Strictly returns indices in out_indices without copying OpenDeltaEntry objects.
+  // Read-only candidate query: overwrites out_indices with indices of raw_entries
+  // intersecting [L, U). Strictly clears out_indices at entry.
   void CollectIntersectingRawEntryIndices(
       const Slice* lower_bound, const Slice* upper_bound,
       const InternalKeyComparator& icmp,
       std::vector<size_t>* out_indices,
-      AMTVRunIntervalIndexAuditInfo* out_audit = nullptr) const;
+      AMTVRunIntervalIndexAuditInfo* out_audit = nullptr) const {
+    sidecar_index_.CollectIntersectingIndices(raw_entries, lower_bound,
+                                             upper_bound, icmp, out_indices,
+                                             out_audit);
+  }
 
   size_t index_bytes() const {
-    return (sorted_indices.size() + prefix_max_end_index.size()) * sizeof(size_t);
+    return sidecar_index_.memory_bytes();
+  }
+
+  // Read-only access to sidecar index for invariant verification
+  const AMTVRunSidecarIndex& sidecar_index() const {
+    return sidecar_index_;
   }
 
  private:
-  void BuildIntervalIndex(const InternalKeyComparator& icmp);
+  AMTVRunSidecarIndex sidecar_index_;
 };
 
 // Returns true if r1 and r2 are eligible for binary size-tiered merge.
@@ -504,7 +553,7 @@ class AMTVState : public std::enable_shared_from_this<AMTVState> {
 
   // Precise stability check and wait protocol (P0-2, M2c.1)
   bool IsMergeStable() const;
-  void WaitForMergeStable();
+  bool WaitForMergeStable(uint64_t timeout_micros = 10000000);
 
   // Lifecycle transitions
   void MarkImmutable() {

@@ -65,10 +65,12 @@ AMTVRun::AMTVRun(uint64_t id, uint32_t lvl, uint64_t chunk_count, bool partial,
   if (fragmented_list) {
     fragment_payload_bytes = fragmented_list->total_tombstone_payload_bytes();
   }
-  BuildIntervalIndex(icmp);
+  sidecar_index_ = AMTVRunSidecarIndex(raw_entries, icmp);
 }
 
-void AMTVRun::BuildIntervalIndex(const InternalKeyComparator& icmp) {
+AMTVRunSidecarIndex::AMTVRunSidecarIndex(
+    const std::vector<OpenDeltaEntry>& raw_entries,
+    const InternalKeyComparator& icmp) {
   const size_t n = raw_entries.size();
   if (n == 0) {
     return;
@@ -78,13 +80,13 @@ void AMTVRun::BuildIntervalIndex(const InternalKeyComparator& icmp) {
   const size_t ts_sz = ucmp->timestamp_size();
   const bool has_ts = (ts_sz > 0);
 
-  sorted_indices.resize(n);
+  sorted_indices_.resize(n);
   for (size_t i = 0; i < n; ++i) {
-    sorted_indices[i] = i;
+    sorted_indices_[i] = i;
   }
 
-  std::sort(sorted_indices.begin(), sorted_indices.end(),
-            [this, ucmp, has_ts, &icmp](size_t i, size_t j) {
+  std::sort(sorted_indices_.begin(), sorted_indices_.end(),
+            [&raw_entries, ucmp, has_ts, &icmp](size_t i, size_t j) {
               const auto& a = raw_entries[i];
               const auto& b = raw_entries[j];
               int c = ucmp->CompareWithoutTimestamp(a.user_start_key(), has_ts,
@@ -103,33 +105,38 @@ void AMTVRun::BuildIntervalIndex(const InternalKeyComparator& icmp) {
                                                    b.user_end_key(), has_ts) < 0;
             });
 
-  prefix_max_end_index.resize(n);
-  prefix_max_end_index[0] = sorted_indices[0];
+  prefix_max_end_index_.resize(n);
+  prefix_max_end_index_[0] = sorted_indices_[0];
   for (size_t i = 1; i < n; ++i) {
-    size_t curr_entry = sorted_indices[i];
-    size_t prev_max_entry = prefix_max_end_index[i - 1];
+    size_t curr_entry = sorted_indices_[i];
+    size_t prev_max_entry = prefix_max_end_index_[i - 1];
     int c = ucmp->CompareWithoutTimestamp(
         raw_entries[curr_entry].user_end_key(), has_ts,
         raw_entries[prev_max_entry].user_end_key(), has_ts);
     if (c > 0) {
-      prefix_max_end_index[i] = curr_entry;
+      prefix_max_end_index_[i] = curr_entry;
     } else {
-      prefix_max_end_index[i] = prev_max_entry;
+      prefix_max_end_index_[i] = prev_max_entry;
     }
   }
 }
 
-void AMTVRun::CollectIntersectingRawEntryIndices(
+void AMTVRunSidecarIndex::CollectIntersectingIndices(
+    const std::vector<OpenDeltaEntry>& raw_entries,
     const Slice* lower_bound, const Slice* upper_bound,
     const InternalKeyComparator& icmp,
     std::vector<size_t>* out_indices,
     AMTVRunIntervalIndexAuditInfo* out_audit) const {
+  // Overwrite contract: always clear caller's output container first.
+  if (out_indices) {
+    out_indices->clear();
+  }
   if (out_audit) {
     *out_audit = AMTVRunIntervalIndexAuditInfo();
     out_audit->raw_entries_count = raw_entries.size();
-    out_audit->index_bytes = index_bytes();
+    out_audit->index_bytes = memory_bytes();
   }
-  if (raw_entries.empty() || sorted_indices.empty()) {
+  if (raw_entries.empty() || sorted_indices_.empty()) {
     return;
   }
 
@@ -147,28 +154,28 @@ void AMTVRun::CollectIntersectingRawEntryIndices(
     }
   }
 
-  // Right bound binary search on sorted_indices: first entry with start >= U
-  size_t right = sorted_indices.size();
+  // Right bound binary search on sorted_indices_: first entry with start >= U
+  size_t right = sorted_indices_.size();
   if (upper_bound != nullptr && !upper_bound->empty()) {
     auto it_right = std::lower_bound(
-        sorted_indices.begin(), sorted_indices.end(), *upper_bound,
-        [this, ucmp, has_ts](size_t idx, const Slice& u) {
+        sorted_indices_.begin(), sorted_indices_.end(), *upper_bound,
+        [&raw_entries, ucmp, has_ts](size_t idx, const Slice& u) {
           return ucmp->CompareWithoutTimestamp(
                      raw_entries[idx].user_start_key(), has_ts, u, false) < 0;
         });
-    right = static_cast<size_t>(std::distance(sorted_indices.begin(), it_right));
+    right = static_cast<size_t>(std::distance(sorted_indices_.begin(), it_right));
   }
 
-  // Left bound binary search on prefix_max_end_index: first entry with prefix_max_end > L
+  // Left bound binary search on prefix_max_end_index_: first entry with prefix_max_end > L
   size_t left = 0;
   if (lower_bound != nullptr && !lower_bound->empty()) {
     auto it_left = std::lower_bound(
-        prefix_max_end_index.begin(), prefix_max_end_index.end(), *lower_bound,
-        [this, ucmp, has_ts](size_t entry_idx, const Slice& l) {
+        prefix_max_end_index_.begin(), prefix_max_end_index_.end(), *lower_bound,
+        [&raw_entries, ucmp, has_ts](size_t entry_idx, const Slice& l) {
           return ucmp->CompareWithoutTimestamp(
                      raw_entries[entry_idx].user_end_key(), has_ts, l, false) <= 0;
         });
-    left = static_cast<size_t>(std::distance(prefix_max_end_index.begin(), it_left));
+    left = static_cast<size_t>(std::distance(prefix_max_end_index_.begin(), it_left));
   }
 
   if (left > right) {
@@ -183,7 +190,7 @@ void AMTVRun::CollectIntersectingRawEntryIndices(
 
   // Exact filtering on [left, right)
   for (size_t i = left; i < right; ++i) {
-    size_t entry_idx = sorted_indices[i];
+    size_t entry_idx = sorted_indices_[i];
     const auto& entry = raw_entries[entry_idx];
 
     bool match = true;
@@ -208,6 +215,95 @@ void AMTVRun::CollectIntersectingRawEntryIndices(
       }
     }
   }
+}
+
+bool AMTVRunSidecarIndex::VerifyInvariants(
+    const std::vector<OpenDeltaEntry>& raw_entries,
+    const InternalKeyComparator& icmp,
+    std::string* out_error) const {
+  const size_t n = raw_entries.size();
+  if (sorted_indices_.size() != n || prefix_max_end_index_.size() != n) {
+    if (out_error) {
+      *out_error = "Array lengths mismatch: raw_entries=" + std::to_string(n) +
+                   ", sorted=" + std::to_string(sorted_indices_.size()) +
+                   ", prefix_max=" + std::to_string(prefix_max_end_index_.size());
+    }
+    return false;
+  }
+  if (n == 0) return true;
+
+  const auto* ucmp = icmp.user_comparator();
+  const size_t ts_sz = ucmp->timestamp_size();
+  const bool has_ts = (ts_sz > 0);
+
+  // Invariant 1: Valid indices and start key monotonicity in sorted_indices_
+  std::vector<bool> seen(n, false);
+  for (size_t i = 0; i < n; ++i) {
+    size_t idx = sorted_indices_[i];
+    if (idx >= n) {
+      if (out_error) {
+        *out_error = "sorted_indices[" + std::to_string(i) + "] = " +
+                     std::to_string(idx) + " >= n (" + std::to_string(n) + ")";
+      }
+      return false;
+    }
+    if (seen[idx]) {
+      if (out_error) {
+        *out_error = "Duplicate index in sorted_indices: " + std::to_string(idx);
+      }
+      return false;
+    }
+    seen[idx] = true;
+
+    if (i > 0) {
+      size_t prev_idx = sorted_indices_[i - 1];
+      int c = ucmp->CompareWithoutTimestamp(
+          raw_entries[prev_idx].user_start_key(), has_ts,
+          raw_entries[idx].user_start_key(), has_ts);
+      if (c > 0) {
+        if (out_error) {
+          *out_error = "Start key inversion at " + std::to_string(i);
+        }
+        return false;
+      }
+    }
+  }
+
+  // Invariant 2: Valid indices and end key prefix maximum monotonicity
+  for (size_t i = 0; i < n; ++i) {
+    size_t max_entry = prefix_max_end_index_[i];
+    if (max_entry >= n) {
+      if (out_error) {
+        *out_error = "prefix_max_end_index[" + std::to_string(i) + "] = " +
+                     std::to_string(max_entry) + " >= n";
+      }
+      return false;
+    }
+    if (i > 0) {
+      size_t prev_max = prefix_max_end_index_[i - 1];
+      int c = ucmp->CompareWithoutTimestamp(
+          raw_entries[max_entry].user_end_key(), has_ts,
+          raw_entries[prev_max].user_end_key(), has_ts);
+      if (c < 0) {
+        if (out_error) {
+          *out_error = "Prefix-max-end non-monotonicity at " + std::to_string(i);
+        }
+        return false;
+      }
+    }
+    // Also verify that raw_entries[max_entry].end >= all sorted_indices[0..i].end
+    size_t curr_entry = sorted_indices_[i];
+    int c = ucmp->CompareWithoutTimestamp(
+        raw_entries[max_entry].user_end_key(), has_ts,
+        raw_entries[curr_entry].user_end_key(), has_ts);
+    if (c < 0) {
+      if (out_error) {
+        *out_error = "prefix_max_end does not cover sorted entry at " + std::to_string(i);
+      }
+      return false;
+    }
+  }
+  return true;
 }
 
 bool FindMergePair(
@@ -524,20 +620,30 @@ bool AMTVState::IsMergeStable() const {
   return !HasMergeablePair(snap->sealed_runs);
 }
 
-void AMTVState::WaitForMergeStable() {
+bool AMTVState::WaitForMergeStable(uint64_t timeout_micros) {
   MutexLock l(&task_mu_);
+  uint64_t start_time = env_ ? env_->NowMicros() : 0;
   while (true) {
     if (task_state_ == MergeTaskState::kIdle) {
       if (is_invalidated_.load(std::memory_order_relaxed)) {
-        break;
+        return true;
       }
       auto snap = GetSnapshot();
       if (!snap || snap->fallback_required ||
           !HasMergeablePair(snap->sealed_runs)) {
-        break;
+        return true;
       }
     }
-    task_cond_.Wait();
+    if (timeout_micros > 0 && env_) {
+      uint64_t now = env_->NowMicros();
+      if (now - start_time >= timeout_micros) {
+        return false;
+      }
+      uint64_t wait_us = std::min<uint64_t>(100000, timeout_micros - (now - start_time));
+      task_cond_.TimedWait(now + wait_us);
+    } else {
+      task_cond_.Wait();
+    }
   }
 }
 

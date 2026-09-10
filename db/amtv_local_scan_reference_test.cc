@@ -4,6 +4,7 @@
 //  STRICTLY TEST-ONLY: DO NOT USE IN PRODUCTION SCAN READ PATH.
 
 #include <algorithm>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <random>
@@ -678,165 +679,66 @@ class AMTVIndependentPointwiseOracle {
 };
 
 // ==========================================================================
+// ScopedEnvBackgroundThreads
+// RAII guard for ensuring that background threads set on an Env are restored
+// on test exit or assertion failure.
+// ==========================================================================
+class ScopedEnvBackgroundThreads {
+ public:
+  ScopedEnvBackgroundThreads(Env* env, int num_threads, Env::Priority pri)
+      : env_(env ? env : Env::Default()),
+        pri_(pri),
+        orig_threads_(env_->GetBackgroundThreads(pri)) {
+    env_->SetBackgroundThreads(num_threads, pri_);
+  }
+  ~ScopedEnvBackgroundThreads() {
+    env_->SetBackgroundThreads(orig_threads_, pri_);
+  }
+  ScopedEnvBackgroundThreads(const ScopedEnvBackgroundThreads&) = delete;
+  ScopedEnvBackgroundThreads& operator=(const ScopedEnvBackgroundThreads&) = delete;
+
+ private:
+  Env* env_;
+  Env::Priority pri_;
+  int orig_threads_;
+};
+
+// ==========================================================================
 // AMTVRunIntervalIndex
-// M4-P1b-0: Test-only run-internal prefix-max-end interval index prototype.
-// Does NOT modify production AMTVRun layout.
-// Stores strictly size_t indices, zero string allocations or copies.
+// Test helper wrapping AMTVRunSidecarIndex for unit testing and backward compatibility.
 // ==========================================================================
 class AMTVRunIntervalIndex {
  public:
   AMTVRunIntervalIndex(const std::vector<OpenDeltaEntry>& raw_entries,
                        const InternalKeyComparator& icmp)
-      : raw_entries_(raw_entries), icmp_(icmp) {
-    BuildIndex();
-  }
+      : raw_entries_(raw_entries), icmp_(icmp), index_(raw_entries, icmp) {}
 
-  // Extracts candidate raw entries intersecting [L, U).
-  // Test prototype convention: nullptr or empty Slice represents an unbounded boundary.
-  // Records structural index boundaries [left, right) for structural auditing.
   void GetCandidates(const Slice* lower_bound, const Slice* upper_bound,
                      std::vector<OpenDeltaEntry>* out_candidates,
                      size_t* out_left = nullptr,
                      size_t* out_right = nullptr) const {
-    if (out_left) *out_left = 0;
-    if (out_right) *out_right = 0;
-    if (raw_entries_.empty()) {
-      return;
-    }
-
-    const auto* ucmp = icmp_.user_comparator();
-    const size_t ts_sz = ucmp->timestamp_size();
-    const bool has_ts = (ts_sz > 0);
-
-    // Test prototype convention: if both L and U are non-null and non-empty, and L >= U,
-    // the query interval [L, U) is empty.
-    if (lower_bound != nullptr && !lower_bound->empty() &&
-        upper_bound != nullptr && !upper_bound->empty()) {
-      if (ucmp->CompareWithoutTimestamp(*lower_bound, false, *upper_bound,
-                                        false) >= 0) {
-        return;
-      }
-    }
-
-    // Step 1: Binary search right bound on sorted_indices_
-    // Find first entry with start >= U. If no U, right = N.
-    size_t right = sorted_indices_.size();
-    if (upper_bound != nullptr && !upper_bound->empty()) {
-      auto it_right = std::lower_bound(
-          sorted_indices_.begin(), sorted_indices_.end(), *upper_bound,
-          [this, ucmp, has_ts](size_t idx, const Slice& u) {
-            return ucmp->CompareWithoutTimestamp(
-                       raw_entries_[idx].user_start_key(), has_ts, u, false) < 0;
-          });
-      right = static_cast<size_t>(std::distance(sorted_indices_.begin(), it_right));
-    }
-
-    // Step 2: Binary search left bound on prefix_max_end_index_
-    // Find first position where prefix_max_end > L. If no L, left = 0.
-    size_t left = 0;
-    if (lower_bound != nullptr && !lower_bound->empty()) {
-      auto it_left = std::lower_bound(
-          prefix_max_end_index_.begin(), prefix_max_end_index_.end(), *lower_bound,
-          [this, ucmp, has_ts](size_t entry_idx, const Slice& l) {
-            return ucmp->CompareWithoutTimestamp(
-                       raw_entries_[entry_idx].user_end_key(), has_ts, l, false) <= 0;
-          });
-      left = static_cast<size_t>(std::distance(prefix_max_end_index_.begin(), it_left));
-    }
-
-    if (left > right) {
-      left = right;
-    }
-
-    if (out_left) *out_left = left;
-    if (out_right) *out_right = right;
-
-    // Step 3: Exact filtering on [left, right)
-    for (size_t i = left; i < right; ++i) {
-      size_t entry_idx = sorted_indices_[i];
-      const auto& entry = raw_entries_[entry_idx];
-
-      bool match = true;
-      if (upper_bound != nullptr && !upper_bound->empty()) {
-        if (ucmp->CompareWithoutTimestamp(entry.user_start_key(), has_ts,
-                                           *upper_bound, false) >= 0) {
-          match = false;
-        }
-      }
-      if (lower_bound != nullptr && !lower_bound->empty()) {
-        if (ucmp->CompareWithoutTimestamp(entry.user_end_key(), has_ts,
-                                           *lower_bound, false) <= 0) {
-          match = false;
-        }
-      }
-      if (match) {
-        out_candidates->push_back(entry);
+    std::vector<size_t> indices;
+    AMTVRunIntervalIndexAuditInfo audit;
+    index_.CollectIntersectingIndices(raw_entries_, lower_bound, upper_bound,
+                                     icmp_, &indices, &audit);
+    if (out_left) *out_left = audit.left;
+    if (out_right) *out_right = audit.right;
+    if (out_candidates) {
+      for (size_t idx : indices) {
+        out_candidates->push_back(raw_entries_[idx]);
       }
     }
   }
 
   size_t size() const { return raw_entries_.size(); }
-  const std::vector<size_t>& sorted_indices() const { return sorted_indices_; }
-  const std::vector<size_t>& prefix_max_end_index() const { return prefix_max_end_index_; }
+  const std::vector<size_t>& sorted_indices() const { return index_.sorted_indices(); }
+  const std::vector<size_t>& prefix_max_end_index() const { return index_.prefix_max_end_index(); }
+  const AMTVRunSidecarIndex& sidecar_index() const { return index_; }
 
  private:
-  void BuildIndex() {
-    const size_t n = raw_entries_.size();
-    if (n == 0) return;
-
-    const auto* ucmp = icmp_.user_comparator();
-    const size_t ts_sz = ucmp->timestamp_size();
-    const bool has_ts = (ts_sz > 0);
-
-    // 1. Construct sorted directory of raw entry indices
-    sorted_indices_.resize(n);
-    for (size_t i = 0; i < n; ++i) {
-      sorted_indices_[i] = i;
-    }
-
-    // Fixed sorting rule:
-    // CompareWithoutTimestamp(start), tie-break with icmp_.Compare, then sequence descending
-    std::sort(sorted_indices_.begin(), sorted_indices_.end(),
-              [this, ucmp, has_ts](size_t i, size_t j) {
-                const auto& a = raw_entries_[i];
-                const auto& b = raw_entries_[j];
-                int c = ucmp->CompareWithoutTimestamp(a.user_start_key(), has_ts,
-                                                      b.user_start_key(), has_ts);
-                if (c != 0) {
-                  return c < 0;
-                }
-                int ic = icmp_.Compare(a.ikey.Encode(), b.ikey.Encode());
-                if (ic != 0) {
-                  return ic < 0;
-                }
-                if (a.sequence() != b.sequence()) {
-                  return a.sequence() > b.sequence();
-                }
-                return ucmp->CompareWithoutTimestamp(a.user_end_key(), has_ts,
-                                                     b.user_end_key(), has_ts) < 0;
-              });
-
-    // 2. Construct Prefix-Max-End array: points to raw entry index in [0, i] with max end key
-    prefix_max_end_index_.resize(n);
-    prefix_max_end_index_[0] = sorted_indices_[0];
-    for (size_t i = 1; i < n; ++i) {
-      size_t curr_entry = sorted_indices_[i];
-      size_t prev_max_entry = prefix_max_end_index_[i - 1];
-      int c = ucmp->CompareWithoutTimestamp(
-          raw_entries_[curr_entry].user_end_key(), has_ts,
-          raw_entries_[prev_max_entry].user_end_key(), has_ts);
-      if (c > 0) {
-        prefix_max_end_index_[i] = curr_entry;
-      } else {
-        prefix_max_end_index_[i] = prev_max_entry;
-      }
-    }
-  }
-
   const std::vector<OpenDeltaEntry>& raw_entries_;
   const InternalKeyComparator& icmp_;
-  std::vector<size_t> sorted_indices_;
-  std::vector<size_t> prefix_max_end_index_;
+  AMTVRunSidecarIndex index_;
 };
 
 // ==========================================================================
@@ -1651,7 +1553,7 @@ TEST_F(AMTVLocalScanReferenceTest, ThreeWayIndependentOracleEquivalence) {
 // 13. Real AMTVSnapshot Input and Background Merge Stability
 // --------------------------------------------------------------------------
 TEST_F(AMTVLocalScanReferenceTest, RealAMTVSnapshotInputAndMergeStability) {
-  Env::Default()->SetBackgroundThreads(1, Env::Priority::LOW);
+  ScopedEnvBackgroundThreads scoped_bg(Env::Default(), 1, Env::Priority::LOW);
 
   // Construct real AMTVState
   auto amtv_state = std::make_shared<AMTVState>(
@@ -1676,7 +1578,7 @@ TEST_F(AMTVLocalScanReferenceTest, RealAMTVSnapshotInputAndMergeStability) {
   amtv_state->AddTombstone("k15", "k55", 140, bytewise_icmp_);
   amtv_state->AddTombstone("k35", "k75", 160, bytewise_icmp_);
   // Wait for background merge of Run 0 and Run 1 to complete
-  amtv_state->WaitForMergeStable();
+  ASSERT_TRUE(amtv_state->WaitForMergeStable(10000000));
   EXPECT_GE(amtv_state->merge_completed(), 1U);
 
   // Add new tombstone into post-merge Open Delta
@@ -1758,7 +1660,6 @@ TEST_F(AMTVLocalScanReferenceTest, RealAMTVSnapshotInputAndMergeStability) {
   Verify3WayPointwise(new_view, new_truth, new_oracle, &L, &U, probe_keys, probe_seqs, BytewiseComparator());
 
   amtv_state->CancelAndDrain();
-  Env::Default()->SetBackgroundThreads(0, Env::Priority::LOW);
 }
 
 // --------------------------------------------------------------------------
@@ -2334,7 +2235,7 @@ TEST_F(AMTVLocalScanReferenceTest, P1b_RandomizedDifferential10000Trials) {
 // 7. Structural audit: N, index bytes, left, right, span, candidate count
 // --------------------------------------------------------------------------
 TEST_F(AMTVLocalScanReferenceTest, P1b1_RealAMTVSnapshot_SidecarIndexAndMergeLifecycle) {
-  Env::Default()->SetBackgroundThreads(1, Env::Priority::LOW);
+  ScopedEnvBackgroundThreads scoped_bg(Env::Default(), 1, Env::Priority::LOW);
 
   // Construct real AMTVState with small delta_limit=4, merge_soft_limit=2
   auto amtv_state = std::make_shared<AMTVState>(
@@ -2365,13 +2266,13 @@ TEST_F(AMTVLocalScanReferenceTest, P1b1_RealAMTVSnapshot_SidecarIndexAndMergeLif
   ASSERT_NE(old_run1, nullptr);
 
   // Record raw memory addresses of old run indices
-  const void* old_run0_index_ptr = old_run0->sorted_indices.data();
-  const void* old_run1_index_ptr = old_run1->sorted_indices.data();
+  const void* old_run0_index_ptr = old_run0->sidecar_index().sorted_indices().data();
+  const void* old_run1_index_ptr = old_run1->sidecar_index().sorted_indices().data();
   EXPECT_NE(old_run0_index_ptr, nullptr);
   EXPECT_NE(old_run1_index_ptr, nullptr);
 
   // Wait for background binary merge of Run 0 and Run 1 to complete into Run 2
-  amtv_state->WaitForMergeStable();
+  ASSERT_TRUE(amtv_state->WaitForMergeStable(10000000));
   EXPECT_GE(amtv_state->merge_completed(), 1U);
 
   // Epoch 2: Add tombstones into post-merge Open Delta
@@ -2386,13 +2287,13 @@ TEST_F(AMTVLocalScanReferenceTest, P1b1_RealAMTVSnapshot_SidecarIndexAndMergeLif
 
   const auto& new_run2 = new_snapshot->sealed_runs[0];
   ASSERT_NE(new_run2, nullptr);
-  const void* new_run2_index_ptr = new_run2->sorted_indices.data();
+  const void* new_run2_index_ptr = new_run2->sidecar_index().sorted_indices().data();
 
   // Verification 1: Memory Address Independence (Zero mutation of old snapshot runs)
   EXPECT_NE(old_run0_index_ptr, new_run2_index_ptr);
   EXPECT_NE(old_run1_index_ptr, new_run2_index_ptr);
-  EXPECT_EQ(old_snapshot->sealed_runs[0]->sorted_indices.data(), old_run0_index_ptr);
-  EXPECT_EQ(old_snapshot->sealed_runs[1]->sorted_indices.data(), old_run1_index_ptr);
+  EXPECT_EQ(old_snapshot->sealed_runs[0]->sidecar_index().sorted_indices().data(), old_run0_index_ptr);
+  EXPECT_EQ(old_snapshot->sealed_runs[1]->sidecar_index().sorted_indices().data(), old_run1_index_ptr);
 
   // Test across multiple distinct query windows:
   // 1. Standard window: [k20, k75)
@@ -2471,28 +2372,315 @@ TEST_F(AMTVLocalScanReferenceTest, P1b1_RealAMTVSnapshot_SidecarIndexAndMergeLif
     AMTVIndependentPointwiseOracle new_oracle(new_runs_raw, new_snapshot->open_delta->entries(), BytewiseComparator(), 200);
     Verify3WayPointwise(new_view, new_truth, new_oracle, pL, pU, probe_keys, probe_seqs, BytewiseComparator());
 
-    // Log structural audit for window
+    // Log structural audit for window: distinguish snapshot total candidates from per-run candidates
+    size_t delta_cands = sidecar_cands_new.size() - new_audits[0].candidate_count;
     std::cout << "Window: " << w_name << "\n"
-              << "  Old Snapshot (Runs=2, Level=0): Σspan=" << old_total_span
-              << ", Cands=" << sidecar_cands_old.size()
+              << "  Old Snapshot (Runs=2, Level=0): TotalCands=" << sidecar_cands_old.size()
               << " [Run0: N=" << old_audits[0].raw_entries_count
+              << ", Cands=" << old_audits[0].candidate_count
               << ", bytes=" << old_audits[0].index_bytes
               << ", [" << old_audits[0].left << "," << old_audits[0].right << ")"
               << ", span=" << old_audits[0].span
               << "; Run1: N=" << old_audits[1].raw_entries_count
+              << ", Cands=" << old_audits[1].candidate_count
               << ", bytes=" << old_audits[1].index_bytes
               << ", [" << old_audits[1].left << "," << old_audits[1].right << ")"
               << ", span=" << old_audits[1].span << "]\n"
-              << "  New Snapshot (Run=1, Level=1, chunks=2): Σspan=" << new_total_span
-              << ", Cands=" << sidecar_cands_new.size()
+              << "  New Snapshot (Run=1, Level=1, chunks=2): TotalCands=" << sidecar_cands_new.size()
               << " [Run2: N=" << new_audits[0].raw_entries_count
+              << ", Cands=" << new_audits[0].candidate_count
               << ", bytes=" << new_audits[0].index_bytes
               << ", [" << new_audits[0].left << "," << new_audits[0].right << ")"
-              << ", span=" << new_audits[0].span << "]\n";
+              << ", span=" << new_audits[0].span
+              << "; Delta: N=" << new_snapshot->open_delta->size()
+              << ", Cands=" << delta_cands << "]\n";
   }
 
   amtv_state->CancelAndDrain();
-  Env::Default()->SetBackgroundThreads(0, Env::Priority::LOW);
+}
+
+// --------------------------------------------------------------------------
+// 23. M4-P1b-1.1: Container Reuse & Overwrite Semantics Test
+// --------------------------------------------------------------------------
+TEST_F(AMTVLocalScanReferenceTest, CollectIntersectingRawEntryIndices_ContainerReuse) {
+  std::vector<OpenDeltaEntry> entries;
+  entries.emplace_back("k10", "k30", 10);
+  entries.emplace_back("k20", "k40", 20);
+  entries.emplace_back("k30", "k50", 30);
+  entries.emplace_back("k40", "k60", 40);
+  AMTVRun run(1, std::move(entries), bytewise_icmp_);
+
+  std::string L = "k25", U = "k45";
+  Slice L_slice(L), U_slice(U);
+
+  // Pre-fill indices container with dirty dummy values
+  std::vector<size_t> indices = {999, 888, 777, 666, 555};
+  AMTVRunIntervalIndexAuditInfo audit;
+
+  // Query [k25, k45)
+  run.CollectIntersectingRawEntryIndices(&L_slice, &U_slice, bytewise_icmp_, &indices, &audit);
+
+  // Overwrite contract verification
+  EXPECT_LE(indices.size(), run.raw_entries.size());
+  EXPECT_EQ(indices.size(), audit.candidate_count);
+  EXPECT_EQ(audit.candidate_count, 4U);
+
+  for (size_t idx : indices) {
+    EXPECT_LT(idx, run.raw_entries.size());
+    EXPECT_NE(idx, 999U);
+    EXPECT_NE(idx, 888U);
+  }
+
+  // Second call with empty window [k50, k20) reusing the same dirty container:
+  // must clear and output 0
+  std::string L_inv = "k50", U_inv = "k20";
+  Slice L_inv_s(L_inv), U_inv_s(U_inv);
+  run.CollectIntersectingRawEntryIndices(&L_inv_s, &U_inv_s, bytewise_icmp_, &indices, &audit);
+  EXPECT_TRUE(indices.empty());
+  EXPECT_EQ(audit.candidate_count, 0U);
+}
+
+// --------------------------------------------------------------------------
+// 24. M4-P1b-1.1: Sidecar Index Mathematical Invariants Test
+// --------------------------------------------------------------------------
+TEST_F(AMTVLocalScanReferenceTest, AMTVRun_SidecarIndexInvariants) {
+  // Case 1: Empty run
+  std::vector<OpenDeltaEntry> empty_entries;
+  AMTVRun empty_run(1, empty_entries, bytewise_icmp_);
+  std::string err;
+  EXPECT_TRUE(empty_run.sidecar_index().VerifyInvariants(empty_run.raw_entries, bytewise_icmp_, &err)) << err;
+  EXPECT_EQ(empty_run.index_bytes(), 0U);
+
+  // Case 2: Single tombstone run
+  std::vector<OpenDeltaEntry> single_entries = {OpenDeltaEntry("k10", "k20", 100)};
+  AMTVRun single_run(2, single_entries, bytewise_icmp_);
+  EXPECT_TRUE(single_run.sidecar_index().VerifyInvariants(single_run.raw_entries, bytewise_icmp_, &err)) << err;
+  EXPECT_EQ(single_run.index_bytes(), 16U); // 2 * 1 * sizeof(size_t) = 16 bytes
+
+  // Case 3: Multiple tombstones with complex interleaving
+  std::vector<OpenDeltaEntry> entries = {
+      OpenDeltaEntry("k50", "k60", 50),
+      OpenDeltaEntry("k10", "k90", 10), // super-long
+      OpenDeltaEntry("k20", "k30", 20),
+      OpenDeltaEntry("k30", "k40", 30),
+      OpenDeltaEntry("k10", "k20", 15), // same start as k10..k90, different end & seq
+      OpenDeltaEntry("k70", "k80", 70),
+  };
+  AMTVRun run(3, entries, bytewise_icmp_);
+  EXPECT_TRUE(run.sidecar_index().VerifyInvariants(run.raw_entries, bytewise_icmp_, &err)) << err;
+  EXPECT_EQ(run.index_bytes(), entries.size() * 16U);
+
+  const auto& sorted = run.sidecar_index().sorted_indices();
+  const auto& pmax = run.sidecar_index().prefix_max_end_index();
+  ASSERT_EQ(sorted.size(), entries.size());
+  ASSERT_EQ(pmax.size(), entries.size());
+
+  // Monotonicity of sorted_indices
+  for (size_t i = 1; i < sorted.size(); ++i) {
+    int c = BytewiseComparator()->Compare(
+        run.raw_entries[sorted[i - 1]].user_start_key(),
+        run.raw_entries[sorted[i]].user_start_key());
+    EXPECT_LE(c, 0);
+  }
+
+  // Monotonicity of prefix_max_end_index
+  for (size_t i = 1; i < pmax.size(); ++i) {
+    int c = BytewiseComparator()->Compare(
+        run.raw_entries[pmax[i - 1]].user_end_key(),
+        run.raw_entries[pmax[i]].user_end_key());
+    EXPECT_LE(c, 0);
+  }
+
+  // Index validity
+  for (size_t i = 0; i < sorted.size(); ++i) {
+    EXPECT_LT(sorted[i], entries.size());
+    EXPECT_LT(pmax[i], entries.size());
+  }
+}
+
+// --------------------------------------------------------------------------
+// 25. M4-P1b-1.1: Large Run Lifecycle Test (B=8 -> L1(16), L2(32), L3(64))
+// --------------------------------------------------------------------------
+TEST_F(AMTVLocalScanReferenceTest, AMTVRun_LargeRunLifecycle_L1_L2_L3) {
+  auto PadNumber = [](int n, int width) -> std::string {
+    std::ostringstream ss;
+    ss << std::setw(width) << std::setfill('0') << n;
+    return ss.str();
+  };
+
+  auto MergeTwoRuns = [&](const std::shared_ptr<const AMTVRun>& r1,
+                          const std::shared_ptr<const AMTVRun>& r2,
+                          uint64_t run_id) -> std::shared_ptr<const AMTVRun> {
+    std::vector<OpenDeltaEntry> merged_entries;
+    merged_entries.reserve(r1->raw_entries.size() + r2->raw_entries.size());
+    merged_entries.insert(merged_entries.end(), r1->raw_entries.begin(), r1->raw_entries.end());
+    merged_entries.insert(merged_entries.end(), r2->raw_entries.begin(), r2->raw_entries.end());
+    return std::make_shared<const AMTVRun>(
+        run_id, r1->level + 1, r1->source_chunk_count + r2->source_chunk_count,
+        /*is_partial=*/false, std::move(merged_entries), bytewise_icmp_);
+  };
+
+  // Step 1: Construct 8 Level 0 runs (8 entries each)
+  std::vector<std::shared_ptr<const AMTVRun>> l0_runs;
+  for (int r = 0; r < 8; ++r) {
+    std::vector<OpenDeltaEntry> l0_entries;
+    for (int j = 0; j < 8; ++j) {
+      int idx = r * 8 + j;
+      std::string start = "k" + PadNumber(idx * 10, 4);
+      std::string end = "k" + PadNumber((idx * 10) + 15, 4);
+      l0_entries.emplace_back(start, end, (idx + 1) * 10);
+    }
+    l0_runs.push_back(std::make_shared<const AMTVRun>(
+        r + 1, /*level=*/0, /*chunk_count=*/1, /*is_partial=*/false,
+        std::move(l0_entries), bytewise_icmp_));
+  }
+
+  // Step 2: Merge pairs of Level 0 runs into 4 Level 1 runs (16 entries each)
+  std::vector<std::shared_ptr<const AMTVRun>> l1_runs;
+  for (int i = 0; i < 4; ++i) {
+    l1_runs.push_back(MergeTwoRuns(l0_runs[2 * i], l0_runs[2 * i + 1], 10 + i));
+    EXPECT_EQ(l1_runs.back()->level, 1U);
+    EXPECT_EQ(l1_runs.back()->raw_entries.size(), 16U);
+  }
+
+  // Step 3: Merge pairs of Level 1 runs into 2 Level 2 runs (32 entries each)
+  std::vector<std::shared_ptr<const AMTVRun>> l2_runs;
+  for (int i = 0; i < 2; ++i) {
+    l2_runs.push_back(MergeTwoRuns(l1_runs[2 * i], l1_runs[2 * i + 1], 20 + i));
+    EXPECT_EQ(l2_runs.back()->level, 2U);
+    EXPECT_EQ(l2_runs.back()->raw_entries.size(), 32U);
+  }
+
+  // --- Point 1 & Point 2: Snapshot Before L3 Merge (holds the 2 Level 2 runs, 32 entries each) ---
+  auto snap_before_l3 = std::make_shared<AMTVSnapshot>();
+  snap_before_l3->sealed_runs = l2_runs;
+  snap_before_l3->open_delta = std::make_shared<OpenDelta>();
+
+  ASSERT_EQ(snap_before_l3->sealed_run_count(), 2U);
+  EXPECT_EQ(snap_before_l3->sealed_runs[0]->level, 2U);
+  EXPECT_EQ(snap_before_l3->sealed_runs[0]->raw_entries.size(), 32U);
+  EXPECT_EQ(snap_before_l3->sealed_runs[1]->level, 2U);
+  EXPECT_EQ(snap_before_l3->sealed_runs[1]->raw_entries.size(), 32U);
+  EXPECT_EQ(snap_before_l3->open_delta->size(), 0U);
+
+  // Validate sidecar invariants on both 32-tombstone Level 2 runs
+  std::string err;
+  EXPECT_TRUE(snap_before_l3->sealed_runs[0]->sidecar_index().VerifyInvariants(
+      snap_before_l3->sealed_runs[0]->raw_entries, bytewise_icmp_, &err)) << err;
+  EXPECT_TRUE(snap_before_l3->sealed_runs[1]->sidecar_index().VerifyInvariants(
+      snap_before_l3->sealed_runs[1]->raw_entries, bytewise_icmp_, &err)) << err;
+
+  // Step 4: Merge the two Level 2 runs into 1 Level 3 run (64 entries)
+  auto run_l3 = MergeTwoRuns(l2_runs[0], l2_runs[1], 30);
+  EXPECT_EQ(run_l3->level, 3U);
+  EXPECT_EQ(run_l3->raw_entries.size(), 64U);
+
+  // --- Point 3: Snapshot After L3 Merge (holds the 1 Level 3 run + Open Delta with 2 tombstones) ---
+  auto new_delta = std::make_shared<OpenDelta>();
+  new_delta->AddEntry("k0100", "k0500", 700);
+  new_delta->AddEntry("k0250", "k0650", 750);
+
+  auto snap_after_l3 = std::make_shared<AMTVSnapshot>();
+  snap_after_l3->sealed_runs = {run_l3};
+  snap_after_l3->open_delta = new_delta;
+
+  ASSERT_EQ(snap_after_l3->sealed_run_count(), 1U);
+  EXPECT_EQ(snap_after_l3->sealed_runs[0]->level, 3U);
+  EXPECT_EQ(snap_after_l3->sealed_runs[0]->raw_entries.size(), 64U);
+  EXPECT_EQ(snap_after_l3->open_delta->size(), 2U);
+
+  // Validate sidecar invariants on 64-tombstone Level 3 run
+  EXPECT_TRUE(snap_after_l3->sealed_runs[0]->sidecar_index().VerifyInvariants(
+      snap_after_l3->sealed_runs[0]->raw_entries, bytewise_icmp_, &err)) << err;
+
+  // Query across diverse windows
+  struct LargeWindowCase {
+    const char* l_str;
+    const char* u_str;
+  };
+  std::vector<LargeWindowCase> test_windows = {
+      {"k0100", "k0400"}, // Dense overlap in lower half
+      {"k0300", "k0600"}, // Straddling mid-range
+      {"k0550", "k0650"}, // Near upper boundary
+      {"k0900", "k0950"}, // Completely disjoint
+      {nullptr, nullptr},  // Unbounded
+  };
+
+  std::vector<std::string> probe_keys = {"k0000", "k0100", "k0200", "k0300", "k0400", "k0500", "k0600", "k0700"};
+  std::vector<SequenceNumber> probe_seqs = {50, 150, 350, 600, 720, 800};
+
+  for (const auto& w : test_windows) {
+    Slice L_slice, U_slice;
+    const Slice* pL = nullptr;
+    const Slice* pU = nullptr;
+    if (w.l_str) {
+      L_slice = Slice(w.l_str);
+      pL = &L_slice;
+    }
+    if (w.u_str) {
+      U_slice = Slice(w.u_str);
+      pU = &U_slice;
+    }
+
+    // 1. Verify Before Snapshot (two 32-entry Level 2 runs)
+    for (size_t r = 0; r < snap_before_l3->sealed_runs.size(); ++r) {
+      const auto& run = snap_before_l3->sealed_runs[r];
+      std::vector<size_t> indices;
+      AMTVRunIntervalIndexAuditInfo audit;
+      run->CollectIntersectingRawEntryIndices(pL, pU, bytewise_icmp_, &indices, &audit);
+
+      EXPECT_LE(audit.candidate_count, run->raw_entries.size());
+      EXPECT_EQ(indices.size(), audit.candidate_count);
+      EXPECT_EQ(audit.span, audit.right - audit.left);
+      EXPECT_EQ(audit.index_bytes, run->raw_entries.size() * 16U);
+
+      // Verify each candidate matches linear check on that run
+      std::vector<OpenDeltaEntry> run_linear;
+      for (const auto& e : run->raw_entries) {
+        if (AMTVLocalScanReferenceView::IsIntersecting(e, pL, pU, BytewiseComparator())) {
+          run_linear.push_back(e);
+        }
+      }
+      EXPECT_EQ(indices.size(), run_linear.size());
+    }
+
+    // 2. Verify After Snapshot (one 64-entry Level 3 run + Open Delta)
+    const auto& target_run_l3 = snap_after_l3->sealed_runs[0];
+    std::vector<size_t> l3_indices;
+    AMTVRunIntervalIndexAuditInfo l3_audit;
+    target_run_l3->CollectIntersectingRawEntryIndices(pL, pU, bytewise_icmp_, &l3_indices, &l3_audit);
+
+    EXPECT_LE(l3_audit.candidate_count, 64U);
+    EXPECT_EQ(l3_indices.size(), l3_audit.candidate_count);
+    EXPECT_EQ(l3_audit.span, l3_audit.right - l3_audit.left);
+    EXPECT_EQ(l3_audit.index_bytes, 64U * 16U); // 1,024 bytes
+
+    // Check linear equivalence for Level 3 run
+    std::vector<OpenDeltaEntry> l3_linear;
+    for (const auto& e : target_run_l3->raw_entries) {
+      if (AMTVLocalScanReferenceView::IsIntersecting(e, pL, pU, BytewiseComparator())) {
+        l3_linear.push_back(e);
+      }
+    }
+    EXPECT_EQ(l3_indices.size(), l3_linear.size());
+
+    // 3. Independent Pointwise Oracle verification on both snapshots
+    AMTVCanonicalFullTruth truth_before(
+        {snap_before_l3->sealed_runs[0]->raw_entries, snap_before_l3->sealed_runs[1]->raw_entries},
+        snap_before_l3->open_delta->entries(), bytewise_icmp_, 1000);
+    AMTVIndependentPointwiseOracle oracle_before(
+        {snap_before_l3->sealed_runs[0]->raw_entries, snap_before_l3->sealed_runs[1]->raw_entries},
+        snap_before_l3->open_delta->entries(), BytewiseComparator(), 1000);
+    AMTVLocalScanReferenceView view_before(*snap_before_l3, pL, pU, bytewise_icmp_, 1000);
+    Verify3WayPointwise(view_before, truth_before, oracle_before, pL, pU, probe_keys, probe_seqs, BytewiseComparator());
+
+    AMTVCanonicalFullTruth truth_after(
+        {run_l3->raw_entries}, snap_after_l3->open_delta->entries(), bytewise_icmp_, 1000);
+    AMTVIndependentPointwiseOracle oracle_after(
+        {run_l3->raw_entries}, snap_after_l3->open_delta->entries(), BytewiseComparator(), 1000);
+    AMTVLocalScanReferenceView view_after(*snap_after_l3, pL, pU, bytewise_icmp_, 1000);
+    Verify3WayPointwise(view_after, truth_after, oracle_after, pL, pU, probe_keys, probe_seqs, BytewiseComparator());
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE
