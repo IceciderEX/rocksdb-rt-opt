@@ -310,8 +310,10 @@ DBImpl::NewInternalIterator (db/db_impl.cc:2573-2624)
    - 当逻辑 start key 相同时，使用完整 InternalKey 及既定 sequence 规则（更大 sequence 优先，再按原始下标稳定破平）构成严格复合排序；
    - `prefix_max_end_index` 严格单调非递减，且对任意前缀 $0 \le j \le i$，均有 $\text{end}(prefix\_max\_end\_index[i]) \ge \text{end}(sorted\_indices[j])$。
 5. **并发生命周期表述**：
-   - 双快照并存及后台 binary merge 过程中的数据竞争与对象有效性：在覆盖的生命周期测试中未观察到死锁或 UAF。
-6. **候选集上限硬断言**：
-   - 对任意窗口 $[L, U)$，每个单 Run 查询的候选集大小均严格满足 `candidate_count <= raw_entries.size()`。
+6. **单 Run 候选集大小上限与 Debug 开发断言口径**：
+   - 对任意窗口 $[L, U)$，每个单 Run 查询的候选集大小均严格满足 `candidate_count <= raw_entries.size()`；
+   - 代码中的 `assert(out_indices... <= raw_entries.size())` 统一表述为“Debug 开发断言”（在 Release 模式下由 `-DNDEBUG` 消除）；
+   - Release 下由单元测试全拓扑覆盖与 Prefix-Max-End 算法不变量提供正确性证据，不得称为运行时硬保护或数学硬断言；
+   - 如需真正 Release fail-fast，需引入额外运行时分支与异常/状态检查（带来额外运行时成本），本阶段默认不引入该成本。
 
 

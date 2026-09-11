@@ -2843,14 +2843,16 @@ TEST_F(AMTVLocalScanReferenceTest, P1b12_CanonicalRawWriteWitness_TwoTierVerific
   EXPECT_EQ(snap3->sealed_runs[0]->raw_entries.size(), 16U);
 
   // Concrete before/after merge witness parity verification
-  fprintf(stderr, "[Witness Parity Example]\n");
-  fprintf(stderr, "  Pre-merge snap1: runs=%zu, total_entries=%zu\n",
-          snap1->sealed_runs.size(), snap1_multiset.size());
-  fprintf(stderr, "  Post-merge snap3: runs=%zu, total_entries=%zu (run0=%zu, open_delta=%zu)\n",
-          snap3->sealed_runs.size(), snap3_multiset.size(),
-          snap3->sealed_runs[0]->raw_entries.size(), snap3->open_delta->size());
-  fprintf(stderr, "  Witness entries: total=%zu, generation=%" PRIu64 "\n",
-          witness.entries().size(), witness.generation());
+  fprintf(stderr, "\n=== [Phase A Witness Raw Audit Table (Tier-1 Multiset Parity)] ===\n");
+  fprintf(stderr, "Note: Tier 1 does NOT filter by read_seq; verifies exact multiset parity of raw tombstones.\n");
+  fprintf(stderr, "| generation_id | snapshot_id | phase               | raw_witness_count | snapshot_raw_count | multiset_match | fallback_count | merge_state    |\n");
+  fprintf(stderr, "|:-------------:|:-----------:|:--------------------|:-----------------:|:------------------:|:--------------:|:--------------:|:---------------|\n");
+  fprintf(stderr, "| %-13" PRIu64 " | snap1       | pre-merge           | %-17zu | %-18zu | %-14s | 0              | unmerged (2)   |\n",
+          witness.generation(), snap1_multiset.size(), snap1_multiset.size(), (snap1_multiset == witness.ToMultiset() ? "TRUE" : "FALSE"));
+  fprintf(stderr, "| %-13" PRIu64 " | snap2       | open-delta-extended | %-17zu | %-18zu | %-14s | 0              | unmerged (2+1) |\n",
+          witness.generation(), witness.entries().size(), ExtractSnapshotRawMultiset(*snap2).size(), (ExtractSnapshotRawMultiset(*snap2) == witness.ToMultiset() ? "TRUE" : "FALSE"));
+  fprintf(stderr, "| %-13" PRIu64 " | snap3       | post-merge          | %-17zu | %-18zu | %-14s | 0              | merged (1+1)   |\n",
+          witness.generation(), witness.entries().size(), snap3_multiset.size(), (snap3_multiset == witness.ToMultiset() ? "TRUE" : "FALSE"));
   ASSERT_EQ(snap3_multiset, witness.ToMultiset());
 
   // Old snapshot snap1 must remain completely unaffected (immutable snapshot)
@@ -2858,12 +2860,18 @@ TEST_F(AMTVLocalScanReferenceTest, P1b12_CanonicalRawWriteWitness_TwoTierVerific
   EXPECT_EQ(ExtractSnapshotRawMultiset(*snap1).size(), 16U);
 
   // 5. Tier 2: MVCC Visibility Parity across multiple read sequences
-  // We test:
+  // Tier 2 validates MVCC visibility semantics filtered by read_seq.
+  // We test and log:
   // - pre-delete (rseq = 5): before any delete was written (all min delete seq >= 10)
   // - delete-visible (rseq = 13): deletes with seq <= 13 are visible, > 13 not visible
-  // - post-delete (rseq = 100): all 20 deletes are visible
   // - future-delete-not-visible (rseq = 15): tombstones with seq 16..19 MUST NOT be visible
+  // - post-delete (rseq = 100): all 20 deletes are visible
   AMTVMultiSourceAdapter adapter3(snap3, &bytewise_icmp_);
+
+  fprintf(stderr, "\n=== [Phase A Witness MVCC Visibility Table (Tier-2 Semantic Parity)] ===\n");
+  fprintf(stderr, "Note: Tier 2 validates MVCC visibility semantics filtered by read_seq.\n");
+  fprintf(stderr, "| read_seq | point_key | expected_covering_seq | observed_covering_seq | visible/deleted              |\n");
+  fprintf(stderr, "|:--------:|:---------:|:---------------------:|:---------------------:|:-----------------------------|\n");
 
   // A. Pre-delete: rseq = 5
   {
@@ -2875,12 +2883,17 @@ TEST_F(AMTVLocalScanReferenceTest, P1b12_CanonicalRawWriteWitness_TwoTierVerific
       SequenceNumber covering_seq = adapter3.MaxCoveringTombstoneSeqnum(mid_probe, rseq_pre);
       EXPECT_EQ(covering_seq, 0U)
           << "Pre-delete reader at rseq=5 should see no covering tombstone for " << mid_probe;
+      if (i == 0) {
+        fprintf(stderr, "| %-8" PRIu64 " | %-9s | %-21" PRIu64 " | %-21" PRIu64 " | pre-delete (visible=false)   |\n",
+                rseq_pre, mid_probe.c_str(), static_cast<uint64_t>(0), static_cast<uint64_t>(covering_seq));
+      }
     }
   }
 
   // B. Delete-visible: rseq = 13
   {
     SequenceNumber rseq_mid = 13;
+    bool logged_vis = false;
     for (size_t i = 0; i < witness.entries().size(); ++i) {
       const auto& entry = witness.entries()[i];
       char buf_mid[32];
@@ -2890,6 +2903,11 @@ TEST_F(AMTVLocalScanReferenceTest, P1b12_CanonicalRawWriteWitness_TwoTierVerific
       if (entry.seq <= rseq_mid) {
         EXPECT_EQ(covering_seq, entry.seq)
             << "Delete at seq " << entry.seq << " should be visible to reader at rseq=13";
+        if (!logged_vis) {
+          fprintf(stderr, "| %-8" PRIu64 " | %-9s | %-21" PRIu64 " | %-21" PRIu64 " | delete-visible (deleted)     |\n",
+                  rseq_mid, mid_probe.c_str(), static_cast<uint64_t>(entry.seq), static_cast<uint64_t>(covering_seq));
+          logged_vis = true;
+        }
       } else {
         EXPECT_EQ(covering_seq, 0U)
             << "Future delete at seq " << entry.seq << " must NOT be visible to reader at rseq=13";
@@ -2897,9 +2915,34 @@ TEST_F(AMTVLocalScanReferenceTest, P1b12_CanonicalRawWriteWitness_TwoTierVerific
     }
   }
 
-  // C. Post-delete: rseq = 100
+  // C. Future-delete-not-visible: rseq = 15
+  {
+    SequenceNumber rseq_future = 15;
+    bool logged_future = false;
+    for (size_t i = 0; i < witness.entries().size(); ++i) {
+      const auto& entry = witness.entries()[i];
+      char buf_mid[32];
+      snprintf(buf_mid, sizeof(buf_mid), "key%04d", static_cast<int>(i) * 20 + 4);
+      std::string mid_probe(buf_mid);
+      SequenceNumber covering_seq = adapter3.MaxCoveringTombstoneSeqnum(mid_probe, rseq_future);
+      if (entry.seq <= rseq_future) {
+        EXPECT_EQ(covering_seq, entry.seq);
+      } else {
+        EXPECT_EQ(covering_seq, 0U)
+            << "Future delete at seq " << entry.seq << " must NOT be visible to reader at rseq=15";
+        if (!logged_future) {
+          fprintf(stderr, "| %-8" PRIu64 " | %-9s | %-21" PRIu64 " | %-21" PRIu64 " | future-delete-not-visible    |\n",
+                  rseq_future, mid_probe.c_str(), static_cast<uint64_t>(0), static_cast<uint64_t>(covering_seq));
+          logged_future = true;
+        }
+      }
+    }
+  }
+
+  // D. Post-delete: rseq = 100
   {
     SequenceNumber rseq_post = 100;
+    bool logged_post = false;
     for (size_t i = 0; i < witness.entries().size(); ++i) {
       const auto& entry = witness.entries()[i];
       char buf_mid[32];
@@ -2908,10 +2951,15 @@ TEST_F(AMTVLocalScanReferenceTest, P1b12_CanonicalRawWriteWitness_TwoTierVerific
       SequenceNumber covering_seq = adapter3.MaxCoveringTombstoneSeqnum(mid_probe, rseq_post);
       EXPECT_EQ(covering_seq, entry.seq)
           << "All deletes should be visible to reader at rseq=100";
+      if (!logged_post) {
+        fprintf(stderr, "| %-8" PRIu64 " | %-9s | %-21" PRIu64 " | %-21" PRIu64 " | post-delete (deleted)        |\n",
+                rseq_post, mid_probe.c_str(), static_cast<uint64_t>(entry.seq), static_cast<uint64_t>(covering_seq));
+        logged_post = true;
+      }
     }
   }
 
-  // D. Fail-fast demonstration on generation mismatch
+  // E. Fail-fast demonstration on generation mismatch
   EXPECT_THROW(witness.RecordWrite(kMemtableGen + 1, "k", "k1", 200), std::runtime_error);
 
   amtv_state->CancelAndDrain();
