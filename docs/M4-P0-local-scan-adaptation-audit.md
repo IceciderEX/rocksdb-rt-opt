@@ -294,14 +294,24 @@ DBImpl::NewInternalIterator (db/db_impl.cc:2573-2624)
 
 ---
 
-## 6. M4-P1b-0 Run 内 Prefix-Max-End 区间索引语义原型结论
+## 6. M4-P1b-1.2 Run 内 Prefix-Max-End 区间索引与证据闭环结论
 
 ### 6.1 核心结论与范围声明
-1. **测试专用边界声明**：M4-P1b-0 仅证明**“Run 内 Prefix-Max-End 区间索引筛选出的候选原始条目集合与全量线性安全遍历候选集合 100% 等价”**。
-2. **非端到端宣称**：P1b-0 **尚未证明**端到端 Scan 加速，亦**尚未允许**将索引或裁剪流接入真实 DB Scan/MergingIterator 生产路径；严禁将索引字段写入 `AMTVRun` 正式生产结构。
-3. **数据结构与复杂度**：
+1. **测试专用边界声明**：M4-P1b 仅证明**“Run 内 Prefix-Max-End 区间索引筛选出的候选原始条目集合与全量线性安全遍历候选集合 100% 等价”**。
+2. **生产路径与 Sidecar 构建成本分离**：
+   - **读取路径零修改**：本阶段严禁且未修改 `DBIter`、`MergingIterator`、`ArenaWrappedDBIter`、`MemTable::NewRangeTombstoneIteratorInternal` 或 `RangeDelAggregator` 真实生产 Scan 路径；
+   - **写入/合并构建成本显式声明**：在 AMTV Run 构造与后台归并路径中，新增了 Sidecar 区间索引构建成本（对 $N$ 条条目进行复合排序及单调前缀扫描计算，时间复杂度 $O(N \log N)$）。
+3. **数据结构与内存代理值口径**：
    - 索引仅分配两个下标数组（`sorted_indices` 与 `prefix_max_end_index`），不复制 start/end key payload；
-   - 64 是 Open Delta 封箱阈值；归并后的 sealed run 可包含多个 chunk。索引内存为 $2N \times \text{sizeof(size_t)} = 16N$ 字节，随 run 大小线性增长；
-   - 二分查找确定候选范围 $[left, right)$，利用 Prefix-Max-End 单调性证明了 $i < left$ 必有 $end \le L$，$i \ge right$ 必有 $start \ge U$，候选截断数学完备；多 Run 审计严格记录每个 run 的 $left_i, right_i, span_i = right_i - left_i$，并以 $\sum span_i$ 核算总跨度，不将各 Run 的边界绝对值累加混淆为全局窗口；
-   - 经 10,000 轮蒙特卡洛随机差分及 7 组确定性反例拓扑验证，候选多重集与裁剪流在 Debug 与全隔离 Release 静态构建下均 100% 通过。
+   - 两组下标数组的 payload 代理值约为 `2 * capacity * sizeof(size_t)`；不含 vector 对象本身、分配器开销以及旧/新快照并存时的内存峰值；
+   - 64 仅是 Open Delta 初始封箱 chunk 阈值，归并后的 sealed run 可为 128、256、512 等多倍大小，并非固定不超过 64；索引随 run 规模线性增长。
+4. **复合排序不变量**：
+   - 逻辑 start key 的顺序严格为“非递减”；
+   - 当逻辑 start key 相同时，使用完整 InternalKey 及既定 sequence 规则（更大 sequence 优先，再按原始下标稳定破平）构成严格复合排序；
+   - `prefix_max_end_index` 严格单调非递减，且对任意前缀 $0 \le j \le i$，均有 $\text{end}(prefix\_max\_end\_index[i]) \ge \text{end}(sorted\_indices[j])$。
+5. **并发生命周期表述**：
+   - 双快照并存及后台 binary merge 过程中的数据竞争与对象有效性：在覆盖的生命周期测试中未观察到死锁或 UAF。
+6. **候选集上限硬断言**：
+   - 对任意窗口 $[L, U)$，每个单 Run 查询的候选集大小均严格满足 `candidate_count <= raw_entries.size()`。
+
 

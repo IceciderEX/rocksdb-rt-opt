@@ -144,10 +144,9 @@ void AMTVRunSidecarIndex::CollectIntersectingIndices(
   const size_t ts_sz = ucmp->timestamp_size();
   const bool has_ts = (ts_sz > 0);
 
-  // Prototype boundary convention: if both L and U are non-null and non-empty, and L >= U,
-  // the interval [L, U) is empty.
-  if (lower_bound != nullptr && !lower_bound->empty() &&
-      upper_bound != nullptr && !upper_bound->empty()) {
+  // Boundary convention: if both L and U are non-null (bounded), and L >= U,
+  // the interval [L, U) is empty. An actual empty Slice ("") is a valid user key, NOT an unbounded sentinel.
+  if (lower_bound != nullptr && upper_bound != nullptr) {
     if (ucmp->CompareWithoutTimestamp(*lower_bound, false, *upper_bound,
                                       false) >= 0) {
       return;
@@ -156,7 +155,7 @@ void AMTVRunSidecarIndex::CollectIntersectingIndices(
 
   // Right bound binary search on sorted_indices_: first entry with start >= U
   size_t right = sorted_indices_.size();
-  if (upper_bound != nullptr && !upper_bound->empty()) {
+  if (upper_bound != nullptr) {
     auto it_right = std::lower_bound(
         sorted_indices_.begin(), sorted_indices_.end(), *upper_bound,
         [&raw_entries, ucmp, has_ts](size_t idx, const Slice& u) {
@@ -168,7 +167,7 @@ void AMTVRunSidecarIndex::CollectIntersectingIndices(
 
   // Left bound binary search on prefix_max_end_index_: first entry with prefix_max_end > L
   size_t left = 0;
-  if (lower_bound != nullptr && !lower_bound->empty()) {
+  if (lower_bound != nullptr) {
     auto it_left = std::lower_bound(
         prefix_max_end_index_.begin(), prefix_max_end_index_.end(), *lower_bound,
         [&raw_entries, ucmp, has_ts](size_t entry_idx, const Slice& l) {
@@ -194,13 +193,13 @@ void AMTVRunSidecarIndex::CollectIntersectingIndices(
     const auto& entry = raw_entries[entry_idx];
 
     bool match = true;
-    if (upper_bound != nullptr && !upper_bound->empty()) {
+    if (upper_bound != nullptr) {
       if (ucmp->CompareWithoutTimestamp(entry.user_start_key(), has_ts,
                                          *upper_bound, false) >= 0) {
         match = false;
       }
     }
-    if (lower_bound != nullptr && !lower_bound->empty()) {
+    if (lower_bound != nullptr) {
       if (ucmp->CompareWithoutTimestamp(entry.user_end_key(), has_ts,
                                          *lower_bound, false) <= 0) {
         match = false;
@@ -215,6 +214,9 @@ void AMTVRunSidecarIndex::CollectIntersectingIndices(
       }
     }
   }
+
+  // Hard assertion: single-run candidate count never exceeds raw entries size
+  assert(out_indices == nullptr || out_indices->size() <= raw_entries.size());
 }
 
 bool AMTVRunSidecarIndex::VerifyInvariants(

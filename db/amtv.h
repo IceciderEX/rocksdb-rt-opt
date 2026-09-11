@@ -140,8 +140,10 @@ class AMTVRunSidecarIndex {
       std::vector<size_t>* out_indices,
       AMTVRunIntervalIndexAuditInfo* out_audit = nullptr) const;
 
+  // Two index vectors payload proxy: ~2 * capacity * sizeof(size_t).
+  // Excludes vector objects, allocator overhead, and dual-snapshot peak memory.
   size_t memory_bytes() const {
-    return (sorted_indices_.size() + prefix_max_end_index_.size()) * sizeof(size_t);
+    return (sorted_indices_.capacity() + prefix_max_end_index_.capacity()) * sizeof(size_t);
   }
 
   size_t size() const { return sorted_indices_.size(); }

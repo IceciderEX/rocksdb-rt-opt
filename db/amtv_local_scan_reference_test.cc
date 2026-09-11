@@ -384,8 +384,7 @@ class AMTVLocalScanReferenceView {
     const bool a_has_ts = (ts_sz > 0);
 
     // Filter 0: If both L and U are specified and L >= U, the interval [L, U) is empty.
-    if (lower_bound != nullptr && !lower_bound->empty() &&
-        upper_bound != nullptr && !upper_bound->empty()) {
+    if (lower_bound != nullptr && upper_bound != nullptr) {
       if (ucmp->CompareWithoutTimestamp(*lower_bound, false, *upper_bound,
                                         false) >= 0) {
         return false;
@@ -393,7 +392,7 @@ class AMTVLocalScanReferenceView {
     }
 
     // Filter 1: start < U
-    if (upper_bound != nullptr && !upper_bound->empty()) {
+    if (upper_bound != nullptr) {
       if (ucmp->CompareWithoutTimestamp(entry.user_start_key(), a_has_ts,
                                          *upper_bound, false) >= 0) {
         return false;
@@ -401,7 +400,7 @@ class AMTVLocalScanReferenceView {
     }
 
     // Filter 2: end > L
-    if (lower_bound != nullptr && !lower_bound->empty()) {
+    if (lower_bound != nullptr) {
       if (ucmp->CompareWithoutTimestamp(entry.user_end_key(), a_has_ts,
                                          *lower_bound, false) <= 0) {
         return false;
@@ -1981,7 +1980,7 @@ TEST_F(AMTVLocalScanReferenceTest, P1b_Counterexample_EmptyAndUnboundedWindows) 
     EXPECT_EQ(index_cands.size(), 2U);
   }
 
-  // Empty Slice convention
+  // Empty Slice convention: ["", "") is an empty window (L == U), returning 0 candidates
   {
     Slice L("");
     Slice U("");
@@ -1989,7 +1988,7 @@ TEST_F(AMTVLocalScanReferenceTest, P1b_Counterexample_EmptyAndUnboundedWindows) 
     std::vector<OpenDeltaEntry> index_cands;
     index.GetCandidates(&L, &U, &index_cands);
     VerifyCandidateMultiSetsIdentical(linear_cands, index_cands, BytewiseComparator());
-    EXPECT_EQ(index_cands.size(), 3U);
+    EXPECT_EQ(index_cands.size(), 0U);
   }
 }
 
@@ -2680,6 +2679,260 @@ TEST_F(AMTVLocalScanReferenceTest, AMTVRun_LargeRunLifecycle_L1_L2_L3) {
         {run_l3->raw_entries}, snap_after_l3->open_delta->entries(), BytewiseComparator(), 1000);
     AMTVLocalScanReferenceView view_after(*snap_after_l3, pL, pU, bytewise_icmp_, 1000);
     Verify3WayPointwise(view_after, truth_after, oracle_after, pL, pU, probe_keys, probe_seqs, BytewiseComparator());
+  }
+}
+
+// ==========================================================================
+// Phase A: CanonicalRawWriteWitness and Associated Structures
+// ==========================================================================
+struct CanonicalTombstoneIdentity {
+  std::string start_key;
+  std::string end_key;
+  SequenceNumber seq;
+  std::string timestamp;
+
+  bool operator==(const CanonicalTombstoneIdentity& other) const {
+    return start_key == other.start_key && end_key == other.end_key &&
+           seq == other.seq && timestamp == other.timestamp;
+  }
+  bool operator<(const CanonicalTombstoneIdentity& other) const {
+    if (start_key != other.start_key) return start_key < other.start_key;
+    if (end_key != other.end_key) return end_key < other.end_key;
+    if (seq != other.seq) return seq < other.seq;
+    return timestamp < other.timestamp;
+  }
+};
+
+class CanonicalRawWriteWitness {
+ public:
+  void RecordWrite(const std::string& start, const std::string& end,
+                   SequenceNumber seq, const std::string& ts = "") {
+    entries_.push_back({start, end, seq, ts});
+  }
+  const std::vector<CanonicalTombstoneIdentity>& entries() const {
+    return entries_;
+  }
+  std::multiset<CanonicalTombstoneIdentity> ToMultiset() const {
+    return std::multiset<CanonicalTombstoneIdentity>(entries_.begin(), entries_.end());
+  }
+ private:
+  std::vector<CanonicalTombstoneIdentity> entries_;
+};
+
+static std::multiset<CanonicalTombstoneIdentity> ExtractSnapshotRawMultiset(
+    const AMTVSnapshot& snap, size_t ts_sz = 0) {
+  std::multiset<CanonicalTombstoneIdentity> result;
+  for (const auto& run : snap.sealed_runs) {
+    if (run) {
+      for (const auto& e : run->raw_entries) {
+        result.insert(CanonicalTombstoneIdentity{
+            e.user_start_key().ToString(),
+            e.user_end_key().ToString(),
+            e.seq,
+            e.timestamp(ts_sz).ToString()});
+      }
+    }
+  }
+  if (snap.open_delta) {
+    for (const auto& e : snap.open_delta->entries()) {
+      result.insert(CanonicalTombstoneIdentity{
+          e.user_start_key().ToString(),
+          e.user_end_key().ToString(),
+          e.seq,
+          e.timestamp(ts_sz).ToString()});
+    }
+  }
+  return result;
+}
+
+// --------------------------------------------------------------------------
+// Test: P1b12_CanonicalRawWriteWitness_TwoTierVerification
+// Tier 1: Structural multiset parity before and after background binary merge
+// Tier 2: MVCC visibility parity across multiple read sequences
+// --------------------------------------------------------------------------
+TEST_F(AMTVLocalScanReferenceTest, P1b12_CanonicalRawWriteWitness_TwoTierVerification) {
+  ScopedEnvBackgroundThreads scoped_bg(Env::Default(), 1, Env::Priority::LOW);
+  auto amtv_state = std::make_shared<AMTVState>(
+      1 /*memtable_generation*/, 8 /*delta_limit*/, 2 /*merge_soft_limit*/,
+      8 /*hard_limit*/, &bytewise_icmp_, Env::Default());
+  CanonicalRawWriteWitness witness;
+
+  // 1. Write 8 tombstones to fill Open Delta and seal into Run 0
+  for (int i = 0; i < 8; ++i) {
+    std::string s = "key" + std::to_string(i * 10);
+    std::string e = "key" + std::to_string(i * 10 + 8);
+    SequenceNumber seq = 10 + i;
+    witness.RecordWrite(s, e, seq);
+    amtv_state->AddTombstone(s, e, seq, bytewise_icmp_);
+  }
+
+  // 2. Write 8 more tombstones to seal into Run 1
+  for (int i = 8; i < 16; ++i) {
+    std::string s = "key" + std::to_string(i * 10);
+    std::string e = "key" + std::to_string(i * 10 + 8);
+    SequenceNumber seq = 10 + i;
+    witness.RecordWrite(s, e, seq);
+    amtv_state->AddTombstone(s, e, seq, bytewise_icmp_);
+  }
+
+  auto snap1 = amtv_state->GetSnapshot();
+  ASSERT_NE(snap1, nullptr);
+  ASSERT_FALSE(snap1->fallback_required) << "AMTV Fallback occurred! Halting test.";
+
+  // Tier 1 structural check on snap1
+  EXPECT_EQ(ExtractSnapshotRawMultiset(*snap1), witness.ToMultiset());
+  EXPECT_EQ(snap1->sealed_runs.size(), 2U);
+
+  // 3. Write 4 more into Open Delta
+  for (int i = 16; i < 20; ++i) {
+    std::string s = "key" + std::to_string(i * 10);
+    std::string e = "key" + std::to_string(i * 10 + 8);
+    SequenceNumber seq = 10 + i;
+    witness.RecordWrite(s, e, seq);
+    amtv_state->AddTombstone(s, e, seq, bytewise_icmp_);
+  }
+
+  auto snap2 = amtv_state->GetSnapshot();
+  ASSERT_NE(snap2, nullptr);
+  ASSERT_FALSE(snap2->fallback_required) << "AMTV Fallback occurred! Halting test.";
+
+  // Tier 1 structural check on snap2
+  EXPECT_EQ(ExtractSnapshotRawMultiset(*snap2), witness.ToMultiset());
+  EXPECT_EQ(snap2->open_delta->size(), 4U);
+
+  // 4. Trigger background binary merge of Run 0 and Run 1 (10-second timeout with diagnostic)
+  bool merge_stable = amtv_state->WaitForMergeStable(10000000);
+  ASSERT_TRUE(merge_stable) << "WaitForMergeStable timed out after 10 seconds! Merge thread hang.";
+
+  auto snap3 = amtv_state->GetSnapshot();
+  ASSERT_NE(snap3, nullptr);
+  ASSERT_FALSE(snap3->fallback_required) << "AMTV Fallback occurred! Halting test.";
+
+  // Tier 1 structural check on snap3 (after merge)
+  EXPECT_EQ(ExtractSnapshotRawMultiset(*snap3), witness.ToMultiset());
+  EXPECT_EQ(snap3->sealed_runs.size(), 1U); // Merged into 1 Run of size 16
+  EXPECT_EQ(snap3->sealed_runs[0]->raw_entries.size(), 16U);
+
+  // Old snapshot snap1 must remain completely unaffected
+  EXPECT_EQ(snap1->sealed_runs.size(), 2U);
+  EXPECT_EQ(ExtractSnapshotRawMultiset(*snap1).size(), 16U);
+
+  // 5. Tier 2: MVCC Visibility Parity
+  std::vector<SequenceNumber> test_read_seqs = {9, 13, 17, 25, 100};
+  AMTVMultiSourceAdapter adapter3(snap3, &bytewise_icmp_);
+
+  for (SequenceNumber rseq : test_read_seqs) {
+    // For every tombstone written, verify reader visibility conforms strictly to seq <= rseq
+    for (const auto& entry : witness.entries()) {
+      std::string mid_probe = entry.start_key + "_probe";
+      SequenceNumber covering_seq = adapter3.MaxCoveringTombstoneSeqnum(mid_probe, rseq);
+
+      if (entry.seq > rseq) {
+        // Must NEVER see future tombstone
+        EXPECT_NE(covering_seq, entry.seq)
+            << "Future tombstone with seq " << entry.seq
+            << " was visible to reader with read_seq " << rseq;
+      }
+    }
+  }
+
+  amtv_state->CancelAndDrain();
+}
+
+// --------------------------------------------------------------------------
+// Test: P1b12_SingleRunCandidateCountUpperBound
+// Verifies that for every single Run query, candidate_count <= raw_entries.size()
+// across varied window specifications.
+// --------------------------------------------------------------------------
+TEST_F(AMTVLocalScanReferenceTest, P1b12_SingleRunCandidateCountUpperBound) {
+  std::vector<OpenDeltaEntry> raw_entries;
+  for (int i = 0; i < 32; ++i) {
+    std::string s = "k" + std::to_string(i * 10);
+    std::string e = "k" + std::to_string(i * 10 + 15);
+    raw_entries.push_back(OpenDeltaEntry(s, e, 100 + i));
+  }
+  auto run = std::make_shared<AMTVRun>(1, raw_entries, bytewise_icmp_);
+
+  struct TestWindow {
+    std::optional<std::string> l;
+    std::optional<std::string> u;
+  };
+  std::vector<TestWindow> test_windows = {
+      {std::nullopt, std::nullopt},
+      {std::nullopt, std::string("k100")},
+      {std::string("k100"), std::nullopt},
+      {std::string("k50"), std::string("k150")},
+      {std::string("k0"), std::string("k400")},
+      {std::string("k999"), std::string("k9999")},
+      {std::string("k00"), std::string("k001")},
+      {std::string("k200"), std::string("k100")},
+  };
+
+  for (const auto& w : test_windows) {
+    Slice sl, su;
+    const Slice* pL = nullptr;
+    const Slice* pU = nullptr;
+    if (w.l.has_value()) {
+      sl = Slice(*w.l);
+      pL = &sl;
+    }
+    if (w.u.has_value()) {
+      su = Slice(*w.u);
+      pU = &su;
+    }
+
+    std::vector<size_t> indices;
+    AMTVRunIntervalIndexAuditInfo audit;
+    run->CollectIntersectingRawEntryIndices(pL, pU, bytewise_icmp_, &indices, &audit);
+
+    // Hard assert on candidate_count
+    EXPECT_LE(audit.candidate_count, run->raw_entries.size());
+    EXPECT_EQ(indices.size(), audit.candidate_count);
+  }
+}
+
+// --------------------------------------------------------------------------
+// Test: P1b12_EmptyUserKeyVsUnboundedBoundaryDistinction
+// Verifies that empty user key Slice("") is distinct from unbounded (nullptr)
+// --------------------------------------------------------------------------
+TEST_F(AMTVLocalScanReferenceTest, P1b12_EmptyUserKeyVsUnboundedBoundaryDistinction) {
+  std::vector<OpenDeltaEntry> raw_entries;
+  raw_entries.push_back(OpenDeltaEntry("", "b", 100));     // Starts at empty string ""
+  raw_entries.push_back(OpenDeltaEntry("b", "d", 101));
+  raw_entries.push_back(OpenDeltaEntry("d", "f", 102));
+
+  auto run = std::make_shared<AMTVRun>(1, raw_entries, bytewise_icmp_);
+
+  Slice empty_key("");
+  Slice key_b("b");
+  Slice key_d("d");
+
+  // 1. Lower bound is Slice("") -> Bounded at "", NOT unbounded
+  {
+    std::vector<size_t> indices;
+    AMTVRunIntervalIndexAuditInfo audit;
+    run->CollectIntersectingRawEntryIndices(&empty_key, &key_b, bytewise_icmp_, &indices, &audit);
+    // [ "", "b" ) intersects first entry ["", "b")
+    EXPECT_EQ(indices.size(), 1U);
+    EXPECT_EQ(indices[0], 0U);
+  }
+
+  // 2. Upper bound is Slice(""), Lower bound is "d" -> ["d", "") is empty window because "" < "d"
+  {
+    std::vector<size_t> indices;
+    AMTVRunIntervalIndexAuditInfo audit;
+    run->CollectIntersectingRawEntryIndices(&key_d, &empty_key, bytewise_icmp_, &indices, &audit);
+    // Inverted/empty window MUST yield 0 candidates
+    EXPECT_EQ(indices.size(), 0U);
+    EXPECT_EQ(audit.candidate_count, 0U);
+  }
+
+  // 3. Fully unbounded: nullptr, nullptr -> returns all 3
+  {
+    std::vector<size_t> indices;
+    AMTVRunIntervalIndexAuditInfo audit;
+    run->CollectIntersectingRawEntryIndices(nullptr, nullptr, bytewise_icmp_, &indices, &audit);
+    EXPECT_EQ(indices.size(), 3U);
   }
 }
 
