@@ -187,6 +187,8 @@ void AMTVRunSidecarIndex::CollectIntersectingIndices(
     out_audit->span = (right >= left) ? (right - left) : 0;
   }
 
+  const size_t initial_indices_size = out_indices ? out_indices->size() : 0;
+
   // Exact filtering on [left, right)
   for (size_t i = left; i < right; ++i) {
     size_t entry_idx = sorted_indices_[i];
@@ -215,8 +217,10 @@ void AMTVRunSidecarIndex::CollectIntersectingIndices(
     }
   }
 
-  // Hard assertion: single-run candidate count never exceeds raw entries size
-  assert(out_indices == nullptr || out_indices->size() <= raw_entries.size());
+  // Debug development assertion (eliminated under -DNDEBUG):
+  // single-run candidates added in this query never exceed raw entries size
+  assert((out_indices == nullptr || (out_indices->size() - initial_indices_size) <= raw_entries.size()) &&
+         (out_audit == nullptr || out_audit->candidate_count <= raw_entries.size()));
 }
 
 bool AMTVRunSidecarIndex::VerifyInvariants(
