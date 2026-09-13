@@ -2703,10 +2703,37 @@ struct CanonicalTombstoneIdentity {
   }
 };
 
+struct CanonicalPointWrite {
+  std::string key;
+  std::string value;
+  SequenceNumber seq;
+};
+
+struct CanonicalOpLogEntry {
+  SequenceNumber seq;
+  std::string op_type;
+  std::string desc;
+};
+
 class CanonicalRawWriteWitness {
  public:
   explicit CanonicalRawWriteWitness(uint64_t expected_generation = 1)
       : generation_(expected_generation) {}
+
+  void RecordPointWrite(uint64_t gen, const std::string& key,
+                        const std::string& value, SequenceNumber seq,
+                        const std::string& note = "") {
+    if (gen != generation_) {
+      throw std::runtime_error("Witness fail-fast: generation mismatch! Expected " +
+                               std::to_string(generation_) + ", got " + std::to_string(gen));
+    }
+    points_.push_back({key, value, seq});
+    std::string desc = "Put(" + key + ", " + value + ")";
+    if (!note.empty()) {
+      desc += " [" + note + "]";
+    }
+    op_log_.push_back({seq, "PUT", desc});
+  }
 
   void RecordWrite(uint64_t gen, const std::string& start, const std::string& end,
                    SequenceNumber seq, const std::string& ts = "") {
@@ -2715,19 +2742,79 @@ class CanonicalRawWriteWitness {
                                std::to_string(generation_) + ", got " + std::to_string(gen));
     }
     entries_.push_back({start, end, seq, ts});
+    std::string desc = "DeleteRange([" + start + ", " + end + "))";
+    op_log_.push_back({seq, "DELETE_RANGE", desc});
   }
 
   uint64_t generation() const { return generation_; }
   const std::vector<CanonicalTombstoneIdentity>& entries() const {
     return entries_;
   }
+  const std::vector<CanonicalPointWrite>& points() const {
+    return points_;
+  }
+  const std::vector<CanonicalOpLogEntry>& op_log() const {
+    return op_log_;
+  }
   std::multiset<CanonicalTombstoneIdentity> ToMultiset() const {
     return std::multiset<CanonicalTombstoneIdentity>(entries_.begin(), entries_.end());
+  }
+
+  bool GetVisiblePoint(const std::string& key, SequenceNumber read_seq,
+                       SequenceNumber* point_seq, std::string* point_val) const {
+    SequenceNumber best_seq = 0;
+    std::string best_val;
+    bool found = false;
+    for (const auto& p : points_) {
+      if (p.key == key && p.seq <= read_seq) {
+        if (!found || p.seq > best_seq) {
+          best_seq = p.seq;
+          best_val = p.value;
+          found = true;
+        }
+      }
+    }
+    if (found) {
+      if (point_seq) *point_seq = best_seq;
+      if (point_val) *point_val = best_val;
+    }
+    return found;
+  }
+
+  SequenceNumber MaxCoveringTombstoneSeq(const std::string& key, SequenceNumber read_seq) const {
+    SequenceNumber max_seq = 0;
+    for (const auto& e : entries_) {
+      if (e.seq <= read_seq) {
+        if (key >= e.start_key && key < e.end_key) {
+          if (e.seq > max_seq) {
+            max_seq = e.seq;
+          }
+        }
+      }
+    }
+    return max_seq;
+  }
+
+  void PrintOperationLog() const {
+    std::vector<CanonicalOpLogEntry> sorted_log = op_log_;
+    std::sort(sorted_log.begin(), sorted_log.end(),
+              [](const CanonicalOpLogEntry& a, const CanonicalOpLogEntry& b) {
+                return a.seq < b.seq;
+              });
+    fprintf(stderr, "\n=== [Sequence-Ordered Canonical Operations Log] ===\n");
+    fprintf(stderr, "| seq | op_type      | description                                  |\n");
+    fprintf(stderr, "|:---:|:------------:|:---------------------------------------------|\n");
+    for (const auto& op : sorted_log) {
+      fprintf(stderr, "| %-3" PRIu64 " | %-12s | %-44s |\n",
+              static_cast<uint64_t>(op.seq), op.op_type.c_str(), op.desc.c_str());
+    }
   }
 
  private:
   uint64_t generation_;
   std::vector<CanonicalTombstoneIdentity> entries_;
+  std::vector<CanonicalPointWrite> points_;
+  std::vector<CanonicalOpLogEntry> op_log_;
 };
 
 static std::multiset<CanonicalTombstoneIdentity> ExtractSnapshotRawMultiset(
@@ -2769,30 +2856,50 @@ TEST_F(AMTVLocalScanReferenceTest, P1b12_CanonicalRawWriteWitness_TwoTierVerific
       8 /*hard_limit*/, &bytewise_icmp_, Env::Default());
   CanonicalRawWriteWitness witness(kMemtableGen);
 
-  // 1. Write 8 tombstones to fill Open Delta and seal into Run 0
-  for (int i = 0; i < 8; ++i) {
+  // 1. Initial point writes into witness
+  witness.RecordPointWrite(kMemtableGen, "key0004", "val_v1", 2, "initial point");
+  witness.RecordPointWrite(kMemtableGen, "key0124", "val_x1", 6, "initial point");
+
+  // 2. Write 4 tombstones to Open Delta
+  for (int i = 0; i < 4; ++i) {
     char buf_s[32], buf_e[32];
     snprintf(buf_s, sizeof(buf_s), "key%04d", i * 20);
     snprintf(buf_e, sizeof(buf_e), "key%04d", i * 20 + 8);
     std::string s(buf_s);
     std::string e(buf_e);
-    SequenceNumber seq = 10 + i;
+    SequenceNumber seq = 10 + i; // 10, 11, 12, 13
     witness.RecordWrite(kMemtableGen, s, e, seq);
     amtv_state->AddTombstone(s, e, seq, bytewise_icmp_);
   }
 
-  // 2. Write 8 more tombstones to seal into Run 1
+  // Put resurrection for key0004 at seq 14 (between tombstones 3 and 4)
+  witness.RecordPointWrite(kMemtableGen, "key0004", "val_v2", 14, "Put resurrection");
+
+  // Write remaining 4 tombstones to fill Open Delta and seal into Run 0 (size 8)
+  for (int i = 4; i < 8; ++i) {
+    char buf_s[32], buf_e[32];
+    snprintf(buf_s, sizeof(buf_s), "key%04d", i * 20);
+    snprintf(buf_e, sizeof(buf_e), "key%04d", i * 20 + 8);
+    std::string s(buf_s);
+    std::string e(buf_e);
+    SequenceNumber seq = 11 + i; // 15, 16, 17, 18 (i=6 is key0120..key0128 @ seq 17)
+    witness.RecordWrite(kMemtableGen, s, e, seq);
+    amtv_state->AddTombstone(s, e, seq, bytewise_icmp_);
+  }
+
+  // 3. Write 8 more tombstones to seal into Run 1 (size 8, seq 19..26)
   for (int i = 8; i < 16; ++i) {
     char buf_s[32], buf_e[32];
     snprintf(buf_s, sizeof(buf_s), "key%04d", i * 20);
     snprintf(buf_e, sizeof(buf_e), "key%04d", i * 20 + 8);
     std::string s(buf_s);
     std::string e(buf_e);
-    SequenceNumber seq = 10 + i;
+    SequenceNumber seq = 11 + i; // 19..26
     witness.RecordWrite(kMemtableGen, s, e, seq);
     amtv_state->AddTombstone(s, e, seq, bytewise_icmp_);
   }
 
+  auto witness_snap1_multiset = witness.ToMultiset();
   auto snap1 = amtv_state->GetSnapshot();
   ASSERT_NE(snap1, nullptr);
   ASSERT_FALSE(snap1->fallback_required) << "Witness fail-fast: AMTV Fallback occurred!";
@@ -2801,21 +2908,22 @@ TEST_F(AMTVLocalScanReferenceTest, P1b12_CanonicalRawWriteWitness_TwoTierVerific
 
   // Tier 1 structural check on snap1 (pre-merge snapshot)
   auto snap1_multiset = ExtractSnapshotRawMultiset(*snap1);
-  EXPECT_EQ(snap1_multiset, witness.ToMultiset());
+  EXPECT_EQ(snap1_multiset, witness_snap1_multiset);
   EXPECT_EQ(snap1->sealed_runs.size(), 2U);
 
-  // 3. Write 4 more into Open Delta
+  // 4. Write 4 more into Open Delta (seq 27..30)
   for (int i = 16; i < 20; ++i) {
     char buf_s[32], buf_e[32];
     snprintf(buf_s, sizeof(buf_s), "key%04d", i * 20);
     snprintf(buf_e, sizeof(buf_e), "key%04d", i * 20 + 8);
     std::string s(buf_s);
     std::string e(buf_e);
-    SequenceNumber seq = 10 + i;
+    SequenceNumber seq = 11 + i; // 27..30
     witness.RecordWrite(kMemtableGen, s, e, seq);
     amtv_state->AddTombstone(s, e, seq, bytewise_icmp_);
   }
 
+  auto witness_snap2_multiset = witness.ToMultiset();
   auto snap2 = amtv_state->GetSnapshot();
   ASSERT_NE(snap2, nullptr);
   ASSERT_FALSE(snap2->fallback_required) << "Witness fail-fast: AMTV Fallback occurred!";
@@ -2823,10 +2931,10 @@ TEST_F(AMTVLocalScanReferenceTest, P1b12_CanonicalRawWriteWitness_TwoTierVerific
       << "Witness fail-fast: Generation changed!";
 
   // Tier 1 structural check on snap2
-  EXPECT_EQ(ExtractSnapshotRawMultiset(*snap2), witness.ToMultiset());
+  EXPECT_EQ(ExtractSnapshotRawMultiset(*snap2), witness_snap2_multiset);
   EXPECT_EQ(snap2->open_delta->size(), 4U);
 
-  // 4. Trigger background binary merge of Run 0 and Run 1
+  // 5. Trigger background binary merge of Run 0 and Run 1
   bool merge_stable = amtv_state->WaitForMergeStable(10000000);
   ASSERT_TRUE(merge_stable) << "WaitForMergeStable timed out after 10 seconds! Merge thread hang.";
 
@@ -2848,9 +2956,9 @@ TEST_F(AMTVLocalScanReferenceTest, P1b12_CanonicalRawWriteWitness_TwoTierVerific
   fprintf(stderr, "| generation_id | snapshot_id | phase               | raw_witness_count | snapshot_raw_count | multiset_match | fallback_count | merge_state    |\n");
   fprintf(stderr, "|:-------------:|:-----------:|:--------------------|:-----------------:|:------------------:|:--------------:|:--------------:|:---------------|\n");
   fprintf(stderr, "| %-13" PRIu64 " | snap1       | pre-merge           | %-17zu | %-18zu | %-14s | 0              | unmerged (2)   |\n",
-          witness.generation(), snap1_multiset.size(), snap1_multiset.size(), (snap1_multiset == witness.ToMultiset() ? "TRUE" : "FALSE"));
+          witness.generation(), witness_snap1_multiset.size(), snap1_multiset.size(), (snap1_multiset == witness_snap1_multiset ? "TRUE" : "FALSE"));
   fprintf(stderr, "| %-13" PRIu64 " | snap2       | open-delta-extended | %-17zu | %-18zu | %-14s | 0              | unmerged (2+1) |\n",
-          witness.generation(), witness.entries().size(), ExtractSnapshotRawMultiset(*snap2).size(), (ExtractSnapshotRawMultiset(*snap2) == witness.ToMultiset() ? "TRUE" : "FALSE"));
+          witness.generation(), witness_snap2_multiset.size(), ExtractSnapshotRawMultiset(*snap2).size(), (ExtractSnapshotRawMultiset(*snap2) == witness_snap2_multiset ? "TRUE" : "FALSE"));
   fprintf(stderr, "| %-13" PRIu64 " | snap3       | post-merge          | %-17zu | %-18zu | %-14s | 0              | merged (1+1)   |\n",
           witness.generation(), witness.entries().size(), snap3_multiset.size(), (snap3_multiset == witness.ToMultiset() ? "TRUE" : "FALSE"));
   ASSERT_EQ(snap3_multiset, witness.ToMultiset());
@@ -2859,107 +2967,102 @@ TEST_F(AMTVLocalScanReferenceTest, P1b12_CanonicalRawWriteWitness_TwoTierVerific
   EXPECT_EQ(snap1->sealed_runs.size(), 2U);
   EXPECT_EQ(ExtractSnapshotRawMultiset(*snap1).size(), 16U);
 
-  // 5. Tier 2: MVCC Visibility Parity across multiple read sequences
+  // 6. Output sequence-ordered operations log
+  witness.PrintOperationLog();
+
+  // 7. Tier 2: MVCC Visibility Parity across multiple read sequences
   // Tier 2 validates MVCC visibility semantics filtered by read_seq.
-  // We test and log:
-  // - pre-delete (rseq = 5): before any delete was written (all min delete seq >= 10)
-  // - delete-visible (rseq = 13): deletes with seq <= 13 are visible, > 13 not visible
-  // - future-delete-not-visible (rseq = 15): tombstones with seq 16..19 MUST NOT be visible
-  // - post-delete (rseq = 100): all 20 deletes are visible
+  // Deconstructed truth table evaluates:
+  // read_seq | point_value_seq | max_covering_tombstone_seq | tombstone_visible | point_deleted_by_tombstone | final_point_visible | expected_result | observed_result
   AMTVMultiSourceAdapter adapter3(snap3, &bytewise_icmp_);
 
+  struct MVCCProbeCase {
+    std::string probe_key;
+    SequenceNumber read_seq;
+    std::string test_phase;
+  };
+
+  std::vector<MVCCProbeCase> probe_cases = {
+      {"key0004", 1, "pre-put (not-found)"},
+      {"key0004", 5, "pre-delete (point-visible)"},
+      {"key0004", 13, "delete-visible (deleted)"},
+      {"key0004", 15, "put-resurrection (point-visible)"},
+      {"key0124", 15, "future-delete-not-visible (point-visible)"},
+      {"key0124", 20, "delete-visible (deleted)"},
+      {"key0004", 100, "post-all (resurrection-visible)"},
+      {"key0124", 100, "post-all (deleted)"},
+  };
+
   fprintf(stderr, "\n=== [Phase A Witness MVCC Visibility Table (Tier-2 Semantic Parity)] ===\n");
-  fprintf(stderr, "Note: Tier 2 validates MVCC visibility semantics filtered by read_seq.\n");
-  fprintf(stderr, "| read_seq | point_key | expected_covering_seq | observed_covering_seq | visible/deleted              |\n");
-  fprintf(stderr, "|:--------:|:---------:|:---------------------:|:---------------------:|:-----------------------------|\n");
+  fprintf(stderr, "Note: Tier 2 validates MVCC visibility semantics filtered by read_seq across 8 canonical columns.\n");
+  fprintf(stderr, "| probe_key | read_seq | point_value_seq | max_covering_tombstone_seq | tombstone_visible | point_deleted_by_tombstone | final_point_visible | expected_result | observed_result |\n");
+  fprintf(stderr, "|:---------:|:--------:|:---------------:|:--------------------------:|:-----------------:|:--------------------------:|:-------------------:|:---------------:|:---------------:|\n");
 
-  // A. Pre-delete: rseq = 5
-  {
-    SequenceNumber rseq_pre = 5;
-    for (size_t i = 0; i < witness.entries().size(); ++i) {
-      char buf_mid[32];
-      snprintf(buf_mid, sizeof(buf_mid), "key%04d", static_cast<int>(i) * 20 + 4);
-      std::string mid_probe(buf_mid);
-      SequenceNumber covering_seq = adapter3.MaxCoveringTombstoneSeqnum(mid_probe, rseq_pre);
-      EXPECT_EQ(covering_seq, 0U)
-          << "Pre-delete reader at rseq=5 should see no covering tombstone for " << mid_probe;
-      if (i == 0) {
-        fprintf(stderr, "| %-8" PRIu64 " | %-9s | %-21" PRIu64 " | %-21" PRIu64 " | pre-delete (visible=false)   |\n",
-                rseq_pre, mid_probe.c_str(), static_cast<uint64_t>(0), static_cast<uint64_t>(covering_seq));
-      }
-    }
+  for (const auto& c : probe_cases) {
+    SequenceNumber point_val_seq = 0;
+    std::string point_val;
+    bool has_point = witness.GetVisiblePoint(c.probe_key, c.read_seq, &point_val_seq, &point_val);
+
+    SequenceNumber expected_covering_seq = witness.MaxCoveringTombstoneSeq(c.probe_key, c.read_seq);
+    SequenceNumber observed_covering_seq = adapter3.MaxCoveringTombstoneSeqnum(c.probe_key, c.read_seq);
+    EXPECT_EQ(observed_covering_seq, expected_covering_seq)
+        << "Mismatch covering seq for " << c.probe_key << " at rseq=" << c.read_seq;
+
+    bool exp_tombstone_vis = (expected_covering_seq > 0);
+    bool obs_tombstone_vis = (observed_covering_seq > 0);
+    EXPECT_EQ(obs_tombstone_vis, exp_tombstone_vis);
+
+    bool exp_deleted = (exp_tombstone_vis && has_point && point_val_seq <= expected_covering_seq);
+    bool obs_deleted = (obs_tombstone_vis && has_point && point_val_seq <= observed_covering_seq);
+    EXPECT_EQ(obs_deleted, exp_deleted);
+
+    bool exp_final_vis = (has_point && !exp_deleted);
+    bool obs_final_vis = (has_point && !obs_deleted);
+    EXPECT_EQ(obs_final_vis, exp_final_vis);
+
+    std::string exp_result = exp_final_vis ? point_val : (exp_deleted ? "DELETED" : "NOT_FOUND");
+    std::string obs_result = obs_final_vis ? point_val : (obs_deleted ? "DELETED" : "NOT_FOUND");
+    EXPECT_EQ(obs_result, exp_result);
+
+    fprintf(stderr, "| %-9s | %-8" PRIu64 " | %-15" PRIu64 " | %-26" PRIu64 " | %-17s | %-26s | %-19s | %-15s | %-15s |\n",
+            c.probe_key.c_str(), static_cast<uint64_t>(c.read_seq),
+            static_cast<uint64_t>(point_val_seq),
+            static_cast<uint64_t>(observed_covering_seq),
+            (obs_tombstone_vis ? "TRUE" : "FALSE"),
+            (obs_deleted ? "TRUE" : "FALSE"),
+            (obs_final_vis ? "TRUE" : "FALSE"),
+            exp_result.c_str(), obs_result.c_str());
   }
 
-  // B. Delete-visible: rseq = 13
-  {
-    SequenceNumber rseq_mid = 13;
-    bool logged_vis = false;
-    for (size_t i = 0; i < witness.entries().size(); ++i) {
-      const auto& entry = witness.entries()[i];
-      char buf_mid[32];
-      snprintf(buf_mid, sizeof(buf_mid), "key%04d", static_cast<int>(i) * 20 + 4);
-      std::string mid_probe(buf_mid);
-      SequenceNumber covering_seq = adapter3.MaxCoveringTombstoneSeqnum(mid_probe, rseq_mid);
-      if (entry.seq <= rseq_mid) {
-        EXPECT_EQ(covering_seq, entry.seq)
-            << "Delete at seq " << entry.seq << " should be visible to reader at rseq=13";
-        if (!logged_vis) {
-          fprintf(stderr, "| %-8" PRIu64 " | %-9s | %-21" PRIu64 " | %-21" PRIu64 " | delete-visible (deleted)     |\n",
-                  rseq_mid, mid_probe.c_str(), static_cast<uint64_t>(entry.seq), static_cast<uint64_t>(covering_seq));
-          logged_vis = true;
-        }
-      } else {
-        EXPECT_EQ(covering_seq, 0U)
-            << "Future delete at seq " << entry.seq << " must NOT be visible to reader at rseq=13";
-      }
+  // Exhaustive 20-entry tombstone visibility checks across all probe points
+  for (size_t i = 0; i < witness.entries().size(); ++i) {
+    const auto& entry = witness.entries()[i];
+    char buf_mid[32];
+    snprintf(buf_mid, sizeof(buf_mid), "key%04d", static_cast<int>(i) * 20 + 4);
+    std::string mid_probe(buf_mid);
+
+    // At rseq = 5 (all tombstones seq >= 10, none visible)
+    EXPECT_EQ(adapter3.MaxCoveringTombstoneSeqnum(mid_probe, 5), 0U);
+
+    // At rseq = 13 (tombstones with seq <= 13 visible, > 13 not visible)
+    if (entry.seq <= 13) {
+      EXPECT_EQ(adapter3.MaxCoveringTombstoneSeqnum(mid_probe, 13), entry.seq);
+    } else {
+      EXPECT_EQ(adapter3.MaxCoveringTombstoneSeqnum(mid_probe, 13), 0U);
     }
+
+    // At rseq = 15 (tombstones with seq <= 15 visible, > 15 not visible)
+    if (entry.seq <= 15) {
+      EXPECT_EQ(adapter3.MaxCoveringTombstoneSeqnum(mid_probe, 15), entry.seq);
+    } else {
+      EXPECT_EQ(adapter3.MaxCoveringTombstoneSeqnum(mid_probe, 15), 0U);
+    }
+
+    // At rseq = 100 (all tombstones visible)
+    EXPECT_EQ(adapter3.MaxCoveringTombstoneSeqnum(mid_probe, 100), entry.seq);
   }
 
-  // C. Future-delete-not-visible: rseq = 15
-  {
-    SequenceNumber rseq_future = 15;
-    bool logged_future = false;
-    for (size_t i = 0; i < witness.entries().size(); ++i) {
-      const auto& entry = witness.entries()[i];
-      char buf_mid[32];
-      snprintf(buf_mid, sizeof(buf_mid), "key%04d", static_cast<int>(i) * 20 + 4);
-      std::string mid_probe(buf_mid);
-      SequenceNumber covering_seq = adapter3.MaxCoveringTombstoneSeqnum(mid_probe, rseq_future);
-      if (entry.seq <= rseq_future) {
-        EXPECT_EQ(covering_seq, entry.seq);
-      } else {
-        EXPECT_EQ(covering_seq, 0U)
-            << "Future delete at seq " << entry.seq << " must NOT be visible to reader at rseq=15";
-        if (!logged_future) {
-          fprintf(stderr, "| %-8" PRIu64 " | %-9s | %-21" PRIu64 " | %-21" PRIu64 " | future-delete-not-visible    |\n",
-                  rseq_future, mid_probe.c_str(), static_cast<uint64_t>(0), static_cast<uint64_t>(covering_seq));
-          logged_future = true;
-        }
-      }
-    }
-  }
-
-  // D. Post-delete: rseq = 100
-  {
-    SequenceNumber rseq_post = 100;
-    bool logged_post = false;
-    for (size_t i = 0; i < witness.entries().size(); ++i) {
-      const auto& entry = witness.entries()[i];
-      char buf_mid[32];
-      snprintf(buf_mid, sizeof(buf_mid), "key%04d", static_cast<int>(i) * 20 + 4);
-      std::string mid_probe(buf_mid);
-      SequenceNumber covering_seq = adapter3.MaxCoveringTombstoneSeqnum(mid_probe, rseq_post);
-      EXPECT_EQ(covering_seq, entry.seq)
-          << "All deletes should be visible to reader at rseq=100";
-      if (!logged_post) {
-        fprintf(stderr, "| %-8" PRIu64 " | %-9s | %-21" PRIu64 " | %-21" PRIu64 " | post-delete (deleted)        |\n",
-                rseq_post, mid_probe.c_str(), static_cast<uint64_t>(entry.seq), static_cast<uint64_t>(covering_seq));
-        logged_post = true;
-      }
-    }
-  }
-
-  // E. Fail-fast demonstration on generation mismatch
+  // 8. Fail-fast demonstration on generation mismatch
   EXPECT_THROW(witness.RecordWrite(kMemtableGen + 1, "k", "k1", 200), std::runtime_error);
 
   amtv_state->CancelAndDrain();

@@ -298,9 +298,9 @@ DBImpl::NewInternalIterator (db/db_impl.cc:2573-2624)
 
 ### 6.1 核心结论与范围声明
 1. **测试专用边界声明**：M4-P1b 仅证明**“Run 内 Prefix-Max-End 区间索引筛选出的候选原始条目集合与全量线性安全遍历候选集合 100% 等价”**。
-2. **生产路径与 Sidecar 构建成本分离**：
-   - **读取路径零修改**：本阶段严禁且未修改 `DBIter`、`MergingIterator`、`ArenaWrappedDBIter`、`MemTable::NewRangeTombstoneIteratorInternal` 或 `RangeDelAggregator` 真实生产 Scan 路径；
-   - **写入/合并构建成本显式声明**：在 AMTV Run 构造与后台归并路径中，新增了 Sidecar 区间索引构建成本（对 $N$ 条条目进行复合排序及单调前缀扫描计算，时间复杂度 $O(N \log N)$）。
+2. **真实 Scan Consumer 零改动声明与 Sidecar 构建开销披露**：
+   - **真实 Scan Consumer 零改动**：本阶段严禁且未修改 `DBIter`、`MergingIterator`、`ArenaWrappedDBIter`、`MemTable::NewRangeTombstoneIteratorInternal` 或 `RangeDelAggregator` 真实生产 Scan 路径（严格 0 行改动）；
+   - **Sidecar 构建开销披露**：不得声称“生产系统零改动”，因为在 AMTV Run 构造与后台归并路径中（`db/amtv.h` / `db/amtv.cc`），新增了 `AMTVRunSidecarIndex` 构建成本：对 $N$ 条墓碑进行复合排序及单调前缀扫描，CPU 复杂度为 $O(N \log N)$，内存开销约为两组下标数组 $2 \times capacity \times sizeof(size\_t)$。
 3. **数据结构与内存代理值口径**：
    - 索引仅分配两个下标数组（`sorted_indices` 与 `prefix_max_end_index`），不复制 start/end key payload；
    - 两组下标数组的 payload 代理值约为 `2 * capacity * sizeof(size_t)`；不含 vector 对象本身、分配器开销以及旧/新快照并存时的内存峰值；
@@ -309,11 +309,73 @@ DBImpl::NewInternalIterator (db/db_impl.cc:2573-2624)
    - 逻辑 start key 的顺序严格为“非递减”；
    - 当逻辑 start key 相同时，使用完整 InternalKey 及既定 sequence 规则（更大 sequence 优先，再按原始下标稳定破平）构成严格复合排序；
    - `prefix_max_end_index` 严格单调非递减，且对任意前缀 $0 \le j \le i$，均有 $\text{end}(prefix\_max\_end\_index[i]) \ge \text{end}(sorted\_indices[j])$。
-5. **并发生命周期表述**：
-6. **单 Run 候选集大小上限与 Debug 开发断言口径**：
-   - 对任意窗口 $[L, U)$，每个单 Run 查询的候选集大小均严格满足 `candidate_count <= raw_entries.size()`；
-   - 代码中的 `assert(out_indices... <= raw_entries.size())` 统一表述为“Debug 开发断言”（在 Release 模式下由 `-DNDEBUG` 消除）；
-   - Release 下由单元测试全拓扑覆盖与 Prefix-Max-End 算法不变量提供正确性证据，不得称为运行时硬保护或数学硬断言；
-   - 如需真正 Release fail-fast，需引入额外运行时分支与异常/状态检查（带来额外运行时成本），本阶段默认不引入该成本。
+
+### 6.2 单 Run 候选集大小上限与 Debug 开发断言定性
+1. **上限事实**：对任意窗口 $[L, U)$，每个单 Run 查询的候选集大小均严格满足 `candidate_count <= raw_entries.size()`；
+2. **断言性质严格定性**：代码中的 `assert(out_indices... <= raw_entries.size())` 必须严格定性为**“Debug 开发断言”**（在 Release 模式下由编译开关 `-DNDEBUG` 彻底消除）；
+3. **严禁夸大词汇**：严禁将其称为“Release 运行时硬保护”或“数学证明”；
+4. **Release 正确性依据**：Release 模式下的行为正确性由算法不变量与单元测试全拓扑覆盖（10,000 次随机差分测试及边界端点测试）作为外围证据支持；若需 Release 模式下的运行时 fail-fast，需额外引入运行时分支与状态检查开销（本阶段默认不引入）。
+
+---
+
+## 7. M4-P1b-1.3-R1 MVCC 语义真值表与构建证据纠错审计
+
+### 7.1 序列操作全时序日志（Sequence-Ordered Operations Log）
+
+在 `AMTVLocalScanReferenceTest.P1b12_CanonicalRawWriteWitness_TwoTierVerification` 中，构建了覆盖点写、范围删除、Put 复活与归并全生命周期的时序操作日志：
+
+| 序列号 (seq) | 操作类型 (op_type) | 操作内容与描述 (description) | 语义归属 |
+| :---: | :---: | :--- | :--- |
+| **2** | `PUT` | `Put(key0004, val_v1) [initial point]` | 初始点写 |
+| **6** | `PUT` | `Put(key0124, val_x1) [initial point]` | 初始点写 |
+| **10** | `DELETE_RANGE` | `DeleteRange([key0000, key0008))` | 覆盖 `key0004` (Run 0) |
+| **11** | `DELETE_RANGE` | `DeleteRange([key0020, key0028))` | Run 0 填充 |
+| **12** | `DELETE_RANGE` | `DeleteRange([key0040, key0048))` | Run 0 填充 |
+| **13** | `DELETE_RANGE` | `DeleteRange([key0060, key0068))` | Run 0 填充 |
+| **14** | `PUT` | `Put(key0004, val_v2) [Put resurrection]` | **Put 复活写 (覆盖 key0004)** |
+| **15** | `DELETE_RANGE` | `DeleteRange([key0080, key0088))` | Run 0 填充 |
+| **16** | `DELETE_RANGE` | `DeleteRange([key0100, key0108))` | Run 0 填充 |
+| **17** | `DELETE_RANGE` | `DeleteRange([key0120, key0128))` | **覆盖 `key0124` (Run 0)** |
+| **18** | `DELETE_RANGE` | `DeleteRange([key0140, key0148))` | Run 0 封口 (size 8) |
+| **19..26** | `DELETE_RANGE` | `DeleteRange([key0160..key0300, ...))` | Run 1 封口 (size 8) |
+| **27..30** | `DELETE_RANGE` | `DeleteRange([key0320..key0380, ...))` | Open Delta 写入 (size 4) |
+
+### 7.2 Tier-1 原始墓碑多重集同构审计（Raw Multiset Parity Table）
+
+Tier-1 不受 `read_seq` 过滤，严格验证同一 MemTable 世代内 raw tombstone 多重集的一致性与不可变快照隔离性：
+
+| generation_id | snapshot_id | phase | raw_witness_count | snapshot_raw_count | multiset_match | fallback_count | merge_state |
+| :---: | :---: | :--- | :---: | :---: | :---: | :---: | :--- |
+| **1** | `snap1` | pre-merge | 16 | 16 | **TRUE** | 0 | unmerged (2) |
+| **1** | `snap2` | open-delta-extended | 20 | 20 | **TRUE** | 0 | unmerged (2+1) |
+| **1** | `snap3` | post-merge | 20 | 20 | **TRUE** | 0 | merged (1+1) |
+
+> **纠错说明**：前次测试输出中 `snap1` 的 `multiset_match` 显示为 `FALSE`，系因打印时刻错误地与追加 4 条墓碑后的 `witness.ToMultiset()` 进行比较。本次审计修复为在快照生成时刻精确捕获 `witness_snap1_multiset`（16 条），验证结果纠正为严格的 **TRUE**。
+
+### 7.3 Tier-2 MVCC 语义可见性解构真值表（Deconstructed MVCC Truth Table）
+
+依据 `material/AGENT.md` §5 规定的 8 列规范（含探测键上下文），对四类核心 MVCC 语义执行位级比对：
+
+| 探测键 (`probe_key`) | 读取序列号 (`read_seq`) | 候选点版本 (`point_value_seq`) | 最大覆盖墓碑版本 (`max_covering_tombstone_seq`) | 墓碑是否可见 (`tombstone_visible`) | 点是否被墓碑删除 (`point_deleted_by_tombstone`) | 最终点是否可见 (`final_point_visible`) | 期望读取结果 (`expected_result`) | 观察读取结果 (`observed_result`) | 语义场景分类 |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
+| `key0004` | **1** | 0 | 0 | FALSE | FALSE | FALSE | `NOT_FOUND` | `NOT_FOUND` | 点写前读 |
+| `key0004` | **5** | 2 | 0 | FALSE | FALSE | TRUE | `val_v1` | `val_v1` | **Pre-delete (墓碑在未来)** |
+| `key0004` | **13** | 2 | 10 | TRUE | TRUE | FALSE | `DELETED` | `DELETED` | **Delete-visible (墓碑覆盖点)** |
+| `key0004` | **15** | 14 | 10 | TRUE | FALSE | TRUE | `val_v2` | `val_v2` | **Put-resurrection (点复活)** |
+| `key0124` | **15** | 6 | 0 | FALSE | FALSE | TRUE | `val_x1` | `val_x1` | **Future-delete-not-visible (墓碑在未来)** |
+| `key0124` | **20** | 6 | 17 | TRUE | TRUE | FALSE | `DELETED` | `DELETED` | **Delete-visible (墓碑覆盖点)** |
+| `key0004` | **100** | 14 | 10 | TRUE | FALSE | TRUE | `val_v2` | `val_v2` | 全局后读 (复活点保持可见) |
+| `key0124` | **100** | 6 | 17 | TRUE | TRUE | FALSE | `DELETED` | `DELETED` | 全局后读 (被删点保持屏蔽) |
+
+### 7.4 关键歧义彻底澄清与消除
+
+1. **`read_seq=13, covering_seq=10` vs `read_seq=15, covering_seq=0` 的真实原因**：
+   - 在旧日志中，两行输出未标注探测键名。实际在 `read_seq=13` 探测的是 `key0004`（其覆盖墓碑在 seq 10，可见）；而在 `read_seq=15` 探测的是 `key0124`（其覆盖墓碑在 seq 17，对 read_seq=15 属于未来墓碑，不可见，故 covering_seq 为 0）。
+   - 两者探测的是不同的键，绝非同一键的覆盖墓碑序列号发生逆转。
+2. **Put 复活不改变 `max_covering_tombstone_seq`**：
+   - 对 `key0004`，在 `read_seq=15` 时，由于 seq 14 写入了 `Put(key0004, val_v2)`，使得点写版本超过墓碑版本（$14 > 10$），`point_deleted_by_tombstone` 变为 `FALSE`，点数据成功复活展示为 `val_v2`；
+   - 但覆盖该区间的墓碑仍然存在，其 `max_covering_tombstone_seq` 严格保持为 **10**，绝不等于 0。
+3. **全量墓碑穷举验证**：
+   - 单元测试对全部 20 条墓碑区间在各 `read_seq` 进行了全量循环扫描断言，确保所有条目均满足 $seq \le read\_seq$ 可见、$seq > read\_seq$ 屏蔽的严格 MVCC 语义。
 
 
