@@ -23,6 +23,7 @@
 | **RocksDB 核心代码基线** | `rocksdb-v11.8.0` | `main` | `395ce9863fc4ecef4fba75f1b9e1e2510edf45c1` | 固定的 AMTV 核心实现基线（`feat(amtv): M1c-P0 multi-run scan semantics audit and test-only differential oracle`） |
 | **M4-P0 文档提交** | `rocksdb-v11.8.0` | `main` | `8d96435a607b7824a32632fd79e7c4caf81668e3` | M4-P0 审计文档初始提交（`docs(amtv): M4-P0 local scan view source adaptation audit`） |
 | **M4-P1a.1 阶段提交** | `rocksdb-v11.8.0` | `main` | `7eacb09c556d0cfe7ebcf58948c97150428a529c` | M4-P1a.1 输出边界裁剪与独立 Oracle 修订（`feat(amtv): M4-P1a.1 output boundary clipping, 3-way oracle, and audit revision`） |
+| **M4-P1b-1.3-R1 审计提交** | `rocksdb-v11.8.0` | `main` | `b3d8f62b85844c0e006de813ccfcbff957fbc726` | M4-P1b-1.3-R1 MVCC 语义真值表、构建隔离与 Release 编译纠错 |
 | **Study 研究仓提交** | `s14-range-delete-study` | `main` | `869a25044afd1baaddf777cd27ceaa5478aa0192` | 固定的实验与基线配置（`docs(audit): fix T512 tail typography and document overall quantiles calculation method`） |
 
 - **工作树状态**：两仓在基线点均保持 clean（无未提交的脏改动）。
@@ -377,5 +378,25 @@ Tier-1 不受 `read_seq` 过滤，严格验证同一 MemTable 世代内 raw tomb
    - 但覆盖该区间的墓碑仍然存在，其 `max_covering_tombstone_seq` 严格保持为 **10**，绝不等于 0。
 3. **全量墓碑穷举验证**：
    - 单元测试对全部 20 条墓碑区间在各 `read_seq` 进行了全量循环扫描断言，确保所有条目均满足 $seq \le read\_seq$ 可见、$seq > read\_seq$ 屏蔽的严格 MVCC 语义。
+
+### 7.5 独立 Debug / Release 双工作树构建与运行证据
+
+为了彻底杜绝共享目标文件、宏污染与构建偶合，建立了两个完全隔离的 Git 工作树进行双构体验证：
+
+| 验证维度 | Debug 独立工作树 (Worktree A) | Release 独立工作树 (Worktree B) |
+| :--- | :--- | :--- |
+| **隔离工作树路径** | `/home/wam/grad/wt-debug` | `/home/wam/grad/wt-release` |
+| **代码基线 SHA** | `b3d8f62b85844c0e006de813ccfcbff957fbc726` | `b3d8f62b85844c0e006de813ccfcbff957fbc726` |
+| **工作树状态** | 独立检出，无未提交改动（Clean） | 独立检出，无未提交改动（Clean） |
+| **编译器版本** | `g++ (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0` | `g++ (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0` |
+| **构建触发命令** | `DEBUG_LEVEL=2 LIB_MODE=shared make -j$(nproc) amtv_local_scan_reference_test` | `DEBUG_LEVEL=0 LIB_MODE=shared make -j$(nproc) amtv_local_scan_reference_test` |
+| **编译开关与 `-DNDEBUG` 证据** | 包含 `-g`，无 `-O2`，**严格无 `-DNDEBUG`** | 包含 `-O2`，**显式包含 `-DNDEBUG`** |
+| **单测二进制 SHA-256** | `cc6625d8372189edec189ff12209ccbfacb59c3631fe9cb67297b76d3946d42f` | `ac5194f6ed055cacd9ae852c8852bb577b2f1eb61ab5312f35ed636c29b4d2a0` |
+| **动态库 `librocksdb.so` SHA-256** | `a75fc28f3392c965dbec038c1961537ec7924fe1ba335064bebb6546b9d08086` | `d8d2f1732e8ca6b6929b0fbbe3f9b2752c8281bff3b1fcc334ba2b1430adf76b` |
+| **动态库加载路径 (`ldd`)** | `librocksdb.so.11.8 => /home/wam/grad/wt-debug/librocksdb.so.11.8` | `librocksdb.so.11.8 => /home/wam/grad/wt-release/librocksdb.so.11.8` |
+| **单测执行结果** | 29/29 全部通过（耗时 797 ms） | 29/29 全部通过（耗时 778 ms） |
+
+> **Release 编译纠错披露**：在首次 Release 构建中，`-DNDEBUG` 消除了只在 `assert` 中引用的局部变量 `initial_indices_size`，触发 `-Werror=unused-variable` 编译失败。该问题已被正式修复（使用 `[[maybe_unused]]` 标注并合入提交 `b3d8f62b8`），证明独立 Release 构建对暴露宏副作用至关重要。
+
 
 
