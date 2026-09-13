@@ -187,7 +187,8 @@ void AMTVRunSidecarIndex::CollectIntersectingIndices(
     out_audit->span = (right >= left) ? (right - left) : 0;
   }
 
-  const size_t initial_indices_size = out_indices ? out_indices->size() : 0;
+  [[maybe_unused]] const size_t initial_indices_size =
+      out_indices ? out_indices->size() : 0;
 
   // Exact filtering on [left, right)
   for (size_t i = left; i < right; ++i) {
