@@ -6571,6 +6571,588 @@ TEST_F(AMTVLocalScanReferenceTest, P2c_0_ActiveMemTable_MultiSnapshot) {
   }
 }
 
+// ==========================================================================
+// Phase B (M4-P2c-1): Multi-Source MergingIterator Compatibility Harness
+// (Active + Immutable-like + SST-like)
+// Baseline A: Active full unbounded (nullptr, nullptr) + Immutable + SST
+// Diagnostic B: Active full bounded ([L, U)) + Immutable + SST
+// Candidate C: Active AMTV local bounded ([L, U)) + Immutable + SST
+// ==========================================================================
+class P2c1MultiSourceMergingIterHarness {
+ public:
+  using PointEntry = MergingIteratorCompatibilityHarness::PointEntry;
+
+  static bool IsObservableValid(
+      InternalIterator* iter, const Slice& L, const Slice& U, const Comparator* ucmp) {
+    if (!iter || !iter->Valid()) return false;
+    Slice k = iter->key();
+    if (k.size() < kNumInternalBytes) return false;
+    Slice uk = ExtractUserKey(k);
+    const bool has_ts = (ucmp->timestamp_size() > 0);
+    if (ucmp->CompareWithoutTimestamp(uk, has_ts, L, false) < 0) return false;
+    if (ucmp->CompareWithoutTimestamp(uk, has_ts, U, false) >= 0) return false;
+    return true;
+  }
+
+  static void PreparePoints(
+      const std::vector<PointEntry>& points,
+      const InternalKeyComparator& icmp,
+      std::vector<std::string>* out_keys,
+      std::vector<std::string>* out_values) {
+    std::vector<std::pair<std::string, std::string>> sorted_points;
+    for (const auto& p : points) {
+      InternalKey ikey(p.user_key, p.seq, p.type);
+      sorted_points.emplace_back(ikey.Encode().ToString(), p.value);
+    }
+    std::sort(sorted_points.begin(), sorted_points.end(),
+              [&](const auto& a, const auto& b) {
+                return icmp.Compare(a.first, b.first) < 0;
+              });
+    out_keys->clear();
+    out_values->clear();
+    for (const auto& kv : sorted_points) {
+      out_keys->push_back(kv.first);
+      out_values->push_back(kv.second);
+    }
+  }
+
+  static void RunMultiSourceEquivalence(
+      const std::vector<PointEntry>& active_points,
+      const CanonicalTombstoneContext& active_canonical_ctx,
+      const LocalRangeDelView& active_local_view,
+      const std::vector<PointEntry>& imm_points,
+      const CanonicalTombstoneContext& imm_canonical_ctx,
+      const std::vector<PointEntry>& sst_points,
+      const CanonicalTombstoneContext& sst_canonical_ctx,
+      const WindowSpec& window,
+      const InternalKeyComparator& icmp,
+      SequenceNumber read_seq = kMaxSequenceNumber,
+      const std::vector<std::string>& probe_targets = {},
+      const Slice* ts_upper_bound = nullptr) {
+    ASSERT_TRUE(window.IsBounded() && window.lower_bound.has_value() && window.upper_bound.has_value());
+    const auto* ucmp = icmp.user_comparator();
+    const bool has_ts = (ucmp->timestamp_size() > 0);
+    Slice L = *window.lower_bound;
+    Slice U = *window.upper_bound;
+
+    std::vector<std::string> pt_k_act, pt_v_act;
+    PreparePoints(active_points, icmp, &pt_k_act, &pt_v_act);
+
+    std::vector<std::string> pt_k_imm, pt_v_imm;
+    PreparePoints(imm_points, icmp, &pt_k_imm, &pt_v_imm);
+
+    std::vector<std::string> pt_k_sst, pt_v_sst;
+    PreparePoints(sst_points, icmp, &pt_k_sst, &pt_v_sst);
+
+    Arena arena_a, arena_b, arena_c;
+    Slice ub_slice = U;
+    if (has_ts && ub_slice.size() > ucmp->timestamp_size()) {
+      ub_slice.remove_suffix(ucmp->timestamp_size());
+    }
+
+    // ====================================================================
+    // Group A: Production Baseline
+    // Slot 0: Active MemTable (Native Unbounded: nullptr, nullptr)
+    // Slot 1: Immutable MemTable (Native Unbounded: nullptr, nullptr)
+    // Slot 2: SST-like File (Native SST-bounded: &sst_smallest, &sst_largest)
+    // ====================================================================
+    MergeIteratorBuilder builder_a(&icmp, &arena_a, false, &ub_slice);
+    auto pt_a0 = new (arena_a.AllocateAligned(sizeof(VectorIterator)))
+        VectorIterator(pt_k_act, pt_v_act, &icmp);
+    auto trunc_a0 = active_canonical_ctx.CreateNativeTruncatedRangeDelIterator(
+        icmp, read_seq, ts_upper_bound, /*force_unbounded=*/true);
+    builder_a.AddPointAndTombstoneIterator(pt_a0, std::move(trunc_a0));
+
+    auto pt_a1 = new (arena_a.AllocateAligned(sizeof(VectorIterator)))
+        VectorIterator(pt_k_imm, pt_v_imm, &icmp);
+    auto trunc_a1 = imm_canonical_ctx.CreateNativeTruncatedRangeDelIterator(
+        icmp, read_seq, ts_upper_bound, /*force_unbounded=*/true);
+    builder_a.AddPointAndTombstoneIterator(pt_a1, std::move(trunc_a1));
+
+    auto pt_a2 = new (arena_a.AllocateAligned(sizeof(VectorIterator)))
+        VectorIterator(pt_k_sst, pt_v_sst, &icmp);
+    auto trunc_a2 = sst_canonical_ctx.CreateNativeTruncatedRangeDelIterator(
+        icmp, read_seq, ts_upper_bound, /*force_unbounded=*/false);
+    builder_a.AddPointAndTombstoneIterator(pt_a2, std::move(trunc_a2));
+
+    InternalIterator* iter_a = builder_a.Finish();
+    if (read_seq < kMaxSequenceNumber) {
+      iter_a->SetRangeDelReadSeqno(read_seq);
+    }
+
+    // ====================================================================
+    // Group B: Intermediate Diagnostic Control
+    // Slot 0: Active MemTable (Native Bounded: [L, U))
+    // Slot 1: Immutable MemTable (Native Unbounded: nullptr, nullptr)
+    // Slot 2: SST-like File (Native SST-bounded: &sst_smallest, &sst_largest)
+    // ====================================================================
+    MergeIteratorBuilder builder_b(&icmp, &arena_b, false, &ub_slice);
+    auto pt_b0 = new (arena_b.AllocateAligned(sizeof(VectorIterator)))
+        VectorIterator(pt_k_act, pt_v_act, &icmp);
+    auto trunc_b0 = active_canonical_ctx.CreateNativeTruncatedRangeDelIterator(
+        icmp, read_seq, ts_upper_bound, /*force_unbounded=*/false);
+    builder_b.AddPointAndTombstoneIterator(pt_b0, std::move(trunc_b0));
+
+    auto pt_b1 = new (arena_b.AllocateAligned(sizeof(VectorIterator)))
+        VectorIterator(pt_k_imm, pt_v_imm, &icmp);
+    auto trunc_b1 = imm_canonical_ctx.CreateNativeTruncatedRangeDelIterator(
+        icmp, read_seq, ts_upper_bound, /*force_unbounded=*/true);
+    builder_b.AddPointAndTombstoneIterator(pt_b1, std::move(trunc_b1));
+
+    auto pt_b2 = new (arena_b.AllocateAligned(sizeof(VectorIterator)))
+        VectorIterator(pt_k_sst, pt_v_sst, &icmp);
+    auto trunc_b2 = sst_canonical_ctx.CreateNativeTruncatedRangeDelIterator(
+        icmp, read_seq, ts_upper_bound, /*force_unbounded=*/false);
+    builder_b.AddPointAndTombstoneIterator(pt_b2, std::move(trunc_b2));
+
+    InternalIterator* iter_b = builder_b.Finish();
+    if (read_seq < kMaxSequenceNumber) {
+      iter_b->SetRangeDelReadSeqno(read_seq);
+    }
+
+    // ====================================================================
+    // Group C: Candidate Implementation
+    // Slot 0: Active MemTable (AMTV Local Bounded: [L, U))
+    // Slot 1: Immutable MemTable (Native Unbounded: nullptr, nullptr)
+    // Slot 2: SST-like File (Native SST-bounded: &sst_smallest, &sst_largest)
+    // ====================================================================
+    MergeIteratorBuilder builder_c(&icmp, &arena_c, false, &ub_slice);
+    auto pt_c0 = new (arena_c.AllocateAligned(sizeof(VectorIterator)))
+        VectorIterator(pt_k_act, pt_v_act, &icmp);
+    auto trunc_c0 = active_local_view.CreateNativeTruncatedRangeDelIterator(
+        icmp, read_seq, ts_upper_bound);
+    builder_c.AddPointAndTombstoneIterator(pt_c0, std::move(trunc_c0));
+
+    auto pt_c1 = new (arena_c.AllocateAligned(sizeof(VectorIterator)))
+        VectorIterator(pt_k_imm, pt_v_imm, &icmp);
+    auto trunc_c1 = imm_canonical_ctx.CreateNativeTruncatedRangeDelIterator(
+        icmp, read_seq, ts_upper_bound, /*force_unbounded=*/true);
+    builder_c.AddPointAndTombstoneIterator(pt_c1, std::move(trunc_c1));
+
+    auto pt_c2 = new (arena_c.AllocateAligned(sizeof(VectorIterator)))
+        VectorIterator(pt_k_sst, pt_v_sst, &icmp);
+    auto trunc_c2 = sst_canonical_ctx.CreateNativeTruncatedRangeDelIterator(
+        icmp, read_seq, ts_upper_bound, /*force_unbounded=*/false);
+    builder_c.AddPointAndTombstoneIterator(pt_c2, std::move(trunc_c2));
+
+    InternalIterator* iter_c = builder_c.Finish();
+    if (read_seq < kMaxSequenceNumber) {
+      iter_c->SetRangeDelReadSeqno(read_seq);
+    }
+
+    // ====================================================================
+    // Track 2: Bounded Consumer Equivalence in observable domain [L, U)
+    // Primary assertion: Baseline A == Candidate C
+    // Diagnostic bridge: Baseline A == Intermediate B == Candidate C
+    // ====================================================================
+    auto assert_match = [&](const std::string& op_desc) {
+      bool v_a = IsObservableValid(iter_a, L, U, ucmp);
+      bool v_b = IsObservableValid(iter_b, L, U, ucmp);
+      bool v_c = IsObservableValid(iter_c, L, U, ucmp);
+
+      ASSERT_EQ(v_a, v_b) << op_desc << ": observable_valid mismatch between Baseline A and Diagnostic B";
+      ASSERT_EQ(v_a, v_c) << op_desc << ": observable_valid mismatch between Baseline A and Candidate C";
+
+      if (v_a) {
+        ASSERT_EQ(iter_a->key().ToString(), iter_c->key().ToString())
+            << op_desc << ": key mismatch between Baseline A and Candidate C";
+        ASSERT_EQ(iter_a->key().ToString(), iter_b->key().ToString())
+            << op_desc << ": key mismatch between Baseline A and Diagnostic B";
+        ASSERT_EQ(iter_a->value().ToString(), iter_c->value().ToString())
+            << op_desc << ": value mismatch between Baseline A and Candidate C";
+
+        ParsedInternalKey pik_a, pik_b, pik_c;
+        ASSERT_OK(ParseInternalKey(iter_a->key(), &pik_a, false));
+        ASSERT_OK(ParseInternalKey(iter_b->key(), &pik_b, false));
+        ASSERT_OK(ParseInternalKey(iter_c->key(), &pik_c, false));
+
+        ASSERT_EQ(pik_a.sequence, pik_c.sequence);
+        ASSERT_EQ(pik_a.sequence, pik_b.sequence);
+        ASSERT_EQ(pik_a.type, pik_c.type);
+        ASSERT_EQ(pik_a.type, pik_b.type);
+
+        if (has_ts) {
+          Slice ts_a = ExtractTimestampFromUserKey(pik_a.user_key, ucmp->timestamp_size());
+          Slice ts_b = ExtractTimestampFromUserKey(pik_b.user_key, ucmp->timestamp_size());
+          Slice ts_c = ExtractTimestampFromUserKey(pik_c.user_key, ucmp->timestamp_size());
+          ASSERT_EQ(ts_a.ToString(), ts_c.ToString());
+          ASSERT_EQ(ts_a.ToString(), ts_b.ToString());
+        }
+      }
+      ASSERT_OK(iter_a->status());
+      ASSERT_OK(iter_b->status());
+      ASSERT_OK(iter_c->status());
+    };
+
+    // 1. Forward Scan: DBIter begins with Seek(L)
+    InternalKey ikey_l(L, kMaxSequenceNumber, kTypeValue);
+    iter_a->Seek(ikey_l.Encode());
+    iter_b->Seek(ikey_l.Encode());
+    iter_c->Seek(ikey_l.Encode());
+
+    while (IsObservableValid(iter_a, L, U, ucmp) ||
+           IsObservableValid(iter_b, L, U, ucmp) ||
+           IsObservableValid(iter_c, L, U, ucmp)) {
+      assert_match("MultiSource Forward Scan Step");
+      iter_a->Next();
+      iter_b->Next();
+      iter_c->Next();
+    }
+    assert_match("MultiSource Forward Scan Termination");
+
+    // 2. Reverse Scan: DBIter begins with SeekForPrev(U)
+    InternalKey ikey_u(U, 0, kValueTypeForSeekForPrev);
+    iter_a->SeekForPrev(ikey_u.Encode());
+    iter_b->SeekForPrev(ikey_u.Encode());
+    iter_c->SeekForPrev(ikey_u.Encode());
+
+    auto clamp_reverse_below_u = [&](InternalIterator* it) {
+      while (it->Valid() && ucmp->CompareWithoutTimestamp(
+                 ExtractUserKey(it->key()), has_ts, U, false) >= 0) {
+        it->Prev();
+      }
+    };
+    clamp_reverse_below_u(iter_a);
+    clamp_reverse_below_u(iter_b);
+    clamp_reverse_below_u(iter_c);
+
+    while (IsObservableValid(iter_a, L, U, ucmp) ||
+           IsObservableValid(iter_b, L, U, ucmp) ||
+           IsObservableValid(iter_c, L, U, ucmp)) {
+      assert_match("MultiSource Reverse Scan Step");
+      iter_a->Prev();
+      iter_b->Prev();
+      iter_c->Prev();
+    }
+    assert_match("MultiSource Reverse Scan Termination");
+
+    // 3. Intra-window targeted seeks
+    for (const auto& target_ukey : probe_targets) {
+      if (ucmp->CompareWithoutTimestamp(target_ukey, has_ts, L, false) < 0 ||
+          ucmp->CompareWithoutTimestamp(target_ukey, has_ts, U, false) >= 0) {
+        continue;
+      }
+
+      InternalKey target_seek_ikey(target_ukey, kMaxSequenceNumber, kTypeValue);
+      iter_a->Seek(target_seek_ikey.Encode());
+      iter_b->Seek(target_seek_ikey.Encode());
+      iter_c->Seek(target_seek_ikey.Encode());
+      assert_match("MultiSource Target Seek(" + target_ukey + ")");
+
+      InternalKey target_prev_ikey(target_ukey, 0, kValueTypeForSeekForPrev);
+      iter_a->SeekForPrev(target_prev_ikey.Encode());
+      iter_b->SeekForPrev(target_prev_ikey.Encode());
+      iter_c->SeekForPrev(target_prev_ikey.Encode());
+      auto clamp_reverse_below_t = [&](InternalIterator* it) {
+        while (it->Valid() && ucmp->CompareWithoutTimestamp(
+                   ExtractUserKey(it->key()), has_ts, target_ukey, false) > 0) {
+          it->Prev();
+        }
+      };
+      clamp_reverse_below_t(iter_a);
+      clamp_reverse_below_t(iter_b);
+      clamp_reverse_below_t(iter_c);
+      assert_match("MultiSource Target SeekForPrev(" + target_ukey + ")");
+    }
+
+    iter_a->~InternalIterator();
+    iter_b->~InternalIterator();
+    iter_c->~InternalIterator();
+  }
+};
+
+// ==========================================================================
+// Phase B (M4-P2c-1): Multi-Source MergingIterator Compatibility Test Suite
+// ==========================================================================
+
+// 1. Cascading and Cross-Source Masking
+TEST_F(AMTVLocalScanReferenceTest, P2c_1_MultiSource_CascadingAndCrossSourceMasking) {
+  // Slot 0: Active MemTable (AMTV local view)
+  std::vector<std::vector<OpenDeltaEntry>> active_runs = {
+      {{"k10", "k30", 300}},
+  };
+  std::vector<OpenDeltaEntry> active_delta = {
+      {"k50", "k70", 320},
+  };
+  std::vector<OwnedRawRangeTombstone> active_all_tombstones = {
+      {"k10", "k30", 300},
+      {"k50", "k70", 320},
+  };
+  std::vector<P2c1MultiSourceMergingIterHarness::PointEntry> active_points = {
+      {"k20", 350},  // resurrected in Active over Active tombstone!
+      {"k55", 310},  // covered by delta @ 320
+      {"k80", 310},  // outside right
+  };
+
+  // Slot 1: Immutable MemTable (Native Unbounded)
+  std::vector<OwnedRawRangeTombstone> imm_tombstones = {
+      {"k25", "k45", 200},
+  };
+  std::vector<P2c1MultiSourceMergingIterHarness::PointEntry> imm_points = {
+      {"k28", 180},  // covered by Imm tombstone @ 200
+      {"k35", 210},  // resurrected in Imm over Imm tombstone @ 200!
+  };
+
+  // Slot 2: SST File (Native SST-bounded by [k00, k99])
+  WindowSpec sst_physical_window("k00", "k99");
+  std::vector<OwnedRawRangeTombstone> sst_tombstones = {
+      {"k60", "k85", 100},
+  };
+  std::vector<P2c1MultiSourceMergingIterHarness::PointEntry> sst_points = {
+      {"k15", 50},
+      {"k38", 50},  // covered by Imm tombstone @ 200
+      {"k48", 50},  // visible!
+      {"k65", 50},  // covered by SST tombstone @ 100
+      {"k72", 50},  // covered by SST tombstone @ 100
+      {"k88", 50},
+  };
+
+  WindowSpec user_window("k22", "k78");
+  std::vector<std::string> probe_targets = {"k22", "k28", "k35", "k48", "k65", "k75"};
+
+  LocalRangeDelView active_local_view(active_runs, active_delta, user_window, bytewise_icmp_);
+  auto active_canonical_ctx = CanonicalTombstoneContext::Create(active_all_tombstones, user_window, bytewise_icmp_);
+  auto imm_canonical_ctx = CanonicalTombstoneContext::Create(imm_tombstones, user_window, bytewise_icmp_);
+  auto sst_canonical_ctx = CanonicalTombstoneContext::Create(sst_tombstones, sst_physical_window, bytewise_icmp_);
+
+  P2c1MultiSourceMergingIterHarness::RunMultiSourceEquivalence(
+      active_points, active_canonical_ctx, active_local_view,
+      imm_points, imm_canonical_ctx,
+      sst_points, sst_canonical_ctx,
+      user_window, bytewise_icmp_,
+      kMaxSequenceNumber, probe_targets);
+}
+
+// 2. Put Resurrection Across Levels
+TEST_F(AMTVLocalScanReferenceTest, P2c_1_MultiSource_PutResurrectionAcrossLevels) {
+  // SST (seq 100): wide tombstone [k20, k80) @ 100
+  WindowSpec sst_physical_window("k00", "k99");
+  std::vector<OwnedRawRangeTombstone> sst_tombstones = {
+      {"k20", "k80", 100},
+  };
+  std::vector<P2c1MultiSourceMergingIterHarness::PointEntry> sst_points = {
+      {"k30", 50},  // covered by SST tombstone
+      {"k60", 50},  // covered by SST tombstone
+  };
+
+  // Immutable (seq 200): resurrected Puts at k30 and k50, tombstone [k45, k65) @ 250
+  std::vector<OwnedRawRangeTombstone> imm_tombstones = {
+      {"k45", "k65", 250},
+  };
+  std::vector<P2c1MultiSourceMergingIterHarness::PointEntry> imm_points = {
+      {"k30", 200},  // resurrected over SST tombstone (200 > 100)
+      {"k50", 200},  // resurrected over SST tombstone, but covered by Imm tombstone (200 < 250)
+  };
+
+  // Active (seq 300): resurrected Put at k50 (seq 350 > 250), tombstone [k25, k35) @ 320 (masks k30)
+  std::vector<std::vector<OpenDeltaEntry>> active_runs = {};
+  std::vector<OpenDeltaEntry> active_delta = {
+      {"k25", "k35", 320},
+  };
+  std::vector<OwnedRawRangeTombstone> active_all_tombstones = {
+      {"k25", "k35", 320},
+  };
+  std::vector<P2c1MultiSourceMergingIterHarness::PointEntry> active_points = {
+      {"k50", 350},  // resurrected in Active over Immutable tombstone!
+  };
+
+  WindowSpec user_window("k22", "k75");
+  std::vector<std::string> probe_targets = {"k25", "k30", "k40", "k50", "k60"};
+
+  LocalRangeDelView active_local_view(active_runs, active_delta, user_window, bytewise_icmp_);
+  auto active_canonical_ctx = CanonicalTombstoneContext::Create(active_all_tombstones, user_window, bytewise_icmp_);
+  auto imm_canonical_ctx = CanonicalTombstoneContext::Create(imm_tombstones, user_window, bytewise_icmp_);
+  auto sst_canonical_ctx = CanonicalTombstoneContext::Create(sst_tombstones, sst_physical_window, bytewise_icmp_);
+
+  P2c1MultiSourceMergingIterHarness::RunMultiSourceEquivalence(
+      active_points, active_canonical_ctx, active_local_view,
+      imm_points, imm_canonical_ctx,
+      sst_points, sst_canonical_ctx,
+      user_window, bytewise_icmp_,
+      kMaxSequenceNumber, probe_targets);
+}
+
+// 3. Future Tombstones and Multi-Snapshot Compatibility
+TEST_F(AMTVLocalScanReferenceTest, P2c_1_MultiSource_FutureTombstonesAndMultiSnapshot) {
+  std::vector<std::vector<OpenDeltaEntry>> active_runs = {
+      {{"k20", "k40", 250}},
+  };
+  std::vector<OpenDeltaEntry> active_delta = {
+      {"k30", "k60", 350},
+  };
+  std::vector<OwnedRawRangeTombstone> active_all_tombstones = {
+      {"k20", "k40", 250},
+      {"k30", "k60", 350},
+  };
+  std::vector<P2c1MultiSourceMergingIterHarness::PointEntry> active_points = {
+      {"k35", 280},
+  };
+
+  std::vector<OwnedRawRangeTombstone> imm_tombstones = {
+      {"k40", "k70", 180},
+  };
+  std::vector<P2c1MultiSourceMergingIterHarness::PointEntry> imm_points = {
+      {"k45", 120},
+  };
+
+  WindowSpec sst_physical_window("k00", "k99");
+  std::vector<OwnedRawRangeTombstone> sst_tombstones = {
+      {"k50", "k80", 90},
+  };
+  std::vector<P2c1MultiSourceMergingIterHarness::PointEntry> sst_points = {
+      {"k25", 60},
+      {"k55", 70},
+      {"k65", 110},
+  };
+
+  WindowSpec user_window("k20", "k75");
+  std::vector<std::string> probe_targets = {"k25", "k35", "k45", "k55", "k65"};
+
+  LocalRangeDelView active_local_view(active_runs, active_delta, user_window, bytewise_icmp_);
+  auto active_canonical_ctx = CanonicalTombstoneContext::Create(active_all_tombstones, user_window, bytewise_icmp_);
+  auto imm_canonical_ctx = CanonicalTombstoneContext::Create(imm_tombstones, user_window, bytewise_icmp_);
+  auto sst_canonical_ctx = CanonicalTombstoneContext::Create(sst_tombstones, sst_physical_window, bytewise_icmp_);
+
+  for (SequenceNumber snapshot_seq : {50, 100, 150, 200, 260, 300, 360, 400}) {
+    P2c1MultiSourceMergingIterHarness::RunMultiSourceEquivalence(
+        active_points, active_canonical_ctx, active_local_view,
+        imm_points, imm_canonical_ctx,
+        sst_points, sst_canonical_ctx,
+        user_window, bytewise_icmp_,
+        snapshot_seq, probe_targets);
+  }
+}
+
+// 4. Multi-Source User-Defined Timestamp (UDT)
+TEST_F(AMTVLocalScanReferenceTest, P2c_1_MultiSource_UserDefinedTimestamp) {
+  const Comparator* ucmp = GetBytewiseComparatorWithU64Ts();
+  InternalKeyComparator ts_icmp(ucmp);
+
+  auto encode_ts = [](uint64_t ts) {
+    std::string s;
+    PutFixed64(&s, ts);
+    return s;
+  };
+
+  std::string ts10 = encode_ts(10);
+  std::string ts20 = encode_ts(20);
+  std::string ts50 = encode_ts(50);
+  std::string ts99 = encode_ts(99);
+  std::string ts00 = encode_ts(0);
+
+  // Active (seq 300)
+  std::vector<std::vector<OpenDeltaEntry>> active_runs = {};
+  std::vector<OpenDeltaEntry> active_delta = {
+      {"k30" + ts10, "k60" + ts10, 300},
+  };
+  std::vector<OwnedRawRangeTombstone> active_all_tombstones = {
+      {"k30" + ts10, "k60" + ts10, 300},
+  };
+  std::vector<P2c1MultiSourceMergingIterHarness::PointEntry> active_points = {
+      {"k35" + ts20, 350},  // resurrected Put!
+  };
+
+  // Immutable (seq 200)
+  std::vector<OwnedRawRangeTombstone> imm_tombstones = {
+      {"k40" + ts10, "k70" + ts10, 200},
+  };
+  std::vector<P2c1MultiSourceMergingIterHarness::PointEntry> imm_points = {
+      {"k45" + ts10, 150},  // covered by Imm tombstone @ 200
+  };
+
+  // SST (seq 100)
+  WindowSpec sst_physical_window("k00" + ts00, "k99" + ts99);
+  std::vector<OwnedRawRangeTombstone> sst_tombstones = {
+      {"k20" + ts10, "k50" + ts10, 100},
+  };
+  std::vector<P2c1MultiSourceMergingIterHarness::PointEntry> sst_points = {
+      {"k25" + ts10, 50},   // covered by SST tombstone
+      {"k65" + ts10, 50},   // visible!
+  };
+
+  WindowSpec user_window("k22" + ts50, "k68" + ts50);
+  std::vector<std::string> probe_targets = {
+      "k22" + ts50, "k25" + ts10, "k35" + ts20, "k45" + ts10, "k65" + ts10, "k68" + ts50
+  };
+
+  LocalRangeDelView active_local_view(active_runs, active_delta, user_window, ts_icmp);
+  auto active_canonical_ctx = CanonicalTombstoneContext::Create(active_all_tombstones, user_window, ts_icmp);
+  auto imm_canonical_ctx = CanonicalTombstoneContext::Create(imm_tombstones, user_window, ts_icmp);
+  auto sst_canonical_ctx = CanonicalTombstoneContext::Create(sst_tombstones, sst_physical_window, ts_icmp);
+
+  P2c1MultiSourceMergingIterHarness::RunMultiSourceEquivalence(
+      active_points, active_canonical_ctx, active_local_view,
+      imm_points, imm_canonical_ctx,
+      sst_points, sst_canonical_ctx,
+      user_window, ts_icmp,
+      kMaxSequenceNumber, probe_targets);
+}
+
+// 5. Active Run Merge Equivalence
+TEST_F(AMTVLocalScanReferenceTest, P2c_1_MultiSource_ActiveRunMergeEquivalence) {
+  // Before Run Merge: 2 runs + 1 delta
+  std::vector<std::vector<OpenDeltaEntry>> active_runs_before = {
+      {{"k10", "k30", 100}},
+      {{"k25", "k50", 150}},
+  };
+  std::vector<OpenDeltaEntry> active_delta_before = {
+      {"k40", "k70", 250},
+  };
+
+  // After Run Merge: Runs compacted into a single run
+  std::vector<std::vector<OpenDeltaEntry>> active_runs_after = {
+      {{"k10", "k30", 100}, {"k25", "k50", 150}},
+  };
+  std::vector<OpenDeltaEntry> active_delta_after = {
+      {"k40", "k70", 250},
+  };
+
+  std::vector<OwnedRawRangeTombstone> active_all_tombstones = {
+      {"k10", "k30", 100},
+      {"k25", "k50", 150},
+      {"k40", "k70", 250},
+  };
+  std::vector<P2c1MultiSourceMergingIterHarness::PointEntry> active_points = {
+      {"k28", 200},  // resurrected over Run 0 (100) and Run 1 (150)
+      {"k45", 220},  // covered by Delta (250)
+      {"k55", 300},  // resurrected in Active over Delta (250)
+  };
+
+  // Immutable & SST
+  std::vector<OwnedRawRangeTombstone> imm_tombstones = {{"k35", "k65", 80}};
+  std::vector<P2c1MultiSourceMergingIterHarness::PointEntry> imm_points = {{"k38", 70}};
+
+  WindowSpec sst_physical_window("k00", "k99");
+  std::vector<OwnedRawRangeTombstone> sst_tombstones = {{"k50", "k80", 50}};
+  std::vector<P2c1MultiSourceMergingIterHarness::PointEntry> sst_points = {{"k68", 40}};
+
+  WindowSpec user_window("k20", "k75");
+  std::vector<std::string> probe_targets = {"k25", "k28", "k38", "k45", "k55", "k68"};
+
+  LocalRangeDelView active_local_view_before(active_runs_before, active_delta_before, user_window, bytewise_icmp_);
+  LocalRangeDelView active_local_view_after(active_runs_after, active_delta_after, user_window, bytewise_icmp_);
+
+  auto active_canonical_ctx = CanonicalTombstoneContext::Create(active_all_tombstones, user_window, bytewise_icmp_);
+  auto imm_canonical_ctx = CanonicalTombstoneContext::Create(imm_tombstones, user_window, bytewise_icmp_);
+  auto sst_canonical_ctx = CanonicalTombstoneContext::Create(sst_tombstones, sst_physical_window, bytewise_icmp_);
+
+  // 1. Verify before run merge against Baseline A
+  P2c1MultiSourceMergingIterHarness::RunMultiSourceEquivalence(
+      active_points, active_canonical_ctx, active_local_view_before,
+      imm_points, imm_canonical_ctx,
+      sst_points, sst_canonical_ctx,
+      user_window, bytewise_icmp_,
+      kMaxSequenceNumber, probe_targets);
+
+  // 2. Verify after run merge against Baseline A
+  P2c1MultiSourceMergingIterHarness::RunMultiSourceEquivalence(
+      active_points, active_canonical_ctx, active_local_view_after,
+      imm_points, imm_canonical_ctx,
+      sst_points, sst_canonical_ctx,
+      user_window, bytewise_icmp_,
+      kMaxSequenceNumber, probe_targets);
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
