@@ -38,6 +38,7 @@
 #include <utility>
 #include <vector>
 
+#include "db/amtv_local_scan_view.h"
 #include "db/arena_wrapped_db_iter.h"
 #include "db/attribute_group_iterator_impl.h"
 #include "db/read_path_audit.h"
@@ -2606,13 +2607,14 @@ InternalIterator* DBImpl::NewInternalIterator(
         /*for_flush=*/false);
     if (!read_options.ignore_range_deletions) {
       std::unique_ptr<TruncatedRangeDelIterator> mem_tombstone_iter;
-      std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
-          super_version->mem->NewRangeTombstoneIterator(
-              read_options, sequence, false /* immutable_memtable */));
-      if (range_del_iter != nullptr && !range_del_iter->empty()) {
-        mem_tombstone_iter = std::make_unique<TruncatedRangeDelIterator>(
-            std::move(range_del_iter), &cfd->ioptions().internal_comparator,
-            nullptr /* smallest */, nullptr /* largest */);
+      s = BuildActiveMemTableRangeDelIteratorForScan(
+          static_cast_with_check<MemTable>(super_version->mem), read_options,
+          sequence, cfd->ioptions().internal_comparator,
+          cfd->ioptions().amtv_enable_bounded_scan_view,
+          &mem_tombstone_iter);
+      if (!s.ok()) {
+        CleanupSuperVersion(super_version);
+        return NewErrorInternalIterator<Slice>(s, arena);
       }
       merge_iter_builder.AddPointAndTombstoneIterator(
           mem_iter, std::move(mem_tombstone_iter));

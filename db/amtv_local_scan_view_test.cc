@@ -406,17 +406,16 @@ TEST_F(AMTVLocalScanViewTest, FactoryFallbackInvertedBounds) {
   EXPECT_EQ(meta.fallback_reason, AMTVScanFallbackReason::kInvertedBounds);
 }
 
-TEST_F(AMTVLocalScanViewTest, FactoryFallbackImmutableMemTable) {
+TEST_F(AMTVLocalScanViewTest, FactoryActiveMemTableCallerContract) {
   OpenDB();
   MemTable* mem = GetActiveMemTable();
   ASSERT_NE(mem, nullptr);
   const auto& icmp = GetInternalKeyComparator();
 
-  ASSERT_OK(db_->DeleteRange(WriteOptions(), "k20", "k40"));
+  // Active memtable contract: mem is mutable active memtable
+  ASSERT_FALSE(mem->IsImmutable());
 
-  // Artificially mark immutable
-  mem->MarkImmutable();
-  ASSERT_TRUE(mem->IsImmutable());
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), "k20", "k40"));
 
   ReadOptions ropt;
   Slice l("k10");
@@ -433,8 +432,7 @@ TEST_F(AMTVLocalScanViewTest, FactoryFallbackImmutableMemTable) {
 
   ASSERT_OK(s);
   ASSERT_NE(out_iter, nullptr);
-  EXPECT_EQ(meta.mode, AMTVScanMode::kNativeFallback);
-  EXPECT_EQ(meta.fallback_reason, AMTVScanFallbackReason::kImmutableMemTable);
+  EXPECT_EQ(meta.mode, AMTVScanMode::kLocal);
 }
 
 TEST_F(AMTVLocalScanViewTest, FactoryFallbackAMTVFailure) {

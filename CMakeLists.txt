@@ -1464,6 +1464,7 @@ if(WITH_TESTS)
         cache/compressed_secondary_cache_test.cc
         cache/lru_cache_test.cc
         cache/tiered_secondary_cache_test.cc
+        db/amtv_db_scan_integration_test.cc
         db/amtv_local_scan_view_test.cc
         db/blob/blob_counting_iterator_test.cc
         db/blob/blob_file_addition_test.cc

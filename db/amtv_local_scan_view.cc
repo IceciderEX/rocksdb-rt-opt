@@ -26,20 +26,23 @@ bool AMTVScanIsCandidateIntersecting(const Slice& user_start_key,
   const bool has_ts = (ts_sz > 0);
 
   // Filter 0: If L >= U, the scan window [L, U) is empty.
-  if (ucmp->CompareWithoutTimestamp(*lower_bound, has_ts, *upper_bound,
-                                    has_ts) >= 0) {
+  // lower_bound and upper_bound from ReadOptions do not contain timestamps.
+  if (ucmp->CompareWithoutTimestamp(*lower_bound, /*a_has_ts=*/false,
+                                    *upper_bound, /*b_has_ts=*/false) >= 0) {
     return false;
   }
 
   // Filter 1: start < U (user_start_key < upper_bound)
-  if (ucmp->CompareWithoutTimestamp(user_start_key, has_ts, *upper_bound,
-                                    has_ts) >= 0) {
+  // user_start_key contains timestamp (if has_ts), upper_bound has no timestamp.
+  if (ucmp->CompareWithoutTimestamp(user_start_key, /*a_has_ts=*/has_ts,
+                                    *upper_bound, /*b_has_ts=*/false) >= 0) {
     return false;
   }
 
   // Filter 2: end > L (user_end_key > lower_bound)
-  if (ucmp->CompareWithoutTimestamp(user_end_key, has_ts, *lower_bound,
-                                    has_ts) <= 0) {
+  // user_end_key contains timestamp (if has_ts), lower_bound has no timestamp.
+  if (ucmp->CompareWithoutTimestamp(user_end_key, /*a_has_ts=*/has_ts,
+                                    *lower_bound, /*b_has_ts=*/false) <= 0) {
     return false;
   }
 
@@ -102,10 +105,11 @@ Status BuildActiveMemTableRangeDelIteratorForScan(
     return fallback_to_native(AMTVScanFallbackReason::kDisabled);
   }
 
-  // 2. Eligibility: Must be mutable active MemTable
-  if (memtable->IsImmutable()) {
-    return fallback_to_native(AMTVScanFallbackReason::kImmutableMemTable);
-  }
+  // 2. Eligibility: The caller (DBImpl::NewInternalIterator or
+  // ArenaWrappedDBIter::Refresh) guarantees that memtable is the active
+  // mutable memtable (super_version->mem). In debug builds, assert to prevent
+  // misusage without introducing cross-thread shared-state reads on the hot path.
+  assert(!memtable->IsImmutable());
 
   // 3. Eligibility: Both lower and upper bounds must be present
   const Slice* lower_bound = read_options.iterate_lower_bound;
@@ -117,9 +121,8 @@ Status BuildActiveMemTableRangeDelIteratorForScan(
   // 4. Eligibility: Valid positive window [L, U) where L < U
   const auto* ucmp = icmp.user_comparator();
   const size_t ts_sz = ucmp->timestamp_size();
-  const bool has_ts = (ts_sz > 0);
-  if (ucmp->CompareWithoutTimestamp(*lower_bound, has_ts, *upper_bound,
-                                    has_ts) >= 0) {
+  if (ucmp->CompareWithoutTimestamp(*lower_bound, /*a_has_ts=*/false,
+                                    *upper_bound, /*b_has_ts=*/false) >= 0) {
     return fallback_to_native(AMTVScanFallbackReason::kInvertedBounds);
   }
 
@@ -196,12 +199,8 @@ Status BuildActiveMemTableRangeDelIteratorForScan(
   std::string smallest_buf = state->lower_bound_bytes;
   std::string largest_buf = state->upper_bound_bytes;
   if (ts_sz > 0) {
-    if (smallest_buf.size() < ts_sz) {
-      smallest_buf.append(std::string(ts_sz, '\xff'));
-    }
-    if (largest_buf.size() < ts_sz) {
-      largest_buf.append(std::string(ts_sz, '\xff'));
-    }
+    smallest_buf.append(std::string(ts_sz, '\xff'));
+    largest_buf.append(std::string(ts_sz, '\xff'));
   }
   state->smallest_ikey = std::make_unique<InternalKey>(
       smallest_buf, kMaxSequenceNumber, kTypeRangeDeletion);
