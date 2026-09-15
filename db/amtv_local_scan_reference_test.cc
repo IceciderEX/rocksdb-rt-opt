@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <random>
 #include <set>
 #include <sstream>
@@ -15,6 +16,7 @@
 
 #include "db/amtv.h"
 #include "db/dbformat.h"
+#include "db/range_del_aggregator.h"
 #include "db/range_tombstone_fragmenter.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/convenience.h"
@@ -584,8 +586,8 @@ class AMTVIndependentPointwiseOracle {
   AMTVIndependentPointwiseOracle(
       const std::vector<std::vector<OpenDeltaEntry>>& runs_raw,
       const std::vector<OpenDeltaEntry>& delta_raw,
-      const Comparator* ucmp,
-      SequenceNumber read_seq,
+      const Comparator* ucmp = BytewiseComparator(),
+      SequenceNumber read_seq = kMaxSequenceNumber,
       const Slice* ts_upper_bound = nullptr)
       : ucmp_(ucmp), read_seq_(read_seq), ts_upper_bound_(ts_upper_bound) {
     for (const auto& r : runs_raw) {
@@ -931,6 +933,719 @@ inline std::vector<OpenDeltaEntry> GetSidecarIndexCandidates(
   }
   if (out_total_span) *out_total_span = tot_span;
   return result;
+}
+
+// ==========================================================================
+// AMTV M4-P2a: Test-Only Bounded Local Range Tombstone View Infrastructure
+// STRICTLY TEST-ONLY: DO NOT USE IN PRODUCTION SCAN READ PATH.
+// ==========================================================================
+
+// 1. WindowSpec
+// Represents an explicit bounding window [lower_bound, upper_bound).
+// Strictly distinguishes std::nullopt (unbounded) from "" (valid 0-byte user key).
+struct WindowSpec {
+  std::optional<std::string> lower_bound;
+  std::optional<std::string> upper_bound;
+
+  WindowSpec() = default;
+  WindowSpec(std::optional<std::string> l, std::optional<std::string> u)
+      : lower_bound(std::move(l)), upper_bound(std::move(u)) {}
+
+  bool IsBounded() const {
+    return lower_bound.has_value() && upper_bound.has_value();
+  }
+
+  bool IsValidBounded(const Comparator* ucmp) const {
+    if (!IsBounded()) return false;
+    assert(ucmp != nullptr);
+    return ucmp->CompareWithoutTimestamp(*lower_bound, false, *upper_bound, false) < 0;
+  }
+};
+
+// 2. OwnedRawRangeTombstone
+// Single canonical truth representation for a raw tombstone.
+// Holds original user keys with original timestamps (if UDT enabled) and sequence.
+// STRICT RULE: No redundant InternalKeys, duplicate sequences, or disconnected timestamps.
+struct OwnedRawRangeTombstone {
+  std::string start_key;
+  std::string end_key;
+  SequenceNumber seq = 0;
+
+  OwnedRawRangeTombstone() = default;
+  OwnedRawRangeTombstone(std::string s, std::string e, SequenceNumber sq)
+      : start_key(std::move(s)), end_key(std::move(e)), seq(sq) {}
+
+  bool operator==(const OwnedRawRangeTombstone& o) const {
+    return start_key == o.start_key && end_key == o.end_key && seq == o.seq;
+  }
+
+  std::pair<InternalKey, Slice> Serialize() const {
+    RangeTombstone rt(start_key, end_key, seq);
+    return rt.Serialize();
+  }
+};
+
+// Forward declarations
+class LocalRangeDelView;
+class WindowGuard;
+
+// 3. LocalRangeDelViewState
+// Phase 1 (Staging) -> Phase 2 (Publication as shared_ptr<const State>).
+struct LocalRangeDelViewState {
+  WindowSpec window;
+  bool is_bounded = false;
+  bool is_empty_window = false;
+  bool fallback_to_full = false;
+  size_t candidate_count = 0;
+
+  // Staging collections (frozen upon publication)
+  std::vector<OwnedRawRangeTombstone> raw_candidates;
+  std::vector<std::string> serialized_keys;
+  std::vector<std::string> serialized_values;
+
+  // Native TruncatedRangeDelIterator bounds
+  std::string smallest_key_buf;
+  std::string largest_key_buf;
+  std::unique_ptr<InternalKey> smallest_ikey;
+  std::unique_ptr<InternalKey> largest_ikey;
+
+  // Native Fragmented Range Tombstone List (shared ownership)
+  std::shared_ptr<FragmentedRangeTombstoneList> fragmented_list;
+};
+
+// 4. WindowGuard
+// Wraps native TruncatedRangeDelIterator and enforces [L, U) window contract.
+class WindowGuard : public InternalIterator {
+ public:
+  WindowGuard(std::unique_ptr<TruncatedRangeDelIterator> trunc_iter,
+              std::shared_ptr<const LocalRangeDelViewState> state,
+              const Comparator* ucmp)
+      : trunc_iter_(std::move(trunc_iter)),
+        state_(std::move(state)),
+        ucmp_(ucmp),
+        ts_sz_(ucmp ? ucmp->timestamp_size() : 0) {}
+
+  bool Valid() const override {
+    return status_.ok() && is_valid_;
+  }
+
+  Status status() const override {
+    return status_;
+  }
+
+  void SeekToFirst() override {
+    status_ = Status::OK();
+    if (state_->is_empty_window) {
+      is_valid_ = false;
+      return;
+    }
+    trunc_iter_->SeekToFirst();
+    UpdateValidity();
+  }
+
+  void SeekToLast() override {
+    status_ = Status::OK();
+    if (state_->is_empty_window) {
+      is_valid_ = false;
+      return;
+    }
+    trunc_iter_->SeekToLast();
+    if (!trunc_iter_->Valid() && state_->is_bounded && !state_->fallback_to_full) {
+      trunc_iter_->Prev();
+    }
+    UpdateValidity();
+  }
+
+  void Seek(const Slice& target) override {
+    status_ = Status::OK();
+    if (state_->is_empty_window) {
+      is_valid_ = false;
+      return;
+    }
+    const bool target_has_ts = (ts_sz_ > 0 && target.size() >= ts_sz_);
+    if (state_->is_bounded && !state_->fallback_to_full) {
+      const auto& L = state_->window.lower_bound;
+      const auto& U = state_->window.upper_bound;
+      if (L.has_value() &&
+          ucmp_->CompareWithoutTimestamp(target, target_has_ts, *L, false) < 0) {
+        status_ = Status::InvalidArgument("Seek target < lower_bound");
+        is_valid_ = false;
+        return;
+      }
+      if (U.has_value() &&
+          ucmp_->CompareWithoutTimestamp(target, target_has_ts, *U, false) >= 0) {
+        status_ = Status::InvalidArgument("Seek target >= upper_bound");
+        is_valid_ = false;
+        return;
+      }
+    }
+    std::string target_buf;
+    Slice effective_target = target;
+    if (ts_sz_ > 0 && !target_has_ts) {
+      AppendKeyWithMaxTimestamp(&target_buf, target, ts_sz_);
+      effective_target = target_buf;
+    }
+    trunc_iter_->Seek(effective_target);
+    UpdateValidity();
+  }
+
+  void SeekForPrev(const Slice& target) override {
+    status_ = Status::OK();
+    if (state_->is_empty_window) {
+      is_valid_ = false;
+      return;
+    }
+    const bool target_has_ts = (ts_sz_ > 0 && target.size() >= ts_sz_);
+    if (state_->is_bounded && !state_->fallback_to_full) {
+      const auto& L = state_->window.lower_bound;
+      const auto& U = state_->window.upper_bound;
+      if (L.has_value() &&
+          ucmp_->CompareWithoutTimestamp(target, target_has_ts, *L, false) < 0) {
+        status_ = Status::InvalidArgument("SeekForPrev target < lower_bound");
+        is_valid_ = false;
+        return;
+      }
+      if (U.has_value() &&
+          ucmp_->CompareWithoutTimestamp(target, target_has_ts, *U, false) > 0) {
+        status_ = Status::InvalidArgument("SeekForPrev target > upper_bound");
+        is_valid_ = false;
+        return;
+      }
+    }
+    std::string target_buf;
+    Slice effective_target = target;
+    if (ts_sz_ > 0 && !target_has_ts) {
+      AppendKeyWithMaxTimestamp(&target_buf, target, ts_sz_);
+      effective_target = target_buf;
+    }
+    trunc_iter_->SeekForPrev(effective_target);
+    if (!trunc_iter_->Valid() && state_->is_bounded && !state_->fallback_to_full) {
+      trunc_iter_->Prev();
+    }
+    UpdateValidity();
+  }
+
+  void Next() override {
+    assert(Valid());
+    trunc_iter_->Next();
+    UpdateValidity();
+  }
+
+  void Prev() override {
+    assert(Valid());
+    trunc_iter_->Prev();
+    UpdateValidity();
+  }
+
+  Slice key() const override {
+    assert(Valid());
+    current_key_buf_ = InternalKey(
+        trunc_iter_->start_key().user_key,
+        trunc_iter_->seq(),
+        kTypeRangeDeletion).Encode().ToString();
+    return current_key_buf_;
+  }
+
+  Slice value() const override {
+    assert(Valid());
+    return trunc_iter_->end_key().user_key;
+  }
+
+  Slice start_key() const {
+    assert(Valid());
+    return trunc_iter_->start_key().user_key;
+  }
+
+  Slice end_key() const {
+    assert(Valid());
+    return trunc_iter_->end_key().user_key;
+  }
+
+  SequenceNumber seq() const {
+    assert(Valid());
+    return trunc_iter_->seq();
+  }
+
+  Slice timestamp() const {
+    assert(Valid());
+    assert(ts_sz_ > 0);
+    return trunc_iter_->timestamp();
+  }
+
+  ClippedTombstoneFragment Fragment() const {
+    assert(Valid());
+    std::string ts_str;
+    if (ts_sz_ > 0) {
+      Slice ts = trunc_iter_->timestamp();
+      ts_str.assign(ts.data(), ts.size());
+    }
+    return ClippedTombstoneFragment(
+        trunc_iter_->start_key().user_key.ToString(),
+        trunc_iter_->end_key().user_key.ToString(),
+        trunc_iter_->seq(),
+        std::move(ts_str));
+  }
+
+ private:
+  void UpdateValidity() {
+    if (!status_.ok()) {
+      is_valid_ = false;
+      return;
+    }
+    is_valid_ = trunc_iter_->Valid();
+    if (is_valid_) {
+      const bool has_ts = (ts_sz_ > 0);
+      if (ucmp_->CompareWithoutTimestamp(
+              trunc_iter_->start_key().user_key, has_ts,
+              trunc_iter_->end_key().user_key, has_ts) >= 0) {
+        is_valid_ = false;
+      }
+    }
+  }
+
+  std::unique_ptr<TruncatedRangeDelIterator> trunc_iter_;
+  std::shared_ptr<const LocalRangeDelViewState> state_;
+  const Comparator* ucmp_;
+  size_t ts_sz_ = 0;
+  Status status_ = Status::OK();
+  bool is_valid_ = false;
+  mutable std::string current_key_buf_;
+};
+
+// 5. LocalRangeDelIteratorHandle
+// Holds the immutable State and WindowGuard.
+class LocalRangeDelIteratorHandle {
+ public:
+  LocalRangeDelIteratorHandle(
+      std::shared_ptr<const LocalRangeDelViewState> state,
+      std::unique_ptr<WindowGuard> guard)
+      : state_(std::move(state)), guard_(std::move(guard)) {}
+
+  WindowGuard* guard() { return guard_.get(); }
+  const WindowGuard* guard() const { return guard_.get(); }
+
+  std::shared_ptr<const LocalRangeDelViewState> state() const {
+    return state_;
+  }
+
+  std::vector<ClippedTombstoneFragment> ForwardStream() {
+    std::vector<ClippedTombstoneFragment> result;
+    guard_->SeekToFirst();
+    while (guard_->Valid()) {
+      result.push_back(guard_->Fragment());
+      guard_->Next();
+    }
+    return result;
+  }
+
+  std::vector<ClippedTombstoneFragment> BackwardStream() {
+    std::vector<ClippedTombstoneFragment> result;
+    guard_->SeekToLast();
+    while (guard_->Valid()) {
+      result.push_back(guard_->Fragment());
+      guard_->Prev();
+    }
+    return result;
+  }
+
+ private:
+  std::shared_ptr<const LocalRangeDelViewState> state_;
+  std::unique_ptr<WindowGuard> guard_;
+};
+
+// 6. LocalRangeDelView
+// Builds immutable state from AMTV snapshot runs and delta, and produces IteratorHandles.
+class LocalRangeDelView {
+ public:
+  using State = LocalRangeDelViewState;
+
+  LocalRangeDelView(
+      const std::vector<std::shared_ptr<const AMTVRun>>& sealed_runs,
+      const std::vector<OpenDeltaEntry>& delta_raw,
+      const WindowSpec& window,
+      const InternalKeyComparator& icmp) {
+    InitFromRunsAndDelta(sealed_runs, delta_raw, window, icmp);
+  }
+
+  LocalRangeDelView(
+      const std::vector<std::vector<OpenDeltaEntry>>& runs_raw,
+      const std::vector<OpenDeltaEntry>& delta_raw,
+      const WindowSpec& window,
+      const InternalKeyComparator& icmp) {
+    std::vector<std::shared_ptr<const AMTVRun>> sealed_runs;
+    for (size_t i = 0; i < runs_raw.size(); ++i) {
+      sealed_runs.push_back(std::make_shared<AMTVRun>(i + 1, runs_raw[i], icmp));
+    }
+    InitFromRunsAndDelta(sealed_runs, delta_raw, window, icmp);
+  }
+
+  std::shared_ptr<const State> state() const { return state_; }
+
+  std::unique_ptr<LocalRangeDelIteratorHandle> CreateIteratorHandle(
+      const InternalKeyComparator& icmp,
+      SequenceNumber read_seq = kMaxSequenceNumber,
+      const Slice* ts_upper_bound = nullptr) const {
+    std::unique_ptr<FragmentedRangeTombstoneIterator> frag_iter;
+    if (!state_->is_empty_window && !state_->raw_candidates.empty()) {
+      frag_iter = std::make_unique<FragmentedRangeTombstoneIterator>(
+          state_->fragmented_list, icmp, read_seq, ts_upper_bound);
+    } else {
+      auto empty_v = std::make_unique<VectorIterator>(
+          std::vector<std::string>{}, std::vector<std::string>{}, &icmp);
+      auto empty_list = std::make_shared<FragmentedRangeTombstoneList>(
+          std::move(empty_v), icmp);
+      frag_iter = std::make_unique<FragmentedRangeTombstoneIterator>(
+          empty_list, icmp, read_seq, ts_upper_bound);
+    }
+
+    std::unique_ptr<TruncatedRangeDelIterator> trunc_iter;
+    if (state_->is_bounded && !state_->fallback_to_full && !state_->is_empty_window) {
+      trunc_iter = std::make_unique<TruncatedRangeDelIterator>(
+          std::move(frag_iter), &icmp,
+          state_->smallest_ikey.get(), state_->largest_ikey.get());
+    } else {
+      trunc_iter = std::make_unique<TruncatedRangeDelIterator>(
+          std::move(frag_iter), &icmp, nullptr, nullptr);
+    }
+
+    auto guard = std::make_unique<WindowGuard>(
+        std::move(trunc_iter), state_, icmp.user_comparator());
+
+    return std::make_unique<LocalRangeDelIteratorHandle>(state_, std::move(guard));
+  }
+
+ private:
+  void InitFromRunsAndDelta(
+      const std::vector<std::shared_ptr<const AMTVRun>>& sealed_runs,
+      const std::vector<OpenDeltaEntry>& delta_raw,
+      const WindowSpec& window,
+      const InternalKeyComparator& icmp) {
+    auto state = std::make_shared<State>();
+    state->window = window;
+
+    const auto* ucmp = icmp.user_comparator();
+    const size_t ts_sz = ucmp->timestamp_size();
+    const bool has_ts = (ts_sz > 0);
+
+    if (!window.IsBounded()) {
+      state->fallback_to_full = true;
+      state->is_bounded = false;
+    } else {
+      state->is_bounded = true;
+      if (!window.IsValidBounded(ucmp)) {
+        state->is_empty_window = true;
+      }
+    }
+
+    if (state->is_empty_window) {
+      state->candidate_count = 0;
+    } else if (state->fallback_to_full) {
+      for (const auto& run : sealed_runs) {
+        if (!run) continue;
+        for (const auto& e : run->raw_entries) {
+          state->raw_candidates.emplace_back(e.user_start_key().ToString(), e.end_key, e.seq);
+        }
+      }
+      for (const auto& e : delta_raw) {
+        state->raw_candidates.emplace_back(e.user_start_key().ToString(), e.end_key, e.seq);
+      }
+      state->candidate_count = state->raw_candidates.size();
+    } else {
+      Slice L_slice = *window.lower_bound;
+      Slice U_slice = *window.upper_bound;
+      for (const auto& run : sealed_runs) {
+        if (!run) continue;
+        std::vector<size_t> indices;
+        AMTVRunIntervalIndexAuditInfo audit;
+        run->CollectIntersectingRawEntryIndices(&L_slice, &U_slice, icmp,
+                                                &indices, &audit);
+        for (size_t idx : indices) {
+          const auto& e = run->raw_entries[idx];
+          state->raw_candidates.emplace_back(e.user_start_key().ToString(), e.end_key, e.seq);
+        }
+      }
+      for (const auto& e : delta_raw) {
+        if (AMTVLocalScanReferenceView::IsIntersecting(e, &L_slice, &U_slice, ucmp)) {
+          state->raw_candidates.emplace_back(e.user_start_key().ToString(), e.end_key, e.seq);
+        }
+      }
+      state->candidate_count = state->raw_candidates.size();
+    }
+
+    // Sort raw_candidates by InternalKeyComparator
+    std::sort(state->raw_candidates.begin(), state->raw_candidates.end(),
+              [&icmp](const OwnedRawRangeTombstone& a, const OwnedRawRangeTombstone& b) {
+                auto key_a = a.Serialize().first;
+                auto key_b = b.Serialize().first;
+                return icmp.Compare(key_a.Encode(), key_b.Encode()) < 0;
+              });
+
+    // Serialize
+    state->serialized_keys.reserve(state->raw_candidates.size());
+    state->serialized_values.reserve(state->raw_candidates.size());
+    for (const auto& c : state->raw_candidates) {
+      auto kv = c.Serialize();
+      state->serialized_keys.push_back(kv.first.Encode().ToString());
+      state->serialized_values.push_back(kv.second.ToString());
+    }
+
+    // Prepare smallest and largest keys for TruncatedRangeDelIterator
+    if (state->is_bounded && !state->is_empty_window) {
+      if (has_ts) {
+        AppendKeyWithMaxTimestamp(&state->smallest_key_buf, *window.lower_bound, ts_sz);
+        AppendKeyWithMaxTimestamp(&state->largest_key_buf, *window.upper_bound, ts_sz);
+      } else {
+        state->smallest_key_buf = *window.lower_bound;
+        state->largest_key_buf = *window.upper_bound;
+      }
+      state->smallest_ikey = std::make_unique<InternalKey>(
+          state->smallest_key_buf, kMaxSequenceNumber, kTypeRangeDeletion);
+      state->largest_ikey = std::make_unique<InternalKey>(
+          state->largest_key_buf, kMaxSequenceNumber, kTypeRangeDeletion);
+    }
+
+    // Build native FragmentedRangeTombstoneList
+    auto v_iter = std::make_unique<VectorIterator>(
+        state->serialized_keys, state->serialized_values, &icmp);
+    state->fragmented_list = std::make_shared<FragmentedRangeTombstoneList>(
+        std::move(v_iter), icmp);
+
+    state_ = std::move(state);
+  }
+
+  std::shared_ptr<const State> state_;
+};
+
+// 7. CanonicalRangeDelTruth
+// Constructs global truth using all raw tombstones and native TruncatedRangeDelIterator.
+class CanonicalRangeDelTruth {
+ public:
+  CanonicalRangeDelTruth(
+      const std::vector<OwnedRawRangeTombstone>& all_tombstones,
+      const WindowSpec& window,
+      const InternalKeyComparator& icmp,
+      SequenceNumber read_seq = kMaxSequenceNumber,
+      const Slice* ts_upper_bound = nullptr)
+      : window_(window), icmp_(icmp), read_seq_(read_seq), ts_upper_bound_(ts_upper_bound) {
+    const auto* ucmp = icmp.user_comparator();
+    const size_t ts_sz = ucmp->timestamp_size();
+    const bool has_ts = (ts_sz > 0);
+
+    auto sorted_tombstones = all_tombstones;
+    std::sort(sorted_tombstones.begin(), sorted_tombstones.end(),
+              [&icmp](const OwnedRawRangeTombstone& a, const OwnedRawRangeTombstone& b) {
+                auto key_a = a.Serialize().first;
+                auto key_b = b.Serialize().first;
+                return icmp.Compare(key_a.Encode(), key_b.Encode()) < 0;
+              });
+
+    std::vector<std::string> keys, values;
+    keys.reserve(sorted_tombstones.size());
+    values.reserve(sorted_tombstones.size());
+    for (const auto& t : sorted_tombstones) {
+      auto kv = t.Serialize();
+      keys.push_back(kv.first.Encode().ToString());
+      values.push_back(kv.second.ToString());
+    }
+
+    auto v_iter = std::make_unique<VectorIterator>(keys, values, &icmp_);
+    frag_list_ = std::make_shared<FragmentedRangeTombstoneList>(
+        std::move(v_iter), icmp_);
+
+    if (window_.IsBounded() && window_.IsValidBounded(ucmp)) {
+      if (has_ts) {
+        AppendKeyWithMaxTimestamp(&smallest_key_buf_, *window_.lower_bound, ts_sz);
+        AppendKeyWithMaxTimestamp(&largest_key_buf_, *window_.upper_bound, ts_sz);
+      } else {
+        smallest_key_buf_ = *window_.lower_bound;
+        largest_key_buf_ = *window_.upper_bound;
+      }
+      smallest_ikey_ = std::make_unique<InternalKey>(
+          smallest_key_buf_, kMaxSequenceNumber, kTypeRangeDeletion);
+      largest_ikey_ = std::make_unique<InternalKey>(
+          largest_key_buf_, kMaxSequenceNumber, kTypeRangeDeletion);
+    }
+  }
+
+  std::vector<ClippedTombstoneFragment> ForwardStream(
+      const Slice* ts_upper_bound = nullptr) const {
+    const Slice* effective_ts = ts_upper_bound ? ts_upper_bound : ts_upper_bound_;
+    std::vector<ClippedTombstoneFragment> result;
+    auto frag_iter = std::make_unique<FragmentedRangeTombstoneIterator>(
+        frag_list_, icmp_, read_seq_, effective_ts);
+    std::unique_ptr<TruncatedRangeDelIterator> trunc_iter;
+    if (smallest_ikey_ && largest_ikey_) {
+      trunc_iter = std::make_unique<TruncatedRangeDelIterator>(
+          std::move(frag_iter), &icmp_, smallest_ikey_.get(), largest_ikey_.get());
+    } else {
+      trunc_iter = std::make_unique<TruncatedRangeDelIterator>(
+          std::move(frag_iter), &icmp_, nullptr, nullptr);
+    }
+    trunc_iter->SeekToFirst();
+    const auto* ucmp = icmp_.user_comparator();
+    const size_t ts_sz = ucmp->timestamp_size();
+    const bool has_ts = (ts_sz > 0);
+    while (trunc_iter->Valid()) {
+      if (ucmp->CompareWithoutTimestamp(
+              trunc_iter->start_key().user_key, has_ts,
+              trunc_iter->end_key().user_key, has_ts) >= 0) {
+        break;
+      }
+      std::string ts_str;
+      if (ts_sz > 0) {
+        Slice ts = trunc_iter->timestamp();
+        ts_str.assign(ts.data(), ts.size());
+      }
+      result.emplace_back(
+          trunc_iter->start_key().user_key.ToString(),
+          trunc_iter->end_key().user_key.ToString(),
+          trunc_iter->seq(),
+          std::move(ts_str));
+      trunc_iter->Next();
+    }
+    return result;
+  }
+
+  std::vector<ClippedTombstoneFragment> BackwardStream(
+      const Slice* ts_upper_bound = nullptr) const {
+    const Slice* effective_ts = ts_upper_bound ? ts_upper_bound : ts_upper_bound_;
+    std::vector<ClippedTombstoneFragment> result;
+    auto frag_iter = std::make_unique<FragmentedRangeTombstoneIterator>(
+        frag_list_, icmp_, read_seq_, effective_ts);
+    std::unique_ptr<TruncatedRangeDelIterator> trunc_iter;
+    if (smallest_ikey_ && largest_ikey_) {
+      trunc_iter = std::make_unique<TruncatedRangeDelIterator>(
+          std::move(frag_iter), &icmp_, smallest_ikey_.get(), largest_ikey_.get());
+    } else {
+      trunc_iter = std::make_unique<TruncatedRangeDelIterator>(
+          std::move(frag_iter), &icmp_, nullptr, nullptr);
+    }
+    trunc_iter->SeekToLast();
+    if (!trunc_iter->Valid() && smallest_ikey_ && largest_ikey_) {
+      trunc_iter->Prev();
+    }
+    const auto* ucmp = icmp_.user_comparator();
+    const size_t ts_sz = ucmp->timestamp_size();
+    const bool has_ts = (ts_sz > 0);
+    while (trunc_iter->Valid()) {
+      if (ucmp->CompareWithoutTimestamp(
+              trunc_iter->start_key().user_key, has_ts,
+              trunc_iter->end_key().user_key, has_ts) >= 0) {
+        break;
+      }
+      std::string ts_str;
+      if (ts_sz > 0) {
+        Slice ts = trunc_iter->timestamp();
+        ts_str.assign(ts.data(), ts.size());
+      }
+      result.emplace_back(
+          trunc_iter->start_key().user_key.ToString(),
+          trunc_iter->end_key().user_key.ToString(),
+          trunc_iter->seq(),
+          std::move(ts_str));
+      trunc_iter->Prev();
+    }
+    return result;
+  }
+
+ private:
+  WindowSpec window_;
+  InternalKeyComparator icmp_;
+  SequenceNumber read_seq_;
+  const Slice* ts_upper_bound_ = nullptr;
+  std::string smallest_key_buf_;
+  std::string largest_key_buf_;
+  std::unique_ptr<InternalKey> smallest_ikey_;
+  std::unique_ptr<InternalKey> largest_ikey_;
+  std::shared_ptr<FragmentedRangeTombstoneList> frag_list_;
+};
+
+// 8. VerifyFourWayDifferential
+// Verifies four-way differential equivalence: Local vs Canonical vs Independent Oracle vs Symmetry.
+inline void VerifyFourWayDifferential(
+    LocalRangeDelIteratorHandle* handle,
+    CanonicalRangeDelTruth* canonical_truth,
+    const AMTVIndependentPointwiseOracle& independent_oracle,
+    const WindowSpec& window,
+    const std::vector<std::string>& probe_keys,
+    const std::vector<SequenceNumber>& probe_seqs,
+    const InternalKeyComparator& icmp,
+    const Slice* ts_upper_bound = nullptr) {
+  auto local_fwd = handle->ForwardStream();
+  auto canonical_fwd = canonical_truth->ForwardStream(ts_upper_bound);
+
+  ASSERT_EQ(local_fwd.size(), canonical_fwd.size())
+      << "Stream size mismatch (Forward): Local=" << local_fwd.size()
+      << " Canonical=" << canonical_fwd.size();
+  for (size_t i = 0; i < local_fwd.size(); ++i) {
+    EXPECT_EQ(local_fwd[i], canonical_fwd[i])
+        << "Fragment mismatch at index " << i
+        << "\nLocal: " << local_fwd[i].ToString()
+        << "\nCanonical: " << canonical_fwd[i].ToString();
+  }
+
+  auto local_bwd = handle->BackwardStream();
+  auto canonical_bwd = canonical_truth->BackwardStream(ts_upper_bound);
+  ASSERT_EQ(local_bwd.size(), canonical_bwd.size())
+      << "Stream size mismatch (Backward)";
+  for (size_t i = 0; i < local_bwd.size(); ++i) {
+    EXPECT_EQ(local_bwd[i], canonical_bwd[i])
+        << "Backward fragment mismatch at index " << i;
+  }
+
+  // Symmetry: forward stream must match reversed backward stream
+  auto reversed_bwd = local_bwd;
+  std::reverse(reversed_bwd.begin(), reversed_bwd.end());
+  ASSERT_EQ(local_fwd, reversed_bwd)
+      << "Symmetry mismatch between forward and reversed backward stream";
+
+  // Boundary check: all fragments must satisfy L <= start < end <= U
+  const auto* ucmp = icmp.user_comparator();
+  const size_t ts_sz = ucmp->timestamp_size();
+  const bool has_ts = (ts_sz > 0);
+  for (const auto& frag : local_fwd) {
+    if (window.lower_bound.has_value()) {
+      EXPECT_GE(ucmp->CompareWithoutTimestamp(frag.start_key, has_ts,
+                                              *window.lower_bound, false), 0);
+    }
+    if (window.upper_bound.has_value()) {
+      EXPECT_LE(ucmp->CompareWithoutTimestamp(frag.end_key, has_ts,
+                                              *window.upper_bound, false), 0);
+    }
+  }
+
+  // Pointwise Oracle check
+  for (const auto& key : probe_keys) {
+    if (window.lower_bound.has_value() &&
+        ucmp->CompareWithoutTimestamp(key, has_ts, *window.lower_bound, false) < 0) {
+      continue;
+    }
+    if (window.upper_bound.has_value() &&
+        ucmp->CompareWithoutTimestamp(key, has_ts, *window.upper_bound, false) >= 0) {
+      continue;
+    }
+
+    SequenceNumber local_max_seq = 0;
+    for (const auto& frag : local_fwd) {
+      if (ucmp->CompareWithoutTimestamp(frag.start_key, has_ts, key, has_ts) <= 0 &&
+          ucmp->CompareWithoutTimestamp(key, has_ts, frag.end_key, has_ts) < 0) {
+        if (frag.seq > local_max_seq) {
+          local_max_seq = frag.seq;
+        }
+      }
+    }
+
+    SequenceNumber oracle_max_seq = independent_oracle.MaxCoveringTombstoneSeqnum(key);
+    EXPECT_EQ(local_max_seq, oracle_max_seq)
+        << "Pointwise Oracle max seq mismatch for key: " << key;
+
+    for (SequenceNumber pseq : probe_seqs) {
+      bool local_del = (local_max_seq > pseq);
+      bool oracle_del = independent_oracle.ShouldDelete(key, pseq);
+      EXPECT_EQ(local_del, oracle_del)
+          << "ShouldDelete mismatch for key " << key << " at seq " << pseq;
+    }
+  }
 }
 
 // ==========================================================================
@@ -3570,6 +4285,480 @@ TEST_F(AMTVLocalScanReferenceTest, P2a_B0_NativeSerializationRoundTripVerificati
     EXPECT_FALSE(iter.Valid());
   }
   std::cout << "====================================================================\n\n";
+}
+
+// --------------------------------------------------------------------------
+// P2a Test 1: WindowSpec and Boundary Distinction (nullopt vs "")
+// --------------------------------------------------------------------------
+TEST_F(AMTVLocalScanReferenceTest, P2a_WindowSpecAndBoundaryDistinction) {
+  const auto* ucmp = bytewise_icmp_.user_comparator();
+
+  // 1. Boundary distinction
+  WindowSpec unb(std::nullopt, std::nullopt);
+  EXPECT_FALSE(unb.IsBounded());
+
+  WindowSpec left_only("k10", std::nullopt);
+  EXPECT_FALSE(left_only.IsBounded());
+
+  WindowSpec right_only(std::nullopt, "k50");
+  EXPECT_FALSE(right_only.IsBounded());
+
+  // Empty string "" is a valid user key, NOT nullopt
+  WindowSpec empty_start("", "k50");
+  EXPECT_TRUE(empty_start.IsBounded());
+  EXPECT_TRUE(empty_start.IsValidBounded(ucmp));
+
+  WindowSpec inverted("k50", "k10");
+  EXPECT_TRUE(inverted.IsBounded());
+  EXPECT_FALSE(inverted.IsValidBounded(ucmp));
+
+  WindowSpec degenerate("k30", "k30");
+  EXPECT_TRUE(degenerate.IsBounded());
+  EXPECT_FALSE(degenerate.IsValidBounded(ucmp));
+
+  // 2. LocalRangeDelView behavior on unbounded vs empty window
+  std::vector<std::vector<OpenDeltaEntry>> runs = {
+      {OpenDeltaEntry("k10", "k40", 100), OpenDeltaEntry("k50", "k80", 120)},
+  };
+  std::vector<OpenDeltaEntry> delta = {OpenDeltaEntry("k30", "k60", 150)};
+
+  // Unbounded: falls back to full candidates
+  {
+    LocalRangeDelView view(runs, delta, unb, bytewise_icmp_);
+    EXPECT_TRUE(view.state()->fallback_to_full);
+    EXPECT_FALSE(view.state()->is_bounded);
+    EXPECT_EQ(view.state()->candidate_count, 3U);
+  }
+
+  // Inverted: produces empty window
+  {
+    LocalRangeDelView view(runs, delta, inverted, bytewise_icmp_);
+    EXPECT_TRUE(view.state()->is_empty_window);
+    EXPECT_EQ(view.state()->candidate_count, 0U);
+    auto handle = view.CreateIteratorHandle(bytewise_icmp_, 200);
+    handle->guard()->SeekToFirst();
+    EXPECT_FALSE(handle->guard()->Valid());
+    EXPECT_EQ(handle->ForwardStream().size(), 0U);
+  }
+}
+
+// --------------------------------------------------------------------------
+// P2a Test 2: WindowGuard Seek & SeekForPrev Boundary Contract & Rejection
+// --------------------------------------------------------------------------
+TEST_F(AMTVLocalScanReferenceTest, P2a_WindowGuardSeekRejection) {
+  std::vector<std::vector<OpenDeltaEntry>> runs = {
+      {OpenDeltaEntry("k10", "k90", 100)},
+  };
+  std::vector<OpenDeltaEntry> delta;
+  WindowSpec window("k20", "k70");
+  LocalRangeDelView view(runs, delta, window, bytewise_icmp_);
+  auto handle = view.CreateIteratorHandle(bytewise_icmp_, 200);
+  auto* guard = handle->guard();
+
+  // Forward Seek: allowed strictly L <= target < U
+  // 1. target < L ("k10"): rejected
+  guard->Seek("k10");
+  EXPECT_FALSE(guard->Valid());
+  EXPECT_TRUE(guard->status().IsInvalidArgument());
+
+  // 2. target == L ("k20"): accepted
+  guard->Seek("k20");
+  EXPECT_TRUE(guard->status().ok());
+  EXPECT_TRUE(guard->Valid());
+  EXPECT_EQ(guard->start_key(), "k20");
+
+  // 3. L < target < U ("k50"): accepted
+  guard->Seek("k50");
+  EXPECT_TRUE(guard->status().ok());
+  EXPECT_TRUE(guard->Valid());
+
+  // 4. target == U ("k70"): rejected for forward Seek
+  guard->Seek("k70");
+  EXPECT_FALSE(guard->Valid());
+  EXPECT_TRUE(guard->status().IsInvalidArgument());
+
+  // 5. target > U ("k80"): rejected
+  guard->Seek("k80");
+  EXPECT_FALSE(guard->Valid());
+  EXPECT_TRUE(guard->status().IsInvalidArgument());
+
+  // Reverse SeekForPrev: allowed strictly L <= target <= U
+  // 1. target < L ("k10"): rejected
+  guard->SeekForPrev("k10");
+  EXPECT_FALSE(guard->Valid());
+  EXPECT_TRUE(guard->status().IsInvalidArgument());
+
+  // 2. target == L ("k20"): accepted
+  guard->SeekForPrev("k20");
+  EXPECT_TRUE(guard->status().ok());
+  EXPECT_TRUE(guard->Valid());
+
+  // 3. L < target < U ("k50"): accepted
+  guard->SeekForPrev("k50");
+  EXPECT_TRUE(guard->status().ok());
+  EXPECT_TRUE(guard->Valid());
+
+  // 4. target == U ("k70"): MUST BE ACCEPTED (RocksDB SeekToLast exclusive sentinel contract!)
+  guard->SeekForPrev("k70");
+  EXPECT_TRUE(guard->status().ok());
+  EXPECT_TRUE(guard->Valid());
+  EXPECT_EQ(guard->end_key(), "k70");
+
+  // 5. target > U ("k80"): rejected
+  guard->SeekForPrev("k80");
+  EXPECT_FALSE(guard->Valid());
+  EXPECT_TRUE(guard->status().IsInvalidArgument());
+}
+
+// --------------------------------------------------------------------------
+// P2a Test 3: IteratorHandle Lifetime After View & Snapshot Destruction (Hard Test)
+// --------------------------------------------------------------------------
+TEST_F(AMTVLocalScanReferenceTest, P2a_IteratorHandleLifetimeAfterViewAndSnapshotDestruction) {
+  std::unique_ptr<LocalRangeDelIteratorHandle> handle;
+  {
+    std::vector<std::vector<OpenDeltaEntry>> runs = {
+        {OpenDeltaEntry("k10", "k50", 100), OpenDeltaEntry("k60", "k90", 150)},
+    };
+    std::vector<OpenDeltaEntry> delta = {OpenDeltaEntry("k30", "k70", 200)};
+    WindowSpec window("k20", "k80");
+    LocalRangeDelView local_view(runs, delta, window, bytewise_icmp_);
+    handle = local_view.CreateIteratorHandle(bytewise_icmp_, 250);
+    // local_view, runs, and delta go out of scope and are completely destroyed here!
+  }
+
+  ASSERT_NE(handle, nullptr);
+  auto* guard = handle->guard();
+  ASSERT_NE(guard, nullptr);
+
+  // Traverse forward using the surviving handle
+  guard->SeekToFirst();
+  std::vector<ClippedTombstoneFragment> fwd_fragments;
+  while (guard->Valid()) {
+    fwd_fragments.push_back(guard->Fragment());
+    guard->Next();
+  }
+
+  // Traverse backward using the surviving handle
+  guard->SeekToLast();
+  std::vector<ClippedTombstoneFragment> bwd_fragments;
+  while (guard->Valid()) {
+    bwd_fragments.push_back(guard->Fragment());
+    guard->Prev();
+  }
+
+  // Verify non-empty and symmetric
+  ASSERT_GT(fwd_fragments.size(), 0U);
+  auto rev_bwd = bwd_fragments;
+  std::reverse(rev_bwd.begin(), rev_bwd.end());
+  EXPECT_EQ(fwd_fragments, rev_bwd);
+
+  // Verify all fragments are within ["k20", "k80"]
+  for (const auto& frag : fwd_fragments) {
+    EXPECT_GE(frag.start_key, "k20");
+    EXPECT_LE(frag.end_key, "k80");
+  }
+}
+
+// --------------------------------------------------------------------------
+// P2a Test 4: Equal Start Key, Different End Key & Sequence
+// --------------------------------------------------------------------------
+TEST_F(AMTVLocalScanReferenceTest, P2a_EqualStartDifferentEndAndSequence) {
+  std::vector<std::vector<OpenDeltaEntry>> runs = {
+      {OpenDeltaEntry("k10", "k30", 150),
+       OpenDeltaEntry("k10", "k60", 200),
+       OpenDeltaEntry("k10", "k80", 100)},
+  };
+  std::vector<OpenDeltaEntry> delta;
+  WindowSpec window("k10", "k70");
+
+  LocalRangeDelView local_view(runs, delta, window, bytewise_icmp_);
+  auto handle = local_view.CreateIteratorHandle(bytewise_icmp_, 300);
+
+  std::vector<OwnedRawRangeTombstone> all_tombstones = {
+      OwnedRawRangeTombstone("k10", "k30", 150),
+      OwnedRawRangeTombstone("k10", "k60", 200),
+      OwnedRawRangeTombstone("k10", "k80", 100),
+  };
+  CanonicalRangeDelTruth canonical_truth(all_tombstones, window, bytewise_icmp_, 300);
+  AMTVIndependentPointwiseOracle oracle(runs, delta);
+
+  std::vector<std::string> probe_keys = {"k10", "k20", "k30", "k50", "k60", "k70"};
+  std::vector<SequenceNumber> probe_seqs = {50, 120, 180, 250};
+
+  VerifyFourWayDifferential(handle.get(), &canonical_truth, oracle, window,
+                            probe_keys, probe_seqs, bytewise_icmp_);
+}
+
+// --------------------------------------------------------------------------
+// P2a Test 5: Long Tombstones Crossing Bounds, Nested, Adjacent & Spanning
+// --------------------------------------------------------------------------
+TEST_F(AMTVLocalScanReferenceTest, P2a_LongTombstonesCrossingBounds_NestedAdjacentCrossing) {
+  std::vector<std::vector<OpenDeltaEntry>> runs = {
+      {OpenDeltaEntry("k05", "k95", 80),   // Fully spanning
+       OpenDeltaEntry("k10", "k50", 100),  // Left-crossing
+       OpenDeltaEntry("k20", "k30", 90),   // Adjacent outer left
+       OpenDeltaEntry("k35", "k45", 140),  // Nested interior
+       OpenDeltaEntry("k50", "k90", 120),  // Right-crossing
+       OpenDeltaEntry("k70", "k80", 90)},  // Adjacent outer right
+  };
+  std::vector<OpenDeltaEntry> delta;
+  WindowSpec window("k30", "k70");
+
+  LocalRangeDelView local_view(runs, delta, window, bytewise_icmp_);
+  auto handle = local_view.CreateIteratorHandle(bytewise_icmp_, 200);
+
+  std::vector<OwnedRawRangeTombstone> all_tombstones;
+  for (const auto& e : runs[0]) {
+    all_tombstones.emplace_back(e.user_start_key().ToString(), e.end_key, e.seq);
+  }
+  CanonicalRangeDelTruth canonical_truth(all_tombstones, window, bytewise_icmp_, 200);
+  AMTVIndependentPointwiseOracle oracle(runs, delta);
+
+  std::vector<std::string> probe_keys = {"k25", "k30", "k35", "k40", "k45", "k50", "k65", "k70", "k75"};
+  std::vector<SequenceNumber> probe_seqs = {70, 95, 110, 130, 150};
+
+  VerifyFourWayDifferential(handle.get(), &canonical_truth, oracle, window,
+                            probe_keys, probe_seqs, bytewise_icmp_);
+}
+
+// --------------------------------------------------------------------------
+// P2a Test 6: Multi-Level Runs (L0, L1, L2, L3) and Open Delta Candidate Reconstruction
+// --------------------------------------------------------------------------
+TEST_F(AMTVLocalScanReferenceTest, P2a_MultiLevelRuns_OpenDelta_L0_L1_L2_L3) {
+  std::vector<std::vector<OpenDeltaEntry>> runs = {
+      // L0
+      {OpenDeltaEntry("k100", "k250", 40), OpenDeltaEntry("k300", "k450", 45)},
+      // L1
+      {OpenDeltaEntry("k120", "k280", 50), OpenDeltaEntry("k320", "k480", 55)},
+      // L2
+      {OpenDeltaEntry("k050", "k200", 60), OpenDeltaEntry("k350", "k500", 65)},
+      // L3
+      {OpenDeltaEntry("k180", "k380", 70)},
+  };
+  std::vector<OpenDeltaEntry> delta = {
+      OpenDeltaEntry("k220", "k340", 80),
+  };
+  WindowSpec window("k150", "k350");
+
+  LocalRangeDelView local_view(runs, delta, window, bytewise_icmp_);
+  auto handle = local_view.CreateIteratorHandle(bytewise_icmp_, 100);
+
+  std::vector<OwnedRawRangeTombstone> all_tombstones;
+  for (const auto& run : runs) {
+    for (const auto& e : run) {
+      all_tombstones.emplace_back(e.user_start_key().ToString(), e.end_key, e.seq);
+    }
+  }
+  for (const auto& e : delta) {
+    all_tombstones.emplace_back(e.user_start_key().ToString(), e.end_key, e.seq);
+  }
+  CanonicalRangeDelTruth canonical_truth(all_tombstones, window, bytewise_icmp_, 100);
+  AMTVIndependentPointwiseOracle oracle(runs, delta);
+
+  std::vector<std::string> probe_keys = {"k150", "k180", "k220", "k250", "k280", "k300", "k330", "k350"};
+  std::vector<SequenceNumber> probe_seqs = {35, 45, 55, 65, 75, 85};
+
+  VerifyFourWayDifferential(handle.get(), &canonical_truth, oracle, window,
+                            probe_keys, probe_seqs, bytewise_icmp_);
+}
+
+// --------------------------------------------------------------------------
+// P2a Test 7: Put Resurrection & Future Tombstone MVCC Filtering at Iterator Layer
+// --------------------------------------------------------------------------
+TEST_F(AMTVLocalScanReferenceTest, P2a_PutResurrectionAndFutureTombstoneMVCC) {
+  std::vector<std::vector<OpenDeltaEntry>> runs = {
+      {OpenDeltaEntry("k10", "k50", 10),
+       OpenDeltaEntry("k20", "k60", 50),
+       OpenDeltaEntry("k30", "k70", 100),
+       OpenDeltaEntry("k40", "k80", 200)},
+  };
+  std::vector<OpenDeltaEntry> delta;
+  WindowSpec window("k15", "k75");
+  LocalRangeDelView local_view(runs, delta, window, bytewise_icmp_);
+
+  std::vector<OwnedRawRangeTombstone> all_tombstones;
+  for (const auto& e : runs[0]) {
+    all_tombstones.emplace_back(e.user_start_key().ToString(), e.end_key, e.seq);
+  }
+  std::vector<std::string> probe_keys = {"k15", "k25", "k35", "k45", "k55", "k65", "k75"};
+  std::vector<SequenceNumber> probe_seqs = {5, 15, 60, 120};
+
+  // Test multiple read_seqs using the same immutable local_view State
+  std::vector<SequenceNumber> read_seqs = {5, 20, 80, 150, 300};
+  for (SequenceNumber rseq : read_seqs) {
+    auto handle = local_view.CreateIteratorHandle(bytewise_icmp_, rseq);
+    CanonicalRangeDelTruth canonical_truth(all_tombstones, window, bytewise_icmp_, rseq);
+    AMTVIndependentPointwiseOracle oracle(runs, delta, BytewiseComparator(), rseq);
+    VerifyFourWayDifferential(handle.get(), &canonical_truth, oracle, window,
+                              probe_keys, probe_seqs, bytewise_icmp_);
+  }
+}
+
+// --------------------------------------------------------------------------
+// P2a Test 8: User-Defined Timestamp (UDT) with and without ts_upper_bound
+// --------------------------------------------------------------------------
+TEST_F(AMTVLocalScanReferenceTest, P2a_UserDefinedTimestamp_WithAndWithoutTsUpperBound) {
+  const Comparator* ucmp = GetBytewiseComparatorWithU64Ts();
+  ASSERT_NE(ucmp, nullptr);
+  InternalKeyComparator ts_icmp(ucmp);
+  const size_t ts_sz = ucmp->timestamp_size();
+  std::string dummy_ts(ts_sz, '\0');
+
+  std::string ts100, ts200, ts300, ts250;
+  PutFixed64(&ts100, 100);
+  PutFixed64(&ts200, 200);
+  PutFixed64(&ts300, 300);
+  PutFixed64(&ts250, 250);
+
+  std::vector<std::vector<OpenDeltaEntry>> runs = {
+      {OpenDeltaEntry("k10" + ts100, "k60" + ts100, 50)},
+  };
+  std::vector<OpenDeltaEntry> delta = {
+      OpenDeltaEntry("k30" + ts200, "k80" + ts200, 80),
+      OpenDeltaEntry("k50" + ts300, "k90" + ts300, 120),
+  };
+  WindowSpec window("k20", "k70");
+
+  LocalRangeDelView local_view(runs, delta, window, ts_icmp);
+  std::vector<OwnedRawRangeTombstone> all_tombstones;
+  for (const auto& e : runs[0]) {
+    all_tombstones.emplace_back(e.user_start_key().ToString(), e.end_key, e.seq);
+  }
+  for (const auto& e : delta) {
+    all_tombstones.emplace_back(e.user_start_key().ToString(), e.end_key, e.seq);
+  }
+
+  std::vector<std::string> probe_keys = {
+      "k20" + dummy_ts, "k35" + dummy_ts, "k55" + dummy_ts,
+      "k65" + dummy_ts, "k70" + dummy_ts
+  };
+  std::vector<SequenceNumber> probe_seqs = {40, 70, 100};
+
+  // Case 8a: Without ts_upper_bound (all visible)
+  {
+    AMTVIndependentPointwiseOracle oracle_8a(runs, delta, ucmp, 200, nullptr);
+    auto handle = local_view.CreateIteratorHandle(ts_icmp, 200, nullptr);
+    CanonicalRangeDelTruth canonical_truth(all_tombstones, window, ts_icmp, 200, nullptr);
+    VerifyFourWayDifferential(handle.get(), &canonical_truth, oracle_8a, window,
+                              probe_keys, probe_seqs, ts_icmp, nullptr);
+  }
+
+  // Case 8b: With ts_upper_bound = ts250 (ts300 tombstone filtered)
+  {
+    Slice ts_bound_slice(ts250);
+    AMTVIndependentPointwiseOracle oracle_8b(runs, delta, ucmp, 200, &ts_bound_slice);
+    auto handle = local_view.CreateIteratorHandle(ts_icmp, 200, &ts_bound_slice);
+    CanonicalRangeDelTruth canonical_truth(all_tombstones, window, ts_icmp, 200, &ts_bound_slice);
+    VerifyFourWayDifferential(handle.get(), &canonical_truth, oracle_8b, window,
+                              probe_keys, probe_seqs, ts_icmp, &ts_bound_slice);
+  }
+}
+
+// --------------------------------------------------------------------------
+// P2a Test 9: Empty User Key as Valid Boundary ("")
+// --------------------------------------------------------------------------
+TEST_F(AMTVLocalScanReferenceTest, P2a_EmptyUserKeyAsValidBoundary) {
+  std::vector<std::vector<OpenDeltaEntry>> runs = {
+      {OpenDeltaEntry("", "k30", 200), OpenDeltaEntry("k20", "k60", 150)},
+  };
+  std::vector<OpenDeltaEntry> delta;
+  WindowSpec window("", "k50");
+
+  LocalRangeDelView local_view(runs, delta, window, bytewise_icmp_);
+  auto handle = local_view.CreateIteratorHandle(bytewise_icmp_, 250);
+
+  std::vector<OwnedRawRangeTombstone> all_tombstones;
+  for (const auto& e : runs[0]) {
+    all_tombstones.emplace_back(e.user_start_key().ToString(), e.end_key, e.seq);
+  }
+  CanonicalRangeDelTruth canonical_truth(all_tombstones, window, bytewise_icmp_, 250);
+  AMTVIndependentPointwiseOracle oracle(runs, delta);
+
+  std::vector<std::string> probe_keys = {"", "k10", "k25", "k40", "k50"};
+  std::vector<SequenceNumber> probe_seqs = {100, 180, 220};
+
+  VerifyFourWayDifferential(handle.get(), &canonical_truth, oracle, window,
+                            probe_keys, probe_seqs, bytewise_icmp_);
+}
+
+// --------------------------------------------------------------------------
+// P2a Test 10: Old vs New Snapshot Equivalence Across Background Merge
+// --------------------------------------------------------------------------
+TEST_F(AMTVLocalScanReferenceTest, P2a_OldVsNewSnapshotEquivalence) {
+  // Old snapshot: 2 sealed runs + open delta
+  std::vector<OpenDeltaEntry> run0_entries = {
+      OpenDeltaEntry("k00", "k20", 10),
+      OpenDeltaEntry("k30", "k50", 20),
+  };
+  std::vector<OpenDeltaEntry> run1_entries = {
+      OpenDeltaEntry("k10", "k40", 30),
+      OpenDeltaEntry("k60", "k80", 40),
+  };
+  std::vector<OpenDeltaEntry> delta_entries = {
+      OpenDeltaEntry("k25", "k70", 50),
+  };
+
+  auto old_run0 = std::make_shared<AMTVRun>(1, run0_entries, bytewise_icmp_);
+  auto old_run1 = std::make_shared<AMTVRun>(2, run1_entries, bytewise_icmp_);
+  std::vector<std::shared_ptr<const AMTVRun>> old_sealed = {old_run0, old_run1};
+
+  // Perform background merge of run0 + run1 into a single run
+  std::vector<OpenDeltaEntry> merged_entries;
+  for (const auto& e : run0_entries) merged_entries.push_back(e);
+  for (const auto& e : run1_entries) merged_entries.push_back(e);
+  std::sort(merged_entries.begin(), merged_entries.end(),
+            [this](const OpenDeltaEntry& a, const OpenDeltaEntry& b) {
+              return bytewise_icmp_.Compare(a.ikey.Encode(), b.ikey.Encode()) < 0;
+            });
+  auto new_run = std::make_shared<AMTVRun>(3, merged_entries, bytewise_icmp_);
+  std::vector<std::shared_ptr<const AMTVRun>> new_sealed = {new_run};
+
+  // All tombstones for canonical truth
+  std::vector<OwnedRawRangeTombstone> all_tombstones;
+  for (const auto& e : merged_entries) {
+    all_tombstones.emplace_back(e.user_start_key().ToString(), e.end_key, e.seq);
+  }
+  for (const auto& e : delta_entries) {
+    all_tombstones.emplace_back(e.user_start_key().ToString(), e.end_key, e.seq);
+  }
+
+  std::vector<std::vector<OpenDeltaEntry>> oracle_runs = {run0_entries, run1_entries};
+  AMTVIndependentPointwiseOracle oracle(oracle_runs, delta_entries);
+
+  // Test across multiple window topologies
+  std::vector<WindowSpec> test_windows = {
+      WindowSpec("k15", "k65"),  // Interior window
+      WindowSpec("k00", "k90"),  // Full window
+      WindowSpec("k35", "k55"),  // Narrow window
+  };
+
+  std::vector<std::string> probe_keys = {"k05", "k15", "k25", "k35", "k45", "k55", "k65", "k75"};
+  std::vector<SequenceNumber> probe_seqs = {15, 25, 35, 45, 55};
+
+  for (const auto& win : test_windows) {
+    LocalRangeDelView old_view(old_sealed, delta_entries, win, bytewise_icmp_);
+    LocalRangeDelView new_view(new_sealed, delta_entries, win, bytewise_icmp_);
+    CanonicalRangeDelTruth canonical(all_tombstones, win, bytewise_icmp_, 100);
+
+    auto old_handle = old_view.CreateIteratorHandle(bytewise_icmp_, 100);
+    auto new_handle = new_view.CreateIteratorHandle(bytewise_icmp_, 100);
+
+    auto old_stream = old_handle->ForwardStream();
+    auto new_stream = new_handle->ForwardStream();
+    auto can_stream = canonical.ForwardStream();
+
+    ASSERT_EQ(old_stream.size(), new_stream.size());
+    ASSERT_EQ(old_stream.size(), can_stream.size());
+    for (size_t i = 0; i < old_stream.size(); ++i) {
+      EXPECT_EQ(old_stream[i], new_stream[i]);
+      EXPECT_EQ(old_stream[i], can_stream[i]);
+    }
+
+    VerifyFourWayDifferential(old_handle.get(), &canonical, oracle, win,
+                              probe_keys, probe_seqs, bytewise_icmp_);
+    VerifyFourWayDifferential(new_handle.get(), &canonical, oracle, win,
+                              probe_keys, probe_seqs, bytewise_icmp_);
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE
