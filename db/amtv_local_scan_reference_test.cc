@@ -3248,6 +3248,330 @@ TEST_F(AMTVLocalScanReferenceTest, P1b12_EmptyUserKeyVsUnboundedBoundaryDistinct
   }
 }
 
+// ==========================================================================
+// P2a-B0: Native Serialization Round-Trip and Byte-Level Layout Verification
+// Validates exact byte layouts, InternalKey type (kTypeRangeDeletion = 0x0F),
+// sequence number packing, value payload (end_key, NOT 8-byte seqnum),
+// round-trip parsing via ParseInternalKey/RangeTombstone, and consumption
+// through FragmentedRangeTombstoneList across 5 canonical groups.
+// ==========================================================================
+TEST_F(AMTVLocalScanReferenceTest, P2a_B0_NativeSerializationRoundTripVerification) {
+  auto HexDump = [](const Slice& s) -> std::string {
+    std::ostringstream oss;
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(s.data());
+    for (size_t i = 0; i < s.size(); ++i) {
+      if (i > 0) oss << " ";
+      oss << std::hex << std::setw(2) << std::setfill('0')
+          << static_cast<unsigned int>(p[i]);
+    }
+    return oss.str();
+  };
+
+  std::cout << "\n====================================================================\n"
+            << "P2a-B0 Native Range Tombstone Serialization Verification\n"
+            << "====================================================================\n";
+
+  // ------------------------------------------------------------------------
+  // Group 1: Standard Tombstone [k10, k50) @ seq=100
+  // ------------------------------------------------------------------------
+  {
+    std::cout << "\n--- Group 1: Standard Tombstone [k10, k50) @ seq=100 ---\n";
+    RangeTombstone rt("k10", "k50", 100);
+    auto kv = rt.Serialize();
+    Slice key_slice = kv.first.Encode();
+    Slice val_slice = kv.second;
+
+    std::cout << "Key size: " << key_slice.size() << " bytes | Hex: " << HexDump(key_slice) << "\n";
+    std::cout << "Val size: " << val_slice.size() << " bytes | Hex: " << HexDump(val_slice) << "\n";
+
+    // 1. Layout verification
+    ASSERT_EQ(key_slice.size(), 3U + 8U); // "k10" (3B) + 8B footer
+    ASSERT_EQ(val_slice.size(), 3U);      // "k50" (3B) - USER KEY, NOT 8B sequence!
+    ASSERT_EQ(ExtractUserKey(key_slice), "k10");
+    ASSERT_EQ(val_slice, "k50");
+    ASSERT_EQ(GetInternalKeySeqno(key_slice), 100U);
+    ASSERT_EQ(ExtractValueType(key_slice), kTypeRangeDeletion);
+    ASSERT_EQ(static_cast<uint8_t>(ExtractValueType(key_slice)), 0x0F);
+
+    // 2. Round-trip deserialization
+    ParsedInternalKey parsed;
+    Status s = ParseInternalKey(key_slice, &parsed, false);
+    ASSERT_TRUE(s.ok());
+    EXPECT_EQ(parsed.user_key, "k10");
+    EXPECT_EQ(parsed.sequence, 100U);
+    EXPECT_EQ(parsed.type, kTypeRangeDeletion);
+
+    RangeTombstone deserialized(parsed, val_slice);
+    EXPECT_EQ(deserialized.start_key_, "k10");
+    EXPECT_EQ(deserialized.end_key_, "k50");
+    EXPECT_EQ(deserialized.seq_, 100U);
+
+    // 3. Native fragmenter consumption
+    std::vector<std::string> keys = {key_slice.ToString()};
+    std::vector<std::string> values = {val_slice.ToString()};
+    auto v_iter = std::make_unique<VectorIterator>(keys, values, &bytewise_icmp_);
+    FragmentedRangeTombstoneList frag_list(std::move(v_iter), bytewise_icmp_);
+    FragmentedRangeTombstoneIterator iter(&frag_list, bytewise_icmp_, kMaxSequenceNumber);
+
+    iter.SeekToFirst();
+    ASSERT_TRUE(iter.Valid());
+    EXPECT_EQ(iter.start_key(), "k10");
+    EXPECT_EQ(iter.end_key(), "k50");
+    EXPECT_EQ(iter.seq(), 100U);
+    EXPECT_EQ(ExtractUserKey(iter.key()), "k10");
+    EXPECT_EQ(iter.value(), "k50");
+    EXPECT_EQ(GetInternalKeySeqno(iter.key()), 100U);
+    iter.Next();
+    EXPECT_FALSE(iter.Valid());
+  }
+
+  // ------------------------------------------------------------------------
+  // Group 2: Same Start Key, Different Sequence Numbers [k10, k30)@150, [k10, k60)@200
+  // ------------------------------------------------------------------------
+  {
+    std::cout << "\n--- Group 2: Same Start Key Different Sequence [k10, k30)@150, [k10, k60)@200 ---\n";
+    RangeTombstone rt1("k10", "k30", 150);
+    RangeTombstone rt2("k10", "k60", 200);
+
+    auto kv1 = rt1.Serialize();
+    auto kv2 = rt2.Serialize();
+
+    std::cout << "Tombstone 1 (seq=150) Key Hex: " << HexDump(kv1.first.Encode())
+              << " | Val Hex: " << HexDump(kv1.second) << "\n";
+    std::cout << "Tombstone 2 (seq=200) Key Hex: " << HexDump(kv2.first.Encode())
+              << " | Val Hex: " << HexDump(kv2.second) << "\n";
+
+    // InternalKeyComparator ordering: higher seqno must sort BEFORE lower seqno
+    EXPECT_LT(bytewise_icmp_.Compare(kv2.first.Encode(), kv1.first.Encode()), 0);
+
+    // Round-trip parse both
+    ParsedInternalKey p1, p2;
+    ASSERT_TRUE(ParseInternalKey(kv1.first.Encode(), &p1, false).ok());
+    ASSERT_TRUE(ParseInternalKey(kv2.first.Encode(), &p2, false).ok());
+    RangeTombstone d1(p1, kv1.second);
+    RangeTombstone d2(p2, kv2.second);
+    EXPECT_EQ(d1.start_key_, "k10");
+    EXPECT_EQ(d1.end_key_, "k30");
+    EXPECT_EQ(d1.seq_, 150U);
+    EXPECT_EQ(d2.start_key_, "k10");
+    EXPECT_EQ(d2.end_key_, "k60");
+    EXPECT_EQ(d2.seq_, 200U);
+
+    // Pass in sorted order to FragmentedRangeTombstoneList
+    std::vector<std::string> keys = {kv2.first.Encode().ToString(), kv1.first.Encode().ToString()};
+    std::vector<std::string> values = {kv2.second.ToString(), kv1.second.ToString()};
+    auto v_iter = std::make_unique<VectorIterator>(keys, values, &bytewise_icmp_);
+    FragmentedRangeTombstoneList frag_list(std::move(v_iter), bytewise_icmp_);
+    FragmentedRangeTombstoneIterator iter(&frag_list, bytewise_icmp_, kMaxSequenceNumber);
+
+    // Fragment 1: [k10, k30) with top seq = 200
+    iter.SeekToFirst();
+    ASSERT_TRUE(iter.Valid());
+    EXPECT_EQ(iter.start_key(), "k10");
+    EXPECT_EQ(iter.end_key(), "k30");
+    EXPECT_EQ(iter.seq(), 200U);
+
+    // Fragment 2: [k30, k60) with top seq = 200
+    iter.TopNext();
+    ASSERT_TRUE(iter.Valid());
+    EXPECT_EQ(iter.start_key(), "k30");
+    EXPECT_EQ(iter.end_key(), "k60");
+    EXPECT_EQ(iter.seq(), 200U);
+
+    iter.TopNext();
+    EXPECT_FALSE(iter.Valid());
+  }
+
+  // ------------------------------------------------------------------------
+  // Group 3: Overlapping Tombstones [k20, k70) @ 120, [k40, k90) @ 180
+  // ------------------------------------------------------------------------
+  {
+    std::cout << "\n--- Group 3: Overlapping Tombstones [k20, k70)@120, [k40, k90)@180 ---\n";
+    RangeTombstone rt1("k20", "k70", 120);
+    RangeTombstone rt2("k40", "k90", 180);
+
+    auto kv1 = rt1.Serialize();
+    auto kv2 = rt2.Serialize();
+
+    std::cout << "Overlap 1 Key: " << HexDump(kv1.first.Encode()) << " | Val: " << HexDump(kv1.second) << "\n";
+    std::cout << "Overlap 2 Key: " << HexDump(kv2.first.Encode()) << " | Val: " << HexDump(kv2.second) << "\n";
+
+    ParsedInternalKey p1, p2;
+    ASSERT_TRUE(ParseInternalKey(kv1.first.Encode(), &p1, false).ok());
+    ASSERT_TRUE(ParseInternalKey(kv2.first.Encode(), &p2, false).ok());
+    RangeTombstone d1(p1, kv1.second);
+    RangeTombstone d2(p2, kv2.second);
+    EXPECT_EQ(d1.start_key_, "k20");
+    EXPECT_EQ(d1.end_key_, "k70");
+    EXPECT_EQ(d1.seq_, 120U);
+    EXPECT_EQ(d2.start_key_, "k40");
+    EXPECT_EQ(d2.end_key_, "k90");
+    EXPECT_EQ(d2.seq_, 180U);
+
+    std::vector<std::string> keys = {kv1.first.Encode().ToString(), kv2.first.Encode().ToString()};
+    std::vector<std::string> values = {kv1.second.ToString(), kv2.second.ToString()};
+    auto v_iter = std::make_unique<VectorIterator>(keys, values, &bytewise_icmp_);
+    FragmentedRangeTombstoneList frag_list(std::move(v_iter), bytewise_icmp_);
+    FragmentedRangeTombstoneIterator iter(&frag_list, bytewise_icmp_, kMaxSequenceNumber);
+
+    // Fragment 1: [k20, k40) @ 120
+    iter.SeekToFirst();
+    ASSERT_TRUE(iter.Valid());
+    EXPECT_EQ(iter.start_key(), "k20");
+    EXPECT_EQ(iter.end_key(), "k40");
+    EXPECT_EQ(iter.seq(), 120U);
+
+    // Fragment 2: [k40, k70) @ 180 (top seq)
+    iter.TopNext();
+    ASSERT_TRUE(iter.Valid());
+    EXPECT_EQ(iter.start_key(), "k40");
+    EXPECT_EQ(iter.end_key(), "k70");
+    EXPECT_EQ(iter.seq(), 180U);
+
+    // Fragment 3: [k70, k90) @ 180
+    iter.TopNext();
+    ASSERT_TRUE(iter.Valid());
+    EXPECT_EQ(iter.start_key(), "k70");
+    EXPECT_EQ(iter.end_key(), "k90");
+    EXPECT_EQ(iter.seq(), 180U);
+
+    iter.TopNext();
+    EXPECT_FALSE(iter.Valid());
+  }
+
+  // ------------------------------------------------------------------------
+  // Group 4: Empty User Key Boundary ["", k25) @ seq=250
+  // ------------------------------------------------------------------------
+  {
+    std::cout << "\n--- Group 4: Empty User Key Boundary [\"\", k25) @ seq=250 ---\n";
+    RangeTombstone rt("", "k25", 250);
+    auto kv = rt.Serialize();
+    Slice key_slice = kv.first.Encode();
+    Slice val_slice = kv.second;
+
+    std::cout << "Empty-start Key size: " << key_slice.size() << " bytes | Hex: " << HexDump(key_slice) << "\n";
+    std::cout << "Empty-start Val size: " << val_slice.size() << " bytes | Hex: " << HexDump(val_slice) << "\n";
+
+    // Layout verification: start user key is empty, so key is EXACTLY 8 bytes!
+    ASSERT_EQ(key_slice.size(), 8U);
+    ASSERT_EQ(val_slice.size(), 3U);
+    ASSERT_TRUE(ExtractUserKey(key_slice).empty());
+    ASSERT_EQ(val_slice, "k25");
+    ASSERT_EQ(GetInternalKeySeqno(key_slice), 250U);
+    ASSERT_EQ(ExtractValueType(key_slice), kTypeRangeDeletion);
+
+    // Round-trip deserialization
+    ParsedInternalKey parsed;
+    ASSERT_TRUE(ParseInternalKey(key_slice, &parsed, false).ok());
+    EXPECT_TRUE(parsed.user_key.empty());
+    EXPECT_EQ(parsed.sequence, 250U);
+    EXPECT_EQ(parsed.type, kTypeRangeDeletion);
+
+    RangeTombstone deserialized(parsed, val_slice);
+    EXPECT_TRUE(deserialized.start_key_.empty());
+    EXPECT_EQ(deserialized.end_key_, "k25");
+    EXPECT_EQ(deserialized.seq_, 250U);
+
+    // Native fragmenter consumption
+    std::vector<std::string> keys = {key_slice.ToString()};
+    std::vector<std::string> values = {val_slice.ToString()};
+    auto v_iter = std::make_unique<VectorIterator>(keys, values, &bytewise_icmp_);
+    FragmentedRangeTombstoneList frag_list(std::move(v_iter), bytewise_icmp_);
+    FragmentedRangeTombstoneIterator iter(&frag_list, bytewise_icmp_, kMaxSequenceNumber);
+
+    iter.SeekToFirst();
+    ASSERT_TRUE(iter.Valid());
+    EXPECT_EQ(iter.start_key(), "");
+    EXPECT_EQ(iter.end_key(), "k25");
+    EXPECT_EQ(iter.seq(), 250U);
+    EXPECT_TRUE(ExtractUserKey(iter.key()).empty());
+    EXPECT_EQ(iter.value(), "k25");
+    iter.Next();
+    EXPECT_FALSE(iter.Valid());
+  }
+
+  // ------------------------------------------------------------------------
+  // Group 5: User-Defined Timestamp (UDT) Tombstone [k30+ts50, k80+ts50) @ seq=300
+  // ------------------------------------------------------------------------
+  {
+    std::cout << "\n--- Group 5: UDT Tombstone [k30+ts50, k80+ts50) @ seq=300 ---\n";
+    const Comparator* ucmp = GetBytewiseComparatorWithU64Ts();
+    ASSERT_NE(ucmp, nullptr);
+    InternalKeyComparator ts_icmp(ucmp);
+    const size_t ts_sz = ucmp->timestamp_size();
+    ASSERT_EQ(ts_sz, sizeof(uint64_t));
+
+    std::string ts50;
+    PutFixed64(&ts50, 50);
+
+    std::string sk_with_ts = "k30" + ts50;
+    std::string ek_with_ts = "k80" + ts50;
+
+    RangeTombstone rt(sk_with_ts, ek_with_ts, 300);
+    auto kv = rt.Serialize();
+    Slice key_slice = kv.first.Encode();
+    Slice val_slice = kv.second;
+
+    std::cout << "UDT Key size: " << key_slice.size() << " bytes | Hex: " << HexDump(key_slice) << "\n";
+    std::cout << "UDT Val size: " << val_slice.size() << " bytes | Hex: " << HexDump(val_slice) << "\n";
+
+    // Layout verification:
+    // Key: "k30" (3B) + ts50 (8B) + 8B footer = 19 bytes
+    // Val: "k80" (3B) + ts50 (8B) = 11 bytes (end key user string with timestamp)
+    ASSERT_EQ(key_slice.size(), 3U + ts_sz + 8U);
+    ASSERT_EQ(val_slice.size(), 3U + ts_sz);
+
+    Slice extracted_uk = ExtractUserKey(key_slice);
+    ASSERT_EQ(extracted_uk, sk_with_ts);
+    ASSERT_EQ(StripTimestampFromUserKey(extracted_uk, ts_sz), "k30");
+    ASSERT_EQ(ExtractTimestampFromUserKey(extracted_uk, ts_sz), ts50);
+
+    ASSERT_EQ(StripTimestampFromUserKey(val_slice, ts_sz), "k80");
+    ASSERT_EQ(ExtractTimestampFromUserKey(val_slice, ts_sz), ts50);
+
+    ASSERT_EQ(GetInternalKeySeqno(key_slice), 300U);
+    ASSERT_EQ(ExtractValueType(key_slice), kTypeRangeDeletion);
+
+    // Round-trip deserialization
+    ParsedInternalKey parsed;
+    ASSERT_TRUE(ParseInternalKey(key_slice, &parsed, false).ok());
+    EXPECT_EQ(parsed.user_key, sk_with_ts);
+    EXPECT_EQ(parsed.sequence, 300U);
+    EXPECT_EQ(parsed.type, kTypeRangeDeletion);
+
+    RangeTombstone deserialized(parsed, val_slice);
+    EXPECT_EQ(deserialized.start_key_, sk_with_ts);
+    EXPECT_EQ(deserialized.end_key_, ek_with_ts);
+    EXPECT_EQ(deserialized.seq_, 300U);
+
+    // Native Fragmenter consumption with UDT comparator:
+    // FragmentTombstones normalizes start and end keys in RangeTombstoneStack with max timestamp (0xFF...)
+    std::vector<std::string> keys = {key_slice.ToString()};
+    std::vector<std::string> values = {val_slice.ToString()};
+    auto v_iter = std::make_unique<VectorIterator>(keys, values, &ts_icmp);
+    FragmentedRangeTombstoneList frag_list(std::move(v_iter), ts_icmp);
+    FragmentedRangeTombstoneIterator iter(&frag_list, ts_icmp, kMaxSequenceNumber);
+
+    iter.SeekToFirst();
+    ASSERT_TRUE(iter.Valid());
+    std::string expected_kTsMax(ts_sz, static_cast<unsigned char>(0xff));
+    EXPECT_EQ(iter.start_key(), "k30" + expected_kTsMax);
+    EXPECT_EQ(iter.end_key(), "k80" + expected_kTsMax);
+    EXPECT_EQ(iter.seq(), 300U);
+    EXPECT_EQ(iter.timestamp(), ts50);
+    std::cout << "FragmentedRangeTombstoneIterator start_key (normalized with max ts): "
+              << HexDump(iter.start_key()) << "\n";
+    std::cout << "FragmentedRangeTombstoneIterator end_key (normalized with max ts): "
+              << HexDump(iter.end_key()) << "\n";
+    std::cout << "FragmentedRangeTombstoneIterator extracted timestamp(): "
+              << HexDump(iter.timestamp()) << "\n";
+
+    iter.Next();
+    EXPECT_FALSE(iter.Valid());
+  }
+  std::cout << "====================================================================\n\n";
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
