@@ -23,6 +23,7 @@
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
 #include "test_util/testharness.h"
+#include "table/merging_iterator.h"
 #include "util/coding.h"
 #include "util/vector_iterator.h"
 
@@ -1014,7 +1015,10 @@ struct LocalRangeDelViewState {
 };
 
 // 4. WindowGuard
-// Wraps native TruncatedRangeDelIterator and enforces [L, U) window contract.
+// STRICTLY TEST-ONLY VALIDATOR: Used in M4-P2a for boundary assert validation.
+// In M4-P2b (MergingIterator compatibility), MergingIterator receives pure native
+// TruncatedRangeDelIterator without this wrapper, so out-of-bounds seeks follow native
+// clamping / invalidation rules rather than returning InvalidArgument.
 class WindowGuard : public InternalIterator {
  public:
   WindowGuard(std::unique_ptr<TruncatedRangeDelIterator> trunc_iter,
@@ -1312,6 +1316,35 @@ class LocalRangeDelView {
         std::move(trunc_iter), state_, icmp.user_comparator());
 
     return std::make_unique<LocalRangeDelIteratorHandle>(state_, std::move(guard));
+  }
+
+  // Phase P2b: Directly produces a pure native TruncatedRangeDelIterator
+  // without any WindowGuard wrapper. Suitable for direct ingestion by MergingIterator.
+  std::unique_ptr<TruncatedRangeDelIterator> CreateNativeTruncatedRangeDelIterator(
+      const InternalKeyComparator& icmp,
+      SequenceNumber read_seq = kMaxSequenceNumber,
+      const Slice* ts_upper_bound = nullptr) const {
+    std::unique_ptr<FragmentedRangeTombstoneIterator> frag_iter;
+    if (!state_->is_empty_window && !state_->raw_candidates.empty()) {
+      frag_iter = std::make_unique<FragmentedRangeTombstoneIterator>(
+          state_->fragmented_list, icmp, read_seq, ts_upper_bound);
+    } else {
+      auto empty_v = std::make_unique<VectorIterator>(
+          std::vector<std::string>{}, std::vector<std::string>{}, &icmp);
+      auto empty_list = std::make_shared<FragmentedRangeTombstoneList>(
+          std::move(empty_v), icmp);
+      frag_iter = std::make_unique<FragmentedRangeTombstoneIterator>(
+          empty_list, icmp, read_seq, ts_upper_bound);
+    }
+
+    if (state_->is_bounded && !state_->fallback_to_full && !state_->is_empty_window) {
+      return std::make_unique<TruncatedRangeDelIterator>(
+          std::move(frag_iter), &icmp,
+          state_->smallest_ikey.get(), state_->largest_ikey.get());
+    } else {
+      return std::make_unique<TruncatedRangeDelIterator>(
+          std::move(frag_iter), &icmp, nullptr, nullptr);
+    }
   }
 
  private:
@@ -4946,6 +4979,877 @@ TEST_F(AMTVLocalScanReferenceTest, P2b_NativeTruncatedRangeDelIteratorBaseline) 
               << r.seq << " | " << r.notes << " |\n";
   }
   std::cout << "\n===============================================================\n\n";
+}
+
+// ==========================================================================
+// M4-P2b: MergingIterator Consumer Compatibility Verification Harness & Tests
+// ==========================================================================
+
+// 1. Predicate & Safety Eligibility Types (Requirement 7)
+enum class ScanTargetType {
+  kActiveMemTable,
+  kImmutableMemTable,
+  kSSTLevel,
+};
+
+struct ScanEligibilityContext {
+  ScanTargetType target_type = ScanTargetType::kActiveMemTable;
+  bool amtv_enabled = true;
+  std::optional<std::string> lower_bound;
+  std::optional<std::string> upper_bound;
+  const Comparator* ucmp = nullptr;
+};
+
+inline bool IsEligibleForLocalRangeDelView(const ScanEligibilityContext& ctx) {
+  // 1. Target must strictly be active mutable memtable
+  if (ctx.target_type != ScanTargetType::kActiveMemTable) {
+    return false;
+  }
+  // 2. Column Family must have AMTV enabled
+  if (!ctx.amtv_enabled) {
+    return false;
+  }
+  // 3. Both bounds must be explicitly specified (non-nullopt)
+  if (!ctx.lower_bound.has_value() || !ctx.upper_bound.has_value()) {
+    return false;
+  }
+  // 4. lower < upper (non-empty, valid interval)
+  if (ctx.ucmp == nullptr) {
+    return false;
+  }
+  const bool has_ts = (ctx.ucmp->timestamp_size() > 0);
+  if (ctx.ucmp->CompareWithoutTimestamp(
+          *ctx.lower_bound, has_ts, *ctx.upper_bound, has_ts) >= 0) {
+    return false;
+  }
+  return true;
+}
+
+// 2. CanonicalTombstoneContext
+// Owns full range tombstones, sorted and fragmented via native Fragmenter,
+// and manages smallest/largest internal keys for native TruncatedRangeDelIterator.
+struct CanonicalTombstoneContext {
+  std::shared_ptr<FragmentedRangeTombstoneList> fragmented_list;
+  std::unique_ptr<InternalKey> smallest_ikey;
+  std::unique_ptr<InternalKey> largest_ikey;
+
+  static CanonicalTombstoneContext Create(
+      const std::vector<OwnedRawRangeTombstone>& all_tombstones,
+      const WindowSpec& window,
+      const InternalKeyComparator& icmp) {
+    CanonicalTombstoneContext ctx;
+    auto sorted = all_tombstones;
+    const auto* ucmp = icmp.user_comparator();
+    const bool has_ts = (ucmp->timestamp_size() > 0);
+    std::sort(sorted.begin(), sorted.end(),
+              [&](const OwnedRawRangeTombstone& a, const OwnedRawRangeTombstone& b) {
+                int c = ucmp->CompareWithoutTimestamp(a.start_key, has_ts, b.start_key, has_ts);
+                if (c != 0) return c < 0;
+                return a.seq > b.seq;
+              });
+
+    std::vector<std::string> keys, values;
+    for (const auto& t : sorted) {
+      auto kv = t.Serialize();
+      keys.push_back(kv.first.Encode().ToString());
+      values.push_back(kv.second.ToString());
+    }
+
+    auto v_iter = std::make_unique<VectorIterator>(std::move(keys), std::move(values), &icmp);
+    ctx.fragmented_list = std::make_shared<FragmentedRangeTombstoneList>(std::move(v_iter), icmp);
+
+    if (window.IsBounded() && window.IsValidBounded(ucmp)) {
+      const size_t ts_sz = ucmp->timestamp_size();
+      std::string smallest_buf = *window.lower_bound;
+      std::string largest_buf = *window.upper_bound;
+      if (ts_sz > 0) {
+        if (smallest_buf.size() < ts_sz) {
+          smallest_buf.append(std::string(ts_sz, '\xff'));
+        }
+        if (largest_buf.size() < ts_sz) {
+          largest_buf.append(std::string(ts_sz, '\xff'));
+        }
+      }
+      ctx.smallest_ikey = std::make_unique<InternalKey>(
+          smallest_buf, kMaxSequenceNumber, kTypeRangeDeletion);
+      ctx.largest_ikey = std::make_unique<InternalKey>(
+          largest_buf, kMaxSequenceNumber, kTypeRangeDeletion);
+    }
+    return ctx;
+  }
+
+  std::unique_ptr<TruncatedRangeDelIterator> CreateNativeTruncatedRangeDelIterator(
+      const InternalKeyComparator& icmp,
+      SequenceNumber read_seq = kMaxSequenceNumber,
+      const Slice* ts_upper_bound = nullptr) const {
+    auto frag_iter = std::make_unique<FragmentedRangeTombstoneIterator>(
+        fragmented_list, icmp, read_seq, ts_upper_bound);
+    if (smallest_ikey && largest_ikey) {
+      return std::make_unique<TruncatedRangeDelIterator>(
+          std::move(frag_iter), &icmp, smallest_ikey.get(), largest_ikey.get());
+    } else {
+      return std::make_unique<TruncatedRangeDelIterator>(
+          std::move(frag_iter), &icmp, nullptr, nullptr);
+    }
+  }
+};
+
+// 3. MergingIteratorCompatibilityHarness
+// Compares Group A (Native-full) and Group B (AMTV-local) in real MergingIterator.
+class MergingIteratorCompatibilityHarness {
+ public:
+  struct PointEntry {
+    std::string user_key;
+    SequenceNumber seq = 0;
+    ValueType type = kTypeValue;
+    std::string value;
+
+    PointEntry(std::string ukey, SequenceNumber s, ValueType t = kTypeValue, std::string v = "")
+        : user_key(std::move(ukey)), seq(s), type(t), value(std::move(v)) {
+      if (value.empty()) {
+        value = "val_" + user_key;
+      }
+    }
+  };
+
+  struct ComparisonStepRecord {
+    std::string op;
+    std::string target_desc;
+    bool valid = false;
+    Status status;
+    std::string key;
+    std::string value;
+    SequenceNumber seq = 0;
+    std::string timestamp;
+  };
+
+  static void RunDifferentialComparison(
+      const std::vector<PointEntry>& points,
+      const CanonicalTombstoneContext& canonical_ctx,
+      const LocalRangeDelView& local_view,
+      const WindowSpec& /*window*/,
+      const InternalKeyComparator& icmp,
+      SequenceNumber read_seq,
+      const std::vector<std::string>& probe_targets,
+      const Slice* iterate_upper_bound = nullptr,
+      const Slice* ts_upper_bound = nullptr,
+      std::vector<ComparisonStepRecord>* out_trace = nullptr) {
+    const auto* ucmp = icmp.user_comparator();
+
+    // 1. Sort point entries according to icmp
+    std::vector<std::pair<std::string, std::string>> sorted_points;
+    for (const auto& p : points) {
+      InternalKey ikey(p.user_key, p.seq, p.type);
+      sorted_points.emplace_back(ikey.Encode().ToString(), p.value);
+    }
+    std::sort(sorted_points.begin(), sorted_points.end(),
+              [&](const auto& a, const auto& b) {
+                return icmp.Compare(a.first, b.first) < 0;
+              });
+
+    std::vector<std::string> pt_keys_a, pt_vals_a;
+    std::vector<std::string> pt_keys_b, pt_vals_b;
+    for (const auto& kv : sorted_points) {
+      pt_keys_a.push_back(kv.first);
+      pt_vals_a.push_back(kv.second);
+      pt_keys_b.push_back(kv.first);
+      pt_vals_b.push_back(kv.second);
+    }
+
+    // 2. Build Group A (Native-full) MergingIterator
+    Arena arena_a;
+    auto point_iter_a = new (arena_a.AllocateAligned(sizeof(VectorIterator)))
+        VectorIterator(std::move(pt_keys_a), std::move(pt_vals_a), &icmp);
+    auto trunc_iter_a = canonical_ctx.CreateNativeTruncatedRangeDelIterator(
+        icmp, read_seq, ts_upper_bound);
+
+    MergeIteratorBuilder builder_a(&icmp, &arena_a, false /* prefix_seek */,
+                                   iterate_upper_bound);
+    builder_a.AddPointAndTombstoneIterator(point_iter_a, std::move(trunc_iter_a));
+    InternalIterator* merge_iter_a = builder_a.Finish();
+    if (read_seq < kMaxSequenceNumber) {
+      merge_iter_a->SetRangeDelReadSeqno(read_seq);
+    }
+
+    // 3. Build Group B (AMTV-local) MergingIterator
+    Arena arena_b;
+    auto point_iter_b = new (arena_b.AllocateAligned(sizeof(VectorIterator)))
+        VectorIterator(std::move(pt_keys_b), std::move(pt_vals_b), &icmp);
+    auto trunc_iter_b = local_view.CreateNativeTruncatedRangeDelIterator(
+        icmp, read_seq, ts_upper_bound);
+
+    MergeIteratorBuilder builder_b(&icmp, &arena_b, false /* prefix_seek */,
+                                   iterate_upper_bound);
+    builder_b.AddPointAndTombstoneIterator(point_iter_b, std::move(trunc_iter_b));
+    InternalIterator* merge_iter_b = builder_b.Finish();
+    if (read_seq < kMaxSequenceNumber) {
+      merge_iter_b->SetRangeDelReadSeqno(read_seq);
+    }
+
+    // 4. Differential Verification Routine
+    auto assert_match = [&](const std::string& op, const std::string& target_desc) {
+      ASSERT_EQ(merge_iter_a->Valid(), merge_iter_b->Valid())
+          << "Valid mismatch in op '" << op << "' with target '" << target_desc
+          << "': Native=" << merge_iter_a->Valid() << ", AMTV=" << merge_iter_b->Valid();
+      ASSERT_EQ(merge_iter_a->status().code(), merge_iter_b->status().code())
+          << "Status mismatch in op '" << op << "' with target '" << target_desc << "'";
+
+      if (merge_iter_a->Valid()) {
+        ASSERT_EQ(merge_iter_a->key().ToString(true), merge_iter_b->key().ToString(true))
+            << "Key mismatch in op '" << op << "' with target '" << target_desc << "'";
+        ASSERT_EQ(merge_iter_a->value().ToString(true), merge_iter_b->value().ToString(true))
+            << "Value mismatch in op '" << op << "' with target '" << target_desc << "'";
+
+        ParsedInternalKey pik_a, pik_b;
+        ParseInternalKey(merge_iter_a->key(), &pik_a, false).PermitUncheckedError();
+        ParseInternalKey(merge_iter_b->key(), &pik_b, false).PermitUncheckedError();
+        ASSERT_EQ(pik_a.sequence, pik_b.sequence)
+            << "Seq mismatch in op '" << op << "' with target '" << target_desc << "'";
+        ASSERT_EQ(pik_a.type, pik_b.type)
+            << "Type mismatch in op '" << op << "' with target '" << target_desc << "'";
+
+        const size_t ts_sz = ucmp->timestamp_size();
+        if (ts_sz > 0 && pik_a.user_key.size() >= ts_sz) {
+          Slice ts_a = ExtractTimestampFromUserKey(pik_a.user_key, ts_sz);
+          Slice ts_b = ExtractTimestampFromUserKey(pik_b.user_key, ts_sz);
+          ASSERT_EQ(ts_a.ToString(true), ts_b.ToString(true))
+              << "Timestamp mismatch in op '" << op << "' with target '" << target_desc << "'";
+        }
+
+        if (out_trace) {
+          ComparisonStepRecord rec;
+          rec.op = op;
+          rec.target_desc = target_desc;
+          rec.valid = true;
+          rec.status = merge_iter_a->status();
+          rec.key = merge_iter_a->key().ToString(true);
+          rec.value = merge_iter_a->value().ToString(true);
+          rec.seq = pik_a.sequence;
+          if (ts_sz > 0 && pik_a.user_key.size() >= ts_sz) {
+            rec.timestamp = ExtractTimestampFromUserKey(pik_a.user_key, ts_sz).ToString(true);
+          }
+          out_trace->push_back(std::move(rec));
+        }
+      } else {
+        if (out_trace) {
+          ComparisonStepRecord rec;
+          rec.op = op;
+          rec.target_desc = target_desc;
+          rec.valid = false;
+          rec.status = merge_iter_a->status();
+          out_trace->push_back(std::move(rec));
+        }
+      }
+    };
+
+    // 4a. Forward Scan: SeekToFirst() followed by sequential Next()
+    merge_iter_a->SeekToFirst();
+    merge_iter_b->SeekToFirst();
+    assert_match("SeekToFirst", "-");
+    while (merge_iter_a->Valid() && merge_iter_b->Valid()) {
+      merge_iter_a->Next();
+      merge_iter_b->Next();
+      assert_match("Next", "-");
+    }
+    ASSERT_EQ(merge_iter_a->Valid(), merge_iter_b->Valid())
+        << "Forward scan completion mismatch";
+
+    // 4b. Reverse Scan: SeekToLast() followed by sequential Prev()
+    merge_iter_a->SeekToLast();
+    merge_iter_b->SeekToLast();
+    assert_match("SeekToLast", "-");
+    while (merge_iter_a->Valid() && merge_iter_b->Valid()) {
+      merge_iter_a->Prev();
+      merge_iter_b->Prev();
+      assert_match("Prev", "-");
+    }
+    ASSERT_EQ(merge_iter_a->Valid(), merge_iter_b->Valid())
+        << "Reverse scan completion mismatch";
+
+    // 4c. Targeted Forward Seeks: Seek(target)
+    for (const auto& target_ukey : probe_targets) {
+      InternalKey target_ikey(target_ukey, read_seq, kValueTypeForSeek);
+      merge_iter_a->Seek(target_ikey.Encode());
+      merge_iter_b->Seek(target_ikey.Encode());
+      assert_match("Seek", target_ukey);
+    }
+
+    // 4d. Targeted Reverse Seeks: SeekForPrev(target)
+    for (const auto& target_ukey : probe_targets) {
+      InternalKey target_ikey(target_ukey, 0, kValueTypeForSeekForPrev);
+      merge_iter_a->SeekForPrev(target_ikey.Encode());
+      merge_iter_b->SeekForPrev(target_ikey.Encode());
+      assert_match("SeekForPrev", target_ukey);
+    }
+
+    // 5. Explicitly destruct MergingIterators before arena teardown
+    merge_iter_a->~InternalIterator();
+    merge_iter_b->~InternalIterator();
+  }
+};
+
+// ==========================================================================
+// P2b Test Cases: MergingIterator Consumer Compatibility Verification
+// ==========================================================================
+
+TEST_F(AMTVLocalScanReferenceTest, P2b_SafetyEligibilityPredicate) {
+  const Comparator* ucmp = BytewiseComparator();
+
+  // 1. Active MemTable + AMTV enabled + both bounds + L < U -> Local
+  {
+    ScanEligibilityContext ctx;
+    ctx.target_type = ScanTargetType::kActiveMemTable;
+    ctx.amtv_enabled = true;
+    ctx.lower_bound = "k10";
+    ctx.upper_bound = "k50";
+    ctx.ucmp = ucmp;
+    EXPECT_TRUE(IsEligibleForLocalRangeDelView(ctx));
+  }
+  // 2. Unbounded (both nullopt) -> Native
+  {
+    ScanEligibilityContext ctx;
+    ctx.target_type = ScanTargetType::kActiveMemTable;
+    ctx.amtv_enabled = true;
+    ctx.lower_bound = std::nullopt;
+    ctx.upper_bound = std::nullopt;
+    ctx.ucmp = ucmp;
+    EXPECT_FALSE(IsEligibleForLocalRangeDelView(ctx));
+  }
+  // 3. Single lower bound -> Native
+  {
+    ScanEligibilityContext ctx;
+    ctx.target_type = ScanTargetType::kActiveMemTable;
+    ctx.amtv_enabled = true;
+    ctx.lower_bound = "k10";
+    ctx.upper_bound = std::nullopt;
+    ctx.ucmp = ucmp;
+    EXPECT_FALSE(IsEligibleForLocalRangeDelView(ctx));
+  }
+  // 4. Single upper bound -> Native
+  {
+    ScanEligibilityContext ctx;
+    ctx.target_type = ScanTargetType::kActiveMemTable;
+    ctx.amtv_enabled = true;
+    ctx.lower_bound = std::nullopt;
+    ctx.upper_bound = "k50";
+    ctx.ucmp = ucmp;
+    EXPECT_FALSE(IsEligibleForLocalRangeDelView(ctx));
+  }
+  // 5. Inverted window (L > U) -> Native
+  {
+    ScanEligibilityContext ctx;
+    ctx.target_type = ScanTargetType::kActiveMemTable;
+    ctx.amtv_enabled = true;
+    ctx.lower_bound = "k50";
+    ctx.upper_bound = "k10";
+    ctx.ucmp = ucmp;
+    EXPECT_FALSE(IsEligibleForLocalRangeDelView(ctx));
+  }
+  // 6. Empty window (L == U) -> Native
+  {
+    ScanEligibilityContext ctx;
+    ctx.target_type = ScanTargetType::kActiveMemTable;
+    ctx.amtv_enabled = true;
+    ctx.lower_bound = "k20";
+    ctx.upper_bound = "k20";
+    ctx.ucmp = ucmp;
+    EXPECT_FALSE(IsEligibleForLocalRangeDelView(ctx));
+  }
+  // 7. AMTV disabled -> Native
+  {
+    ScanEligibilityContext ctx;
+    ctx.target_type = ScanTargetType::kActiveMemTable;
+    ctx.amtv_enabled = false;
+    ctx.lower_bound = "k10";
+    ctx.upper_bound = "k50";
+    ctx.ucmp = ucmp;
+    EXPECT_FALSE(IsEligibleForLocalRangeDelView(ctx));
+  }
+  // 8. Immutable MemTable -> Native
+  {
+    ScanEligibilityContext ctx;
+    ctx.target_type = ScanTargetType::kImmutableMemTable;
+    ctx.amtv_enabled = true;
+    ctx.lower_bound = "k10";
+    ctx.upper_bound = "k50";
+    ctx.ucmp = ucmp;
+    EXPECT_FALSE(IsEligibleForLocalRangeDelView(ctx));
+  }
+  // 9. SST Level -> Native
+  {
+    ScanEligibilityContext ctx;
+    ctx.target_type = ScanTargetType::kSSTLevel;
+    ctx.amtv_enabled = true;
+    ctx.lower_bound = "k10";
+    ctx.upper_bound = "k50";
+    ctx.ucmp = ucmp;
+    EXPECT_FALSE(IsEligibleForLocalRangeDelView(ctx));
+  }
+  // 10. UDT enabled: L < U -> Local
+  {
+    const Comparator* ts_ucmp = GetBytewiseComparatorWithU64Ts();
+    std::string ts1, ts2;
+    PutFixed64(&ts1, 100);
+    PutFixed64(&ts2, 200);
+    ScanEligibilityContext ctx;
+    ctx.target_type = ScanTargetType::kActiveMemTable;
+    ctx.amtv_enabled = true;
+    ctx.lower_bound = "k10" + ts1;
+    ctx.upper_bound = "k50" + ts2;
+    ctx.ucmp = ts_ucmp;
+    EXPECT_TRUE(IsEligibleForLocalRangeDelView(ctx));
+  }
+  // 11. UDT enabled: L >= U -> Native
+  {
+    const Comparator* ts_ucmp = GetBytewiseComparatorWithU64Ts();
+    std::string ts1, ts2;
+    PutFixed64(&ts1, 100);
+    PutFixed64(&ts2, 200);
+    ScanEligibilityContext ctx;
+    ctx.target_type = ScanTargetType::kActiveMemTable;
+    ctx.amtv_enabled = true;
+    ctx.lower_bound = "k50" + ts1;
+    ctx.upper_bound = "k10" + ts2;
+    ctx.ucmp = ts_ucmp;
+    EXPECT_FALSE(IsEligibleForLocalRangeDelView(ctx));
+  }
+}
+
+TEST_F(AMTVLocalScanReferenceTest, P2b_MergingIter_LongTombstonesCrossingBounds) {
+  WindowSpec window("k30", "k70");
+
+  std::vector<std::vector<OpenDeltaEntry>> runs = {
+      {OpenDeltaEntry("k10", "k45", 100)},  // left crossing
+  };
+  std::vector<OpenDeltaEntry> delta = {
+      OpenDeltaEntry("k55", "k90", 120),  // right crossing
+      OpenDeltaEntry("k05", "k95", 80),   // full crossing
+  };
+
+  LocalRangeDelView local_view(runs, delta, window, bytewise_icmp_);
+  std::vector<OwnedRawRangeTombstone> all_tombstones = {
+      {"k10", "k45", 100},
+      {"k55", "k90", 120},
+      {"k05", "k95", 80},
+  };
+  auto canonical_ctx = CanonicalTombstoneContext::Create(
+      all_tombstones, window, bytewise_icmp_);
+
+  std::vector<MergingIteratorCompatibilityHarness::PointEntry> points = {
+      {"k08", 90},
+      {"k20", 70},
+      {"k30", 90},
+      {"k40", 90},
+      {"k50", 90},
+      {"k60", 110},
+      {"k70", 110},
+      {"k85", 110},
+  };
+
+  std::vector<std::string> probe_targets = {
+      "k05", "k20", "k30", "k40", "k50", "k60", "k70", "k85", "k99"};
+
+  std::vector<MergingIteratorCompatibilityHarness::ComparisonStepRecord> trace;
+  MergingIteratorCompatibilityHarness::RunDifferentialComparison(
+      points, canonical_ctx, local_view, window, bytewise_icmp_,
+      kMaxSequenceNumber, probe_targets, nullptr, nullptr, &trace);
+
+  EXPECT_GT(trace.size(), 0U);
+}
+
+TEST_F(AMTVLocalScanReferenceTest, P2b_MergingIter_OverlappingAndNestedTombstones) {
+  WindowSpec window("k20", "k80");
+
+  std::vector<std::vector<OpenDeltaEntry>> runs = {
+      {OpenDeltaEntry("k15", "k50", 100), OpenDeltaEntry("k35", "k65", 150)},
+  };
+  std::vector<OpenDeltaEntry> delta = {
+      OpenDeltaEntry("k50", "k85", 120),
+      OpenDeltaEntry("k25", "k75", 90),
+      OpenDeltaEntry("k40", "k60", 180),
+  };
+
+  LocalRangeDelView local_view(runs, delta, window, bytewise_icmp_);
+  std::vector<OwnedRawRangeTombstone> all_tombstones = {
+      {"k15", "k50", 100},
+      {"k35", "k65", 150},
+      {"k50", "k85", 120},
+      {"k25", "k75", 90},
+      {"k40", "k60", 180},
+  };
+  auto canonical_ctx = CanonicalTombstoneContext::Create(
+      all_tombstones, window, bytewise_icmp_);
+
+  std::vector<MergingIteratorCompatibilityHarness::PointEntry> points = {
+      {"k18", 95},
+      {"k22", 80},
+      {"k28", 95},
+      {"k42", 160},
+      {"k42", 190},  // resurrected!
+      {"k55", 140},
+      {"k70", 100},
+      {"k78", 110},
+      {"k82", 110},
+  };
+
+  std::vector<std::string> probe_targets = {
+      "k15", "k20", "k22", "k28", "k42", "k55", "k70", "k78", "k80", "k90"};
+
+  std::vector<MergingIteratorCompatibilityHarness::ComparisonStepRecord> trace;
+  MergingIteratorCompatibilityHarness::RunDifferentialComparison(
+      points, canonical_ctx, local_view, window, bytewise_icmp_,
+      kMaxSequenceNumber, probe_targets, nullptr, nullptr, &trace);
+
+  EXPECT_GT(trace.size(), 0U);
+}
+
+TEST_F(AMTVLocalScanReferenceTest, P2b_MergingIter_AdjacentTombstones) {
+  WindowSpec window("k30", "k70");
+
+  std::vector<std::vector<OpenDeltaEntry>> runs = {
+      {OpenDeltaEntry("k30", "k50", 120), OpenDeltaEntry("k50", "k70", 130)},
+  };
+  std::vector<OpenDeltaEntry> delta = {
+      OpenDeltaEntry("k30", "k45", 100),
+      OpenDeltaEntry("k45", "k60", 110),
+      OpenDeltaEntry("k60", "k70", 120),
+  };
+
+  LocalRangeDelView local_view(runs, delta, window, bytewise_icmp_);
+  std::vector<OwnedRawRangeTombstone> all_tombstones = {
+      {"k30", "k50", 120},
+      {"k50", "k70", 130},
+      {"k30", "k45", 100},
+      {"k45", "k60", 110},
+      {"k60", "k70", 120},
+  };
+  auto canonical_ctx = CanonicalTombstoneContext::Create(
+      all_tombstones, window, bytewise_icmp_);
+
+  std::vector<MergingIteratorCompatibilityHarness::PointEntry> points = {
+      {"k30", 110},
+      {"k35", 105},
+      {"k35", 140},  // resurrected!
+      {"k45", 105},
+      {"k50", 125},
+      {"k55", 140},  // resurrected!
+      {"k60", 115},
+      {"k65", 115},
+      {"k70", 120},
+  };
+
+  std::vector<std::string> probe_targets = {
+      "k10", "k25", "k30", "k35", "k45", "k50", "k55", "k60", "k65", "k70", "k75", "k90"};
+
+  std::vector<MergingIteratorCompatibilityHarness::ComparisonStepRecord> trace;
+  MergingIteratorCompatibilityHarness::RunDifferentialComparison(
+      points, canonical_ctx, local_view, window, bytewise_icmp_,
+      kMaxSequenceNumber, probe_targets, nullptr, nullptr, &trace);
+
+  EXPECT_GT(trace.size(), 0U);
+}
+
+TEST_F(AMTVLocalScanReferenceTest, P2b_MergingIter_EqualStartDifferentSequence) {
+  WindowSpec window("k20", "k80");
+
+  std::vector<std::vector<OpenDeltaEntry>> runs = {
+      {OpenDeltaEntry("k30", "k40", 80), OpenDeltaEntry("k30", "k50", 140)},
+  };
+  std::vector<OpenDeltaEntry> delta = {
+      OpenDeltaEntry("k30", "k60", 110),
+  };
+
+  LocalRangeDelView local_view(runs, delta, window, bytewise_icmp_);
+  std::vector<OwnedRawRangeTombstone> all_tombstones = {
+      {"k30", "k40", 80},
+      {"k30", "k50", 140},
+      {"k30", "k60", 110},
+  };
+  auto canonical_ctx = CanonicalTombstoneContext::Create(
+      all_tombstones, window, bytewise_icmp_);
+
+  std::vector<MergingIteratorCompatibilityHarness::PointEntry> points = {
+      {"k25", 100},
+      {"k35", 100},
+      {"k45", 120},
+      {"k55", 100},
+      {"k55", 130},  // resurrected above seq 110 (after k50 where 140 ends)
+      {"k65", 100},
+      {"k75", 100},
+  };
+
+  std::vector<std::string> probe_targets = {
+      "k20", "k25", "k30", "k35", "k45", "k55", "k65", "k75", "k80"};
+
+  std::vector<MergingIteratorCompatibilityHarness::ComparisonStepRecord> trace;
+  MergingIteratorCompatibilityHarness::RunDifferentialComparison(
+      points, canonical_ctx, local_view, window, bytewise_icmp_,
+      kMaxSequenceNumber, probe_targets, nullptr, nullptr, &trace);
+
+  EXPECT_GT(trace.size(), 0U);
+}
+
+TEST_F(AMTVLocalScanReferenceTest, P2b_MergingIter_FutureTombstonesAndMultiSnapshot) {
+  WindowSpec window("k20", "k80");
+
+  std::vector<std::vector<OpenDeltaEntry>> runs = {
+      {OpenDeltaEntry("k25", "k55", 60), OpenDeltaEntry("k35", "k65", 110)},
+  };
+  std::vector<OpenDeltaEntry> delta = {
+      OpenDeltaEntry("k45", "k75", 160),
+      OpenDeltaEntry("k50", "k70", 210),
+  };
+
+  LocalRangeDelView local_view(runs, delta, window, bytewise_icmp_);
+  std::vector<OwnedRawRangeTombstone> all_tombstones = {
+      {"k25", "k55", 60},
+      {"k35", "k65", 110},
+      {"k45", "k75", 160},
+      {"k50", "k70", 210},
+  };
+  auto canonical_ctx = CanonicalTombstoneContext::Create(
+      all_tombstones, window, bytewise_icmp_);
+
+  std::vector<MergingIteratorCompatibilityHarness::PointEntry> points = {
+      {"k30", 50},
+      {"k30", 70},
+      {"k40", 90},
+      {"k40", 130},
+      {"k50", 140},
+      {"k50", 180},
+      {"k60", 150},
+      {"k60", 220},
+  };
+
+  std::vector<std::string> probe_targets = {
+      "k20", "k25", "k30", "k40", "k50", "k60", "k70", "k75", "k80"};
+
+  // Test across multiple snapshot read_seqs: 80, 130, 180, 250
+  std::vector<SequenceNumber> test_snapshots = {80, 130, 180, 250};
+  for (SequenceNumber read_seq : test_snapshots) {
+    std::vector<MergingIteratorCompatibilityHarness::ComparisonStepRecord> trace;
+    MergingIteratorCompatibilityHarness::RunDifferentialComparison(
+        points, canonical_ctx, local_view, window, bytewise_icmp_,
+        read_seq, probe_targets, nullptr, nullptr, &trace);
+    EXPECT_GT(trace.size(), 0U);
+  }
+}
+
+TEST_F(AMTVLocalScanReferenceTest, P2b_MergingIter_PutResurrection) {
+  WindowSpec window("k30", "k70");
+
+  std::vector<std::vector<OpenDeltaEntry>> runs = {
+      {OpenDeltaEntry("k30", "k70", 100)},
+  };
+  std::vector<OpenDeltaEntry> delta = {};
+
+  LocalRangeDelView local_view(runs, delta, window, bytewise_icmp_);
+  std::vector<OwnedRawRangeTombstone> all_tombstones = {
+      {"k30", "k70", 100},
+  };
+  auto canonical_ctx = CanonicalTombstoneContext::Create(
+      all_tombstones, window, bytewise_icmp_);
+
+  std::vector<MergingIteratorCompatibilityHarness::PointEntry> points = {
+      {"k40", 50},   // covered, deleted (seq 50 < 100)
+      {"k45", 150},  // resurrected, visible (seq 150 > 100)
+      {"k50", 80},   // covered, deleted (seq 80 < 100)
+      {"k60", 130},  // resurrected, visible (seq 130 > 100)
+      {"k60", 70},   // older than resurrection and tombstone (seq 70 < 100)
+      {"k65", 99},   // covered, deleted (seq 99 < 100)
+  };
+
+  std::vector<std::string> probe_targets = {
+      "k20", "k30", "k40", "k45", "k50", "k60", "k65", "k70", "k80"};
+
+  std::vector<MergingIteratorCompatibilityHarness::ComparisonStepRecord> trace;
+  MergingIteratorCompatibilityHarness::RunDifferentialComparison(
+      points, canonical_ctx, local_view, window, bytewise_icmp_,
+      kMaxSequenceNumber, probe_targets, nullptr, nullptr, &trace);
+
+  EXPECT_GT(trace.size(), 0U);
+}
+
+TEST_F(AMTVLocalScanReferenceTest, P2b_MergingIter_UserDefinedTimestamp) {
+  const Comparator* ucmp = GetBytewiseComparatorWithU64Ts();
+  ASSERT_NE(ucmp, nullptr);
+  InternalKeyComparator ts_icmp(ucmp);
+  const size_t ts_sz = ucmp->timestamp_size();
+  std::string dummy_ts(ts_sz, '\0');
+
+  std::string ts100, ts200, ts300, ts250;
+  PutFixed64(&ts100, 100);
+  PutFixed64(&ts200, 200);
+  PutFixed64(&ts300, 300);
+  PutFixed64(&ts250, 250);
+
+  std::vector<std::vector<OpenDeltaEntry>> runs = {
+      {OpenDeltaEntry("k10" + ts100, "k60" + ts100, 50)},
+  };
+  std::vector<OpenDeltaEntry> delta = {
+      OpenDeltaEntry("k30" + ts200, "k80" + ts200, 80),
+      OpenDeltaEntry("k50" + ts300, "k90" + ts300, 120),
+  };
+  WindowSpec window("k20", "k70");
+
+  LocalRangeDelView local_view(runs, delta, window, ts_icmp);
+  std::vector<OwnedRawRangeTombstone> all_tombstones;
+  for (const auto& e : runs[0]) {
+    all_tombstones.emplace_back(e.user_start_key().ToString(), e.end_key, e.seq);
+  }
+  for (const auto& e : delta) {
+    all_tombstones.emplace_back(e.user_start_key().ToString(), e.end_key, e.seq);
+  }
+  auto canonical_ctx = CanonicalTombstoneContext::Create(
+      all_tombstones, window, ts_icmp);
+
+  std::vector<MergingIteratorCompatibilityHarness::PointEntry> points = {
+      {"k15" + ts100, 60},
+      {"k25" + ts100, 40},
+      {"k35" + ts200, 70},
+      {"k45" + ts200, 90},
+      {"k55" + ts300, 110},
+      {"k65" + ts300, 130},
+      {"k75" + ts300, 110},
+  };
+
+  std::vector<std::string> probe_targets = {
+      "k15" + dummy_ts, "k20" + dummy_ts, "k35" + dummy_ts,
+      "k45" + dummy_ts, "k55" + dummy_ts, "k70" + dummy_ts,
+      "k80" + dummy_ts};
+
+  std::vector<MergingIteratorCompatibilityHarness::ComparisonStepRecord> trace;
+  MergingIteratorCompatibilityHarness::RunDifferentialComparison(
+      points, canonical_ctx, local_view, window, ts_icmp,
+      200, probe_targets, nullptr, nullptr, &trace);
+
+  EXPECT_GT(trace.size(), 0U);
+}
+
+TEST_F(AMTVLocalScanReferenceTest, P2b_MergingIter_OldVsNewAmtvSnapshot) {
+  WindowSpec window("k25", "k75");
+
+  std::vector<std::vector<OpenDeltaEntry>> old_runs = {
+      {OpenDeltaEntry("k10", "k50", 100)},
+      {OpenDeltaEntry("k40", "k80", 120)},
+  };
+  std::vector<OpenDeltaEntry> old_delta = {
+      OpenDeltaEntry("k60", "k90", 140),
+  };
+
+  // Simulating background merge of Run 1 and Run 2 into a single Run
+  std::vector<std::vector<OpenDeltaEntry>> new_runs = {
+      {OpenDeltaEntry("k10", "k50", 100), OpenDeltaEntry("k40", "k80", 120)},
+  };
+  std::vector<OpenDeltaEntry> new_delta = {
+      OpenDeltaEntry("k60", "k90", 140),
+  };
+
+  LocalRangeDelView old_view(old_runs, old_delta, window, bytewise_icmp_);
+  LocalRangeDelView new_view(new_runs, new_delta, window, bytewise_icmp_);
+
+  std::vector<OwnedRawRangeTombstone> all_tombstones = {
+      {"k10", "k50", 100},
+      {"k40", "k80", 120},
+      {"k60", "k90", 140},
+  };
+  auto canonical_ctx = CanonicalTombstoneContext::Create(
+      all_tombstones, window, bytewise_icmp_);
+
+  std::vector<MergingIteratorCompatibilityHarness::PointEntry> points = {
+      {"k15", 90},
+      {"k30", 90},
+      {"k45", 110},
+      {"k55", 110},
+      {"k65", 130},
+      {"k70", 150},
+      {"k85", 130},
+  };
+
+  std::vector<std::string> probe_targets = {
+      "k15", "k25", "k35", "k45", "k55", "k65", "k75", "k85"};
+
+  std::vector<MergingIteratorCompatibilityHarness::ComparisonStepRecord> trace_old;
+  MergingIteratorCompatibilityHarness::RunDifferentialComparison(
+      points, canonical_ctx, old_view, window, bytewise_icmp_,
+      kMaxSequenceNumber, probe_targets, nullptr, nullptr, &trace_old);
+
+  std::vector<MergingIteratorCompatibilityHarness::ComparisonStepRecord> trace_new;
+  MergingIteratorCompatibilityHarness::RunDifferentialComparison(
+      points, canonical_ctx, new_view, window, bytewise_icmp_,
+      kMaxSequenceNumber, probe_targets, nullptr, nullptr, &trace_new);
+
+  ASSERT_EQ(trace_old.size(), trace_new.size());
+  for (size_t i = 0; i < trace_old.size(); ++i) {
+    EXPECT_EQ(trace_old[i].op, trace_new[i].op);
+    EXPECT_EQ(trace_old[i].valid, trace_new[i].valid);
+    EXPECT_EQ(trace_old[i].key, trace_new[i].key);
+    EXPECT_EQ(trace_old[i].value, trace_new[i].value);
+    EXPECT_EQ(trace_old[i].seq, trace_new[i].seq);
+  }
+}
+
+TEST_F(AMTVLocalScanReferenceTest, P2b_MergingIter_EmptyAndInvertedWindowFallback) {
+  std::vector<std::vector<OpenDeltaEntry>> runs = {
+      {OpenDeltaEntry("k20", "k60", 100)},
+  };
+  std::vector<OpenDeltaEntry> delta = {
+      OpenDeltaEntry("k40", "k80", 120),
+  };
+  std::vector<OwnedRawRangeTombstone> all_tombstones = {
+      {"k20", "k60", 100},
+      {"k40", "k80", 120},
+  };
+
+  std::vector<MergingIteratorCompatibilityHarness::PointEntry> points = {
+      {"k25", 90},
+      {"k45", 110},
+      {"k65", 110},
+  };
+  std::vector<std::string> probe_targets = {"k20", "k40", "k60", "k80"};
+
+  // 1. Empty window [k40, k40): Evaluated by predicate as not eligible -> Fallback to Native Full
+  {
+    ScanEligibilityContext ctx;
+    ctx.target_type = ScanTargetType::kActiveMemTable;
+    ctx.amtv_enabled = true;
+    ctx.lower_bound = "k40";
+    ctx.upper_bound = "k40";
+    ctx.ucmp = bytewise_icmp_.user_comparator();
+    EXPECT_FALSE(IsEligibleForLocalRangeDelView(ctx));
+
+    // Under Safety Rule, empty window falls back to full native view (unbounded)
+    WindowSpec fallback_win(std::nullopt, std::nullopt);
+    LocalRangeDelView local_view(runs, delta, fallback_win, bytewise_icmp_);
+    EXPECT_TRUE(local_view.state()->fallback_to_full);
+
+    auto canonical_ctx = CanonicalTombstoneContext::Create(
+        all_tombstones, fallback_win, bytewise_icmp_);
+    MergingIteratorCompatibilityHarness::RunDifferentialComparison(
+        points, canonical_ctx, local_view, fallback_win, bytewise_icmp_,
+        kMaxSequenceNumber, probe_targets);
+  }
+
+  // 2. Inverted window [k60, k30): Evaluated by predicate as not eligible -> Fallback to Native Full
+  {
+    ScanEligibilityContext ctx;
+    ctx.target_type = ScanTargetType::kActiveMemTable;
+    ctx.amtv_enabled = true;
+    ctx.lower_bound = "k60";
+    ctx.upper_bound = "k30";
+    ctx.ucmp = bytewise_icmp_.user_comparator();
+    EXPECT_FALSE(IsEligibleForLocalRangeDelView(ctx));
+
+    WindowSpec fallback_win(std::nullopt, std::nullopt);
+    LocalRangeDelView local_view(runs, delta, fallback_win, bytewise_icmp_);
+    EXPECT_TRUE(local_view.state()->fallback_to_full);
+
+    auto canonical_ctx = CanonicalTombstoneContext::Create(
+        all_tombstones, fallback_win, bytewise_icmp_);
+    MergingIteratorCompatibilityHarness::RunDifferentialComparison(
+        points, canonical_ctx, local_view, fallback_win, bytewise_icmp_,
+        kMaxSequenceNumber, probe_targets);
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE

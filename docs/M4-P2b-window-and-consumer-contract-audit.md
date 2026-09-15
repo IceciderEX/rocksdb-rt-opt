@@ -71,12 +71,19 @@
 | 用户 `SeekToFirst()` | 客户端指令 | `ArenaWrappedDBIter::SeekToFirst`、`DBIter::SeekToFirst` | 构造完成后用户显式调用 | **否**（无显式键，扫描整个键空间） |
 | 用户 `SeekToLast()` | 客户端指令 | `ArenaWrappedDBIter::SeekToLast`、`DBIter::SeekToLast` | 构造完成后用户显式调用 | **否**（反向全扫描，下界不确定） |
 
-### 核心结论：局部窗口 $[L, U)$ 在构造期的可确定性
-1. **确定充分条件**：当且仅当客户端在构造 `ReadOptions` 时同时显式设置了非空的 `iterate_lower_bound` 与 `iterate_upper_bound`，且 $L < U$ 时，局部窗口 $[L, U)$ 才能在 `DBImpl::NewIterator` 构造期 100% 确定。
-2. **不可推断性**：若客户端未在 `ReadOptions` 中指定完整上下界：
-   * 随后的 `Seek(target)` 只能提供遍历起始点，客户端随后可以通过任意次数的 `Next()` 扫描至无穷大，绝不构成右边界 $U$；
-   * 任何试图“等待用户调用首次 `Seek` 时动态猜测/构造局部视图”的做法，在面对跨界 `Next()`、反向 `Prev()` 或动态重新 `Seek` 时必然发生墓碑漏选（Under-coverage），严重违反快照一致性。
-3. **架构铁律**：**局部视图的生命周期必须绑定在静态已知的确切有界扫描（Bounded Scan）上**；无界或半有界扫描必须在构造期直接决策回退原生全量视图。
+### 核心结论：局部窗口 $[L, U)$ 的可见性与延迟初始化确定性
+1. **捕获与使用时机分离**：
+   - 用户传入的 `ReadOptions.iterate_lower_bound` 与 `iterate_upper_bound` 在 `DBImpl::NewIterator` 调用时被捕获并保存于 `DBIter` 状态中；
+   - 真实的底阶内部迭代器（包括活跃 MemTable 的点/范围墓碑迭代器）在 `NewIterator` 阶段**并不立即构造**，而是遵循 RocksDB 惰性延迟初始化机制，在客户端首次调用 `Seek()` / `SeekToFirst()` 时于 `ArenaWrappedDBIter::EnsureInternalIteratorInitialized()` -> `DBImpl::NewInternalIterator()` 中统一构造；
+   - 因此，局部视图的判断与构造时机应落在首次延迟初始化 `NewInternalIterator`（或未来刷新）中，但其窗口确定性前提依然是在 `NewIterator` 创建期就已由捕获的 `ReadOptions` 完整提供。
+2. **所有权铁律：边界 Key 内容必须深拷贝**：
+   - 未来局部视图 `State` 必须**深拷贝** `lower_bound` 与 `upper_bound` 的实际 key 内容（转换为拥有型 `std::string`）；
+   - **严禁**直接保存或依赖外部 `ReadOptions.iterate_lower_bound` / `iterate_upper_bound` 的 `Slice` 指针或外部生命周期（防止客户端提前释放或修改 options 缓冲区）；
+   - 在用户定义时间戳（UDT）场景下，还必须在深拷贝后严格校验并保留时间戳格式。
+3. **不可推断性**：若客户端未在 `ReadOptions` 中指定完整上下界：
+   - 随后的 `Seek(target)` 只能提供遍历起始点，客户端随后可以通过任意次数的 `Next()` 扫描至无穷大，绝不构成右边界 $U$；
+   - 任何试图“等待用户调用首次 `Seek` 时动态猜测/构造局部视图”的做法，在面对跨界 `Next()`、反向 `Prev()` 或动态重新 `Seek` 时必然发生墓碑漏选（Under-coverage），严重违反快照一致性。
+4. **架构铁律**：**局部视图的生命周期必须绑定在静态已知的确切有界扫描（Bounded Scan）上**；无界或半有界扫描必须在构造期直接决策回退原生全量视图。
 
 ---
 
@@ -175,6 +182,10 @@
 ### 强制回退原生规则（Strict Fallback to Native）：
 * 只要上述任一条件不满足（例如无界扫描、单侧有界扫描、前缀扫描未显式指定双边界、空区间），**100% 回退 RocksDB 原生全量范围墓碑视图**（`MemTable::NewRangeTombstoneIteratorInternal`）。
 * 严禁依赖任何“等待用户后续调用 `Seek()` 时再探测或构造局部视图”的假设。
+
+### 未来 Local State 所有权与 UDT 强约束：
+1. **边界深拷贝**：未来局部视图 `State` 必须深拷贝 `iterate_lower_bound` 与 `iterate_upper_bound` 对应的 key 内容到由 State 独立拥有的 `std::string`，绝不能保存外部 `Slice` 指针或依赖其生命周期；
+2. **UDT 格式与时间戳校验**：在启用用户定义时间戳时，深拷贝后必须保留并校验时间戳长度与格式，截断边界必须严格对齐原生时间戳规范。
 
 ---
 
