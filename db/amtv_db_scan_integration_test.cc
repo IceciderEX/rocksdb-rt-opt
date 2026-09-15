@@ -672,6 +672,7 @@ TEST_F(AMTVDBScanIntegrationTest, Scenario12_FallbackMatrix) {
     AssertIteratorsEquivalent(it_nat.get(), it_c.get(), &l, &u, {"k10", "k20"});
   }
 
+#ifndef NDEBUG
   // 12b: AMTV local build failure injection via SyncPoint
   {
     OpenDualDB(/*cand_bounded_scan=*/true);
@@ -699,6 +700,7 @@ TEST_F(AMTVDBScanIntegrationTest, Scenario12_FallbackMatrix) {
     SyncPoint::GetInstance()->DisableProcessing();
     SyncPoint::GetInstance()->ClearAllCallBacks();
   }
+#endif
 
   // 12c: Unbounded scan (iterate_lower_bound / upper_bound is null)
   {
