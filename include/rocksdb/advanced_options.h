@@ -445,6 +445,12 @@ struct AdvancedColumnFamilyOptions {
   // Legacy alias for amtv_hard_layer_limit.
   uint32_t amtv_max_sealed_deltas = 8;
 
+  // EXPERIMENTAL: If true, enables bounded scan view optimization using AMTV
+  // in active memtable for queries with iterate_lower_bound and iterate_upper_bound.
+  //
+  // Default: false
+  bool amtv_enable_bounded_scan_view = false;
+
   // existing_value - pointer to previous value (from both memtable and sst).
   //                  nullptr if key doesn't exist
   // existing_value_size - pointer to size of existing_value).

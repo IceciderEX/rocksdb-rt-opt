@@ -383,6 +383,13 @@ void UpdateColumnFamilyOptions(const ImmutableCFOptions& ioptions,
   cf_opts->cf_allow_ingest_behind = ioptions.cf_allow_ingest_behind;
   cf_opts->memtable_batch_lookup_optimization =
       ioptions.memtable_batch_lookup_optimization;
+  cf_opts->enable_amtv = ioptions.enable_amtv;
+  cf_opts->amtv_delta_tombstones = ioptions.amtv_delta_tombstones;
+  cf_opts->amtv_merge_soft_limit = ioptions.amtv_merge_soft_limit;
+  cf_opts->amtv_hard_layer_limit = ioptions.amtv_hard_layer_limit;
+  cf_opts->amtv_max_sealed_deltas = ioptions.amtv_max_sealed_deltas;
+  cf_opts->amtv_enable_bounded_scan_view =
+      ioptions.amtv_enable_bounded_scan_view;
 
   // TODO(yhchiang): find some way to handle the following derived options
   // * max_file_size

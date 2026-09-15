@@ -766,6 +766,7 @@ set(SOURCES
         cache/sharded_cache.cc
         cache/tiered_secondary_cache.cc
         db/amtv.cc
+        db/amtv_local_scan_view.cc
         db/arena_wrapped_db_iter.cc
         db/attribute_group_iterator_impl.cc
         db/blob/blob_contents.cc
@@ -1463,6 +1464,7 @@ if(WITH_TESTS)
         cache/compressed_secondary_cache_test.cc
         cache/lru_cache_test.cc
         cache/tiered_secondary_cache_test.cc
+        db/amtv_local_scan_view_test.cc
         db/blob/blob_counting_iterator_test.cc
         db/blob/blob_file_addition_test.cc
         db/blob/blob_file_builder_test.cc

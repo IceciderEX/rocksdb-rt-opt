@@ -876,6 +876,7 @@ class MemTable final : public ReadOnlyMemTable {
   AMTVState* GetAMTVState() { return amtv_state_.get(); }
   const AMTVState* GetAMTVState() const { return amtv_state_.get(); }
   std::shared_ptr<AMTVState> GetAMTVStateShared() { return amtv_state_; }
+  bool IsImmutable() const { return is_immutable_.LoadRelaxed(); }
 
   uint64_t ApproximateOldestKeyTime() const override {
     return oldest_key_time_.load(std::memory_order_relaxed);

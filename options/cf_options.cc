@@ -1015,6 +1015,10 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableCFOptions, amtv_max_sealed_deltas),
           OptionType::kUInt32T, OptionVerificationType::kNormal,
           OptionTypeFlags::kCompareNever}},
+        {"amtv_enable_bounded_scan_view",
+         {offsetof(struct ImmutableCFOptions, amtv_enable_bounded_scan_view),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kCompareNever}},
 };
 
 const std::string OptionsHelper::kCFOptionsName = "ColumnFamilyOptions";
@@ -1166,7 +1170,9 @@ ImmutableCFOptions::ImmutableCFOptions(const ColumnFamilyOptions& cf_options)
       amtv_delta_tombstones(cf_options.amtv_delta_tombstones),
       amtv_merge_soft_limit(cf_options.amtv_merge_soft_limit),
       amtv_hard_layer_limit(cf_options.amtv_hard_layer_limit),
-      amtv_max_sealed_deltas(cf_options.amtv_hard_layer_limit) {}
+      amtv_max_sealed_deltas(cf_options.amtv_hard_layer_limit),
+      amtv_enable_bounded_scan_view(
+          cf_options.amtv_enable_bounded_scan_view) {}
 
 ImmutableOptions::ImmutableOptions() : ImmutableOptions(Options()) {}
 

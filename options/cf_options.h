@@ -105,6 +105,7 @@ struct ImmutableCFOptions {
   uint32_t amtv_merge_soft_limit;
   uint32_t amtv_hard_layer_limit;
   uint32_t amtv_max_sealed_deltas;
+  bool amtv_enable_bounded_scan_view;
 };
 
 struct ImmutableOptions : public ImmutableDBOptions, public ImmutableCFOptions {
