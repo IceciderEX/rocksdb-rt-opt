@@ -486,6 +486,7 @@ TEST_F(AMTVLocalScanViewTest, FactoryFallbackAMTVFailure) {
   EXPECT_EQ(meta.fallback_reason, AMTVScanFallbackReason::kAMTVUnavailable);
 }
 
+#ifndef NDEBUG
 TEST_F(AMTVLocalScanViewTest, FactorySyncPointFailureInjection) {
   OpenDB();
   MemTable* mem = GetActiveMemTable();
@@ -530,6 +531,7 @@ TEST_F(AMTVLocalScanViewTest, FactorySyncPointFailureInjection) {
   EXPECT_EQ(out_iter->start_key().user_key, "k20");
   EXPECT_EQ(out_iter->end_key().user_key, "k40");
 }
+#endif
 
 TEST_F(AMTVLocalScanViewTest, FactoryStateAliasingLifetimeAndASan) {
   OpenDB();
