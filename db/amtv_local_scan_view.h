@@ -82,12 +82,16 @@ bool AMTVScanIsCandidateIntersecting(const Slice& user_start_key,
 //
 // Contract:
 // 1. Immediately executes out_iter->reset() upon entry (or returns InvalidArgument if out_iter is null).
-// 2. Returns Status::OK() + (*out_iter == nullptr) when the MemTable currently has no range tombstones
+// 2. Caller Guarantees Active MemTable: The 'memtable' parameter must come directly from the current
+//    SuperVersion's active mutable memtable slot (super_version->mem). The factory does not read
+//    memtable->IsImmutable() in order to prevent unnecessary cross-thread shared-state reads on the hot path.
+//    Immutable memtables are handled 100% via the native path (super_version->imm->AddIterators).
+// 3. Returns Status::OK() + (*out_iter == nullptr) when the MemTable currently has no range tombstones
 //    (a legitimate, non-error result).
-// 3. When ineligible or when local build fails, constructs the current native full iterator inside
+// 4. When ineligible or when local build fails, constructs the current native full iterator inside
 //    the factory and returns Status::OK() with metadata indicating kNativeFallback.
-// 4. Returns non-OK Status only when unable to provide any valid RangeDel iterator.
-// 5. Refresh callers must unconditionally execute *slot0 = std::move(new_iter) on Status::OK(),
+// 5. Returns non-OK Status only when unable to provide any valid RangeDel iterator.
+// 6. Refresh callers must unconditionally execute *slot0 = std::move(new_iter) on Status::OK(),
 //    even if new_iter is nullptr (clearing old slot 0).
 Status BuildActiveMemTableRangeDelIteratorForScan(
     MemTable* memtable,

@@ -56,6 +56,11 @@ Status BuildActiveMemTableRangeDelIteratorForScan(
     std::unique_ptr<TruncatedRangeDelIterator>* out_iter,
     AMTVScanBuildMetadata* build_meta) {
   if (out_iter == nullptr) {
+#ifndef NDEBUG
+    const char* outcome = "FINAL_ERROR";
+    TEST_SYNC_POINT_CALLBACK(
+        "BuildActiveMemTableRangeDelIteratorForScan:Outcome", &outcome);
+#endif
     return Status::InvalidArgument("out_iter must not be null");
   }
   out_iter->reset();
@@ -65,6 +70,11 @@ Status BuildActiveMemTableRangeDelIteratorForScan(
   }
 
   if (memtable == nullptr) {
+#ifndef NDEBUG
+    const char* outcome = "FINAL_ERROR";
+    TEST_SYNC_POINT_CALLBACK(
+        "BuildActiveMemTableRangeDelIteratorForScan:Outcome", &outcome);
+#endif
     return Status::InvalidArgument("memtable must not be null");
   }
 
@@ -81,6 +91,18 @@ Status BuildActiveMemTableRangeDelIteratorForScan(
     if (build_meta != nullptr) {
       build_meta->fallback_reason = reason;
     }
+#ifndef NDEBUG
+    bool fallback_fail = false;
+    TEST_SYNC_POINT_CALLBACK(
+        "BuildActiveMemTableRangeDelIteratorForScan:FallbackFail",
+        &fallback_fail);
+    if (fallback_fail) {
+      const char* outcome = "FINAL_ERROR";
+      TEST_SYNC_POINT_CALLBACK(
+          "BuildActiveMemTableRangeDelIteratorForScan:Outcome", &outcome);
+      return Status::Corruption("Injected native fallback failure");
+    }
+#endif
     std::unique_ptr<FragmentedRangeTombstoneIterator> native_iter(
         memtable->NewRangeTombstoneIterator(read_options, read_seq,
                                             /*immutable_memtable=*/false));
@@ -89,6 +111,29 @@ Status BuildActiveMemTableRangeDelIteratorForScan(
         build_meta->mode = AMTVScanMode::kEmpty;
       }
       *out_iter = nullptr;
+#ifndef NDEBUG
+      const char* outcome = nullptr;
+      switch (reason) {
+        case AMTVScanFallbackReason::kDisabled:
+          outcome = "NATIVE_FALLBACK_DISABLED";
+          break;
+        case AMTVScanFallbackReason::kUnbounded:
+          outcome = "NATIVE_FALLBACK_UNBOUNDED";
+          break;
+        case AMTVScanFallbackReason::kAMTVUnavailable:
+        case AMTVScanFallbackReason::kSnapshotUnavailable:
+          outcome = "NATIVE_FALLBACK_AMTV_UNAVAILABLE";
+          break;
+        case AMTVScanFallbackReason::kLocalBuildFailed:
+          outcome = "NATIVE_FALLBACK_LOCAL_BUILD_FAILURE";
+          break;
+        default:
+          outcome = "NATIVE_FALLBACK_OTHER";
+          break;
+      }
+      TEST_SYNC_POINT_CALLBACK(
+          "BuildActiveMemTableRangeDelIteratorForScan:Outcome", &outcome);
+#endif
       return Status::OK();
     }
     *out_iter = std::make_unique<TruncatedRangeDelIterator>(
@@ -97,6 +142,29 @@ Status BuildActiveMemTableRangeDelIteratorForScan(
     if (build_meta != nullptr) {
       build_meta->mode = AMTVScanMode::kNativeFallback;
     }
+#ifndef NDEBUG
+    const char* outcome = nullptr;
+    switch (reason) {
+      case AMTVScanFallbackReason::kDisabled:
+        outcome = "NATIVE_FALLBACK_DISABLED";
+        break;
+      case AMTVScanFallbackReason::kUnbounded:
+        outcome = "NATIVE_FALLBACK_UNBOUNDED";
+        break;
+      case AMTVScanFallbackReason::kAMTVUnavailable:
+      case AMTVScanFallbackReason::kSnapshotUnavailable:
+        outcome = "NATIVE_FALLBACK_AMTV_UNAVAILABLE";
+        break;
+      case AMTVScanFallbackReason::kLocalBuildFailed:
+        outcome = "NATIVE_FALLBACK_LOCAL_BUILD_FAILURE";
+        break;
+      default:
+        outcome = "NATIVE_FALLBACK_OTHER";
+        break;
+    }
+    TEST_SYNC_POINT_CALLBACK(
+        "BuildActiveMemTableRangeDelIteratorForScan:Outcome", &outcome);
+#endif
     return Status::OK();
   };
 
@@ -105,11 +173,10 @@ Status BuildActiveMemTableRangeDelIteratorForScan(
     return fallback_to_native(AMTVScanFallbackReason::kDisabled);
   }
 
-  // 2. Eligibility: The caller (DBImpl::NewInternalIterator or
-  // ArenaWrappedDBIter::Refresh) guarantees that memtable is the active
-  // mutable memtable (super_version->mem). In debug builds, assert to prevent
-  // misusage without introducing cross-thread shared-state reads on the hot path.
-  assert(!memtable->IsImmutable());
+  // 2. Eligibility: The caller guarantees that memtable corresponds to the active
+  // mutable memtable of the SuperVersion (super_version->mem). To prevent false
+  // assertion failures during concurrent memtable switches and avoid unneeded
+  // cross-thread shared-state reads on the hot path, IsImmutable() is not queried.
 
   // 3. Eligibility: Both lower and upper bounds must be present
   const Slice* lower_bound = read_options.iterate_lower_bound;
@@ -127,6 +194,15 @@ Status BuildActiveMemTableRangeDelIteratorForScan(
   }
 
   // 5. Eligibility: AMTV state and background merge health
+#ifndef NDEBUG
+  bool amtv_unavailable_inject = false;
+  TEST_SYNC_POINT_CALLBACK(
+      "BuildActiveMemTableRangeDelIteratorForScan:AMTVUnavailable",
+      &amtv_unavailable_inject);
+  if (amtv_unavailable_inject) {
+    return fallback_to_native(AMTVScanFallbackReason::kAMTVUnavailable);
+  }
+#endif
   AMTVState* amtv_state = memtable->GetAMTVState();
   if (amtv_state == nullptr || amtv_state->is_fallback_required()) {
     return fallback_to_native(AMTVScanFallbackReason::kAMTVUnavailable);
@@ -188,6 +264,11 @@ Status BuildActiveMemTableRangeDelIteratorForScan(
       build_meta->fallback_reason = AMTVScanFallbackReason::kNone;
     }
     *out_iter = nullptr;
+#ifndef NDEBUG
+    const char* outcome = "LOCAL_VIEW_EMPTY";
+    TEST_SYNC_POINT_CALLBACK(
+        "BuildActiveMemTableRangeDelIteratorForScan:Outcome", &outcome);
+#endif
     return Status::OK();
   }
 
@@ -232,6 +313,11 @@ Status BuildActiveMemTableRangeDelIteratorForScan(
       build_meta->fallback_reason = AMTVScanFallbackReason::kNone;
     }
     *out_iter = nullptr;
+#ifndef NDEBUG
+    const char* outcome = "LOCAL_VIEW_EMPTY";
+    TEST_SYNC_POINT_CALLBACK(
+        "BuildActiveMemTableRangeDelIteratorForScan:Outcome", &outcome);
+#endif
     return Status::OK();
   }
 
@@ -251,6 +337,11 @@ Status BuildActiveMemTableRangeDelIteratorForScan(
     build_meta->mode = AMTVScanMode::kLocal;
     build_meta->fallback_reason = AMTVScanFallbackReason::kNone;
   }
+#ifndef NDEBUG
+  const char* outcome = "LOCAL_VIEW_NONEMPTY";
+  TEST_SYNC_POINT_CALLBACK(
+      "BuildActiveMemTableRangeDelIteratorForScan:Outcome", &outcome);
+#endif
   return Status::OK();
 }
 

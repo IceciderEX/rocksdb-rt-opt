@@ -36,9 +36,39 @@ class AMTVDBScanIntegrationTest : public testing::Test {
   }
 
   void TearDown() override {
+#ifndef NDEBUG
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+#endif
     CloseDualDB();
     EXPECT_OK(DestroyDB(dbname_native_, Options()));
     EXPECT_OK(DestroyDB(dbname_cand_, Options()));
+  }
+
+  std::string cand_last_outcome_;
+
+  std::unique_ptr<Iterator> NewCandidateIterator(const ReadOptions& ro) {
+    cand_last_outcome_.clear();
+#ifndef NDEBUG
+    SyncPoint::GetInstance()->SetCallBack(
+        "BuildActiveMemTableRangeDelIteratorForScan:Outcome",
+        [this](void* arg) {
+          const char** p = reinterpret_cast<const char**>(arg);
+          if (p && *p) {
+            this->cand_last_outcome_ = *p;
+          }
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+#endif
+    auto it = std::unique_ptr<Iterator>(db_cand_->NewIterator(ro));
+    if (it != nullptr) {
+      it->SeekToFirst();
+    }
+#ifndef NDEBUG
+    SyncPoint::GetInstance()->ClearCallBack(
+        "BuildActiveMemTableRangeDelIteratorForScan:Outcome");
+#endif
+    return it;
   }
 
   void OpenDualDB(bool cand_bounded_scan = true,
@@ -236,7 +266,10 @@ TEST_F(AMTVDBScanIntegrationTest, Scenario01_NoTombstones) {
   ro.iterate_upper_bound = &u;
 
   auto it_native = std::unique_ptr<Iterator>(db_native_->NewIterator(ro));
-  auto it_cand = std::unique_ptr<Iterator>(db_cand_->NewIterator(ro));
+  auto it_cand = NewCandidateIterator(ro);
+#ifndef NDEBUG
+  EXPECT_EQ(cand_last_outcome_, "LOCAL_VIEW_EMPTY");
+#endif
 
   std::vector<std::string> targets = {"k00", "k10", "k15", "k20", "k30",
                                       "k40", "k45", "k50", "k60"};
@@ -267,7 +300,10 @@ TEST_F(AMTVDBScanIntegrationTest, Scenario02_DisjointTombstones) {
   ro.iterate_upper_bound = &u;
 
   auto it_native = std::unique_ptr<Iterator>(db_native_->NewIterator(ro));
-  auto it_cand = std::unique_ptr<Iterator>(db_cand_->NewIterator(ro));
+  auto it_cand = NewCandidateIterator(ro);
+#ifndef NDEBUG
+  EXPECT_EQ(cand_last_outcome_, "LOCAL_VIEW_EMPTY");
+#endif
 
   std::vector<std::string> targets = {"k05", "k10", "k20", "k30", "k40",
                                       "k50", "k60", "k70", "k80"};
@@ -294,7 +330,10 @@ TEST_F(AMTVDBScanIntegrationTest, Scenario03_LeftBoundaryStraddle) {
   ro.iterate_upper_bound = &u;
 
   auto it_native = std::unique_ptr<Iterator>(db_native_->NewIterator(ro));
-  auto it_cand = std::unique_ptr<Iterator>(db_cand_->NewIterator(ro));
+  auto it_cand = NewCandidateIterator(ro);
+#ifndef NDEBUG
+  EXPECT_EQ(cand_last_outcome_, "LOCAL_VIEW_NONEMPTY");
+#endif
 
   std::vector<std::string> targets = {"k10", "k15", "k20", "k25", "k30",
                                       "k40", "k45"};
@@ -321,7 +360,10 @@ TEST_F(AMTVDBScanIntegrationTest, Scenario04_RightBoundaryStraddle) {
   ro.iterate_upper_bound = &u;
 
   auto it_native = std::unique_ptr<Iterator>(db_native_->NewIterator(ro));
-  auto it_cand = std::unique_ptr<Iterator>(db_cand_->NewIterator(ro));
+  auto it_cand = NewCandidateIterator(ro);
+#ifndef NDEBUG
+  EXPECT_EQ(cand_last_outcome_, "LOCAL_VIEW_NONEMPTY");
+#endif
 
   std::vector<std::string> targets = {"k15", "k20", "k30", "k35", "k40",
                                       "k45", "k50"};
@@ -348,7 +390,10 @@ TEST_F(AMTVDBScanIntegrationTest, Scenario05_EncompassingTombstone) {
   ro.iterate_upper_bound = &u;
 
   auto it_native = std::unique_ptr<Iterator>(db_native_->NewIterator(ro));
-  auto it_cand = std::unique_ptr<Iterator>(db_cand_->NewIterator(ro));
+  auto it_cand = NewCandidateIterator(ro);
+#ifndef NDEBUG
+  EXPECT_EQ(cand_last_outcome_, "LOCAL_VIEW_NONEMPTY");
+#endif
 
   std::vector<std::string> targets = {"k10", "k15", "k20", "k30", "k40",
                                       "k45", "k50"};
@@ -388,7 +433,10 @@ TEST_F(AMTVDBScanIntegrationTest, Scenario06_ComplexTombstoneTopology) {
   ro.iterate_upper_bound = &u;
 
   auto it_native = std::unique_ptr<Iterator>(db_native_->NewIterator(ro));
-  auto it_cand = std::unique_ptr<Iterator>(db_cand_->NewIterator(ro));
+  auto it_cand = NewCandidateIterator(ro);
+#ifndef NDEBUG
+  EXPECT_EQ(cand_last_outcome_, "LOCAL_VIEW_NONEMPTY");
+#endif
 
   std::vector<std::string> targets;
   for (int i = 0; i <= 95; i += 5) {
@@ -421,7 +469,10 @@ TEST_F(AMTVDBScanIntegrationTest, Scenario07_SameStartDiffEndAndSeq) {
   ro.iterate_upper_bound = &u;
 
   auto it_native = std::unique_ptr<Iterator>(db_native_->NewIterator(ro));
-  auto it_cand = std::unique_ptr<Iterator>(db_cand_->NewIterator(ro));
+  auto it_cand = NewCandidateIterator(ro);
+#ifndef NDEBUG
+  EXPECT_EQ(cand_last_outcome_, "LOCAL_VIEW_NONEMPTY");
+#endif
 
   std::vector<std::string> targets = {"k15", "k20", "k30", "k35", "k45",
                                       "k50", "k55", "k60", "k65"};
@@ -452,7 +503,10 @@ TEST_F(AMTVDBScanIntegrationTest, Scenario08_PutResurrection) {
   ro.iterate_upper_bound = &u;
 
   auto it_native = std::unique_ptr<Iterator>(db_native_->NewIterator(ro));
-  auto it_cand = std::unique_ptr<Iterator>(db_cand_->NewIterator(ro));
+  auto it_cand = NewCandidateIterator(ro);
+#ifndef NDEBUG
+  EXPECT_EQ(cand_last_outcome_, "LOCAL_VIEW_NONEMPTY");
+#endif
 
   std::vector<std::string> targets = {"k15", "k20", "k25", "k30", "k35",
                                       "k40", "k45"};
@@ -501,7 +555,10 @@ TEST_F(AMTVDBScanIntegrationTest, Scenario09_MultipleSnapshots) {
     ro_cand.iterate_lower_bound = &l;
     ro_cand.iterate_upper_bound = &u;
     auto it_nat = std::unique_ptr<Iterator>(db_native_->NewIterator(ro_nat));
-    auto it_c = std::unique_ptr<Iterator>(db_cand_->NewIterator(ro_cand));
+    auto it_c = NewCandidateIterator(ro_cand);
+#ifndef NDEBUG
+    EXPECT_EQ(cand_last_outcome_, "LOCAL_VIEW_NONEMPTY");
+#endif
     AssertIteratorsEquivalent(it_nat.get(), it_c.get(), &l, &u, targets);
   }
 
@@ -515,7 +572,10 @@ TEST_F(AMTVDBScanIntegrationTest, Scenario09_MultipleSnapshots) {
     ro_cand.iterate_lower_bound = &l;
     ro_cand.iterate_upper_bound = &u;
     auto it_nat = std::unique_ptr<Iterator>(db_native_->NewIterator(ro_nat));
-    auto it_c = std::unique_ptr<Iterator>(db_cand_->NewIterator(ro_cand));
+    auto it_c = NewCandidateIterator(ro_cand);
+#ifndef NDEBUG
+    EXPECT_EQ(cand_last_outcome_, "LOCAL_VIEW_NONEMPTY");
+#endif
     AssertIteratorsEquivalent(it_nat.get(), it_c.get(), &l, &u, targets);
   }
 
@@ -529,7 +589,10 @@ TEST_F(AMTVDBScanIntegrationTest, Scenario09_MultipleSnapshots) {
     ro_cand.iterate_lower_bound = &l;
     ro_cand.iterate_upper_bound = &u;
     auto it_nat = std::unique_ptr<Iterator>(db_native_->NewIterator(ro_nat));
-    auto it_c = std::unique_ptr<Iterator>(db_cand_->NewIterator(ro_cand));
+    auto it_c = NewCandidateIterator(ro_cand);
+#ifndef NDEBUG
+    EXPECT_EQ(cand_last_outcome_, "LOCAL_VIEW_NONEMPTY");
+#endif
     AssertIteratorsEquivalent(it_nat.get(), it_c.get(), &l, &u, targets);
   }
 
@@ -541,7 +604,10 @@ TEST_F(AMTVDBScanIntegrationTest, Scenario09_MultipleSnapshots) {
     ro_cand.iterate_lower_bound = &l;
     ro_cand.iterate_upper_bound = &u;
     auto it_nat = std::unique_ptr<Iterator>(db_native_->NewIterator(ro_nat));
-    auto it_c = std::unique_ptr<Iterator>(db_cand_->NewIterator(ro_cand));
+    auto it_c = NewCandidateIterator(ro_cand);
+#ifndef NDEBUG
+    EXPECT_EQ(cand_last_outcome_, "LOCAL_VIEW_NONEMPTY");
+#endif
     AssertIteratorsEquivalent(it_nat.get(), it_c.get(), &l, &u, targets);
   }
 
@@ -573,7 +639,10 @@ TEST_F(AMTVDBScanIntegrationTest, Scenario10_EmptyUserKey) {
   ro.iterate_upper_bound = &u;
 
   auto it_native = std::unique_ptr<Iterator>(db_native_->NewIterator(ro));
-  auto it_cand = std::unique_ptr<Iterator>(db_cand_->NewIterator(ro));
+  auto it_cand = NewCandidateIterator(ro);
+#ifndef NDEBUG
+  EXPECT_EQ(cand_last_outcome_, "LOCAL_VIEW_NONEMPTY");
+#endif
 
   std::vector<std::string> targets = {"", "\x01", "a", "b", "c", "z"};
   AssertIteratorsEquivalent(it_native.get(), it_cand.get(), &l, &u, targets);
@@ -622,7 +691,10 @@ TEST_F(AMTVDBScanIntegrationTest, Scenario11_UserDefinedTimestamps) {
     ro.iterate_lower_bound = &l;
     ro.iterate_upper_bound = &u;
     auto it_nat = std::unique_ptr<Iterator>(db_native_->NewIterator(ro));
-    auto it_cand = std::unique_ptr<Iterator>(db_cand_->NewIterator(ro));
+    auto it_cand = NewCandidateIterator(ro);
+#ifndef NDEBUG
+    EXPECT_EQ(cand_last_outcome_, "LOCAL_VIEW_NONEMPTY");
+#endif
     AssertIteratorsEquivalent(it_nat.get(), it_cand.get(), &l, &u, targets,
                               ucmp);
   }
@@ -635,7 +707,10 @@ TEST_F(AMTVDBScanIntegrationTest, Scenario11_UserDefinedTimestamps) {
     ro.iterate_lower_bound = &l;
     ro.iterate_upper_bound = &u;
     auto it_nat = std::unique_ptr<Iterator>(db_native_->NewIterator(ro));
-    auto it_cand = std::unique_ptr<Iterator>(db_cand_->NewIterator(ro));
+    auto it_cand = NewCandidateIterator(ro);
+#ifndef NDEBUG
+    EXPECT_EQ(cand_last_outcome_, "LOCAL_VIEW_NONEMPTY");
+#endif
     AssertIteratorsEquivalent(it_nat.get(), it_cand.get(), &l, &u, targets,
                               ucmp);
   }
@@ -648,7 +723,10 @@ TEST_F(AMTVDBScanIntegrationTest, Scenario11_UserDefinedTimestamps) {
     ro.iterate_lower_bound = &l;
     ro.iterate_upper_bound = &u;
     auto it_nat = std::unique_ptr<Iterator>(db_native_->NewIterator(ro));
-    auto it_cand = std::unique_ptr<Iterator>(db_cand_->NewIterator(ro));
+    auto it_cand = NewCandidateIterator(ro);
+#ifndef NDEBUG
+    EXPECT_EQ(cand_last_outcome_, "LOCAL_VIEW_NONEMPTY");
+#endif
     AssertIteratorsEquivalent(it_nat.get(), it_cand.get(), &l, &u, targets,
                               ucmp);
   }
@@ -668,7 +746,10 @@ TEST_F(AMTVDBScanIntegrationTest, Scenario12_FallbackMatrix) {
     ro.iterate_lower_bound = &l;
     ro.iterate_upper_bound = &u;
     auto it_nat = std::unique_ptr<Iterator>(db_native_->NewIterator(ro));
-    auto it_c = std::unique_ptr<Iterator>(db_cand_->NewIterator(ro));
+    auto it_c = NewCandidateIterator(ro);
+#ifndef NDEBUG
+    EXPECT_EQ(cand_last_outcome_, "NATIVE_FALLBACK_DISABLED");
+#endif
     AssertIteratorsEquivalent(it_nat.get(), it_c.get(), &l, &u, {"k10", "k20"});
   }
 
@@ -694,7 +775,8 @@ TEST_F(AMTVDBScanIntegrationTest, Scenario12_FallbackMatrix) {
     ro.iterate_lower_bound = &l;
     ro.iterate_upper_bound = &u;
     auto it_nat = std::unique_ptr<Iterator>(db_native_->NewIterator(ro));
-    auto it_c = std::unique_ptr<Iterator>(db_cand_->NewIterator(ro));
+    auto it_c = NewCandidateIterator(ro);
+    EXPECT_EQ(cand_last_outcome_, "NATIVE_FALLBACK_LOCAL_BUILD_FAILURE");
     AssertIteratorsEquivalent(it_nat.get(), it_c.get(), &l, &u, {"k10", "k20"});
 
     SyncPoint::GetInstance()->DisableProcessing();
@@ -713,7 +795,10 @@ TEST_F(AMTVDBScanIntegrationTest, Scenario12_FallbackMatrix) {
     ReadOptions ro;
     // No bounds specified
     auto it_nat = std::unique_ptr<Iterator>(db_native_->NewIterator(ro));
-    auto it_c = std::unique_ptr<Iterator>(db_cand_->NewIterator(ro));
+    auto it_c = NewCandidateIterator(ro);
+#ifndef NDEBUG
+    EXPECT_EQ(cand_last_outcome_, "NATIVE_FALLBACK_UNBOUNDED");
+#endif
     AssertIteratorsEquivalent(it_nat.get(), it_c.get(), nullptr, nullptr,
                               {"k10", "k20", "k30"});
   }
@@ -732,7 +817,10 @@ TEST_F(AMTVDBScanIntegrationTest, Scenario12_FallbackMatrix) {
     ro.iterate_upper_bound = &u;
 
     auto it_nat = std::unique_ptr<Iterator>(db_native_->NewIterator(ro));
-    auto it_c = std::unique_ptr<Iterator>(db_cand_->NewIterator(ro));
+    auto it_c = NewCandidateIterator(ro);
+#ifndef NDEBUG
+    EXPECT_EQ(cand_last_outcome_, "NATIVE_FALLBACK_OTHER");
+#endif
     it_nat->SeekToFirst();
     it_c->SeekToFirst();
     EXPECT_FALSE(it_nat->Valid());
@@ -740,7 +828,77 @@ TEST_F(AMTVDBScanIntegrationTest, Scenario12_FallbackMatrix) {
     EXPECT_EQ(it_nat->status().ToString(), it_c->status().ToString());
   }
 
-  // 12e: ignore_range_deletions = true
+#ifndef NDEBUG
+  // 12e: AMTV unavailable fallback injection via SyncPoint
+  {
+    OpenDualDB(/*cand_bounded_scan=*/true);
+    DualPut("k10", "v10");
+    DualPut("k20", "v20");
+    DualDeleteRange("k15", "k25");
+
+    SyncPoint::GetInstance()->SetCallBack(
+        "BuildActiveMemTableRangeDelIteratorForScan:AMTVUnavailable",
+        [](void* arg) {
+          bool* fail = static_cast<bool*>(arg);
+          *fail = true;
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+
+    Slice l("k05");
+    Slice u("k35");
+    ReadOptions ro;
+    ro.iterate_lower_bound = &l;
+    ro.iterate_upper_bound = &u;
+    auto it_nat = std::unique_ptr<Iterator>(db_native_->NewIterator(ro));
+    auto it_c = NewCandidateIterator(ro);
+    EXPECT_EQ(cand_last_outcome_, "NATIVE_FALLBACK_AMTV_UNAVAILABLE");
+    AssertIteratorsEquivalent(it_nat.get(), it_c.get(), &l, &u, {"k10", "k20"});
+
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  }
+
+  // 12f: Local build fail AND fallback fail -> FINAL_ERROR & resource cleanup
+  {
+    OpenDualDB(/*cand_bounded_scan=*/true);
+    DualPut("k10", "v10");
+    DualPut("k20", "v20");
+    DualDeleteRange("k15", "k25");
+
+    SyncPoint::GetInstance()->SetCallBack(
+        "BuildActiveMemTableRangeDelIteratorForScan:LocalBuildFail",
+        [](void* arg) {
+          bool* fail = static_cast<bool*>(arg);
+          *fail = true;
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "BuildActiveMemTableRangeDelIteratorForScan:FallbackFail",
+        [](void* arg) {
+          bool* fail = static_cast<bool*>(arg);
+          *fail = true;
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+
+    Slice l("k05");
+    Slice u("k35");
+    ReadOptions ro;
+    ro.iterate_lower_bound = &l;
+    ro.iterate_upper_bound = &u;
+
+    auto it_c = NewCandidateIterator(ro);
+    EXPECT_EQ(cand_last_outcome_, "FINAL_ERROR");
+    ASSERT_NE(it_c, nullptr);
+    EXPECT_FALSE(it_c->Valid());
+    EXPECT_TRUE(it_c->status().IsCorruption());
+    EXPECT_NE(it_c->status().ToString().find("Injected native fallback failure"),
+              std::string::npos);
+
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  }
+#endif
+
+  // 12g: ignore_range_deletions = true (factory bypassed completely)
   {
     OpenDualDB(/*cand_bounded_scan=*/true);
     DualPut("k10", "v10");
@@ -756,7 +914,10 @@ TEST_F(AMTVDBScanIntegrationTest, Scenario12_FallbackMatrix) {
     ro.ignore_range_deletions = true;
 
     auto it_nat = std::unique_ptr<Iterator>(db_native_->NewIterator(ro));
-    auto it_c = std::unique_ptr<Iterator>(db_cand_->NewIterator(ro));
+    auto it_c = NewCandidateIterator(ro);
+#ifndef NDEBUG
+    EXPECT_EQ(cand_last_outcome_, "");
+#endif
     AssertIteratorsEquivalent(it_nat.get(), it_c.get(), &l, &u,
                               {"k10", "k20", "k30"});
   }
