@@ -2196,6 +2196,9 @@ amtv_local_scan_reference_test: $(OBJ_DIR)/db/amtv_local_scan_reference_test.o $
 amtv_db_scan_integration_test: $(OBJ_DIR)/db/amtv_db_scan_integration_test.o $(OBJ_DIR)/test_util/testharness.o $(OBJ_DIR)/test_util/testutil.o $(GTEST) $(LIBRARY)
 	$(AM_LINK)
 
+amtv_db_refresh_test: $(OBJ_DIR)/db/amtv_db_refresh_test.o $(OBJ_DIR)/test_util/testharness.o $(OBJ_DIR)/test_util/testutil.o $(GTEST) $(LIBRARY)
+	$(AM_LINK)
+
 amtv_local_scan_view_test: $(OBJ_DIR)/db/amtv_local_scan_view_test.o $(OBJ_DIR)/test_util/testharness.o $(OBJ_DIR)/test_util/testutil.o $(GTEST) $(LIBRARY)
 	$(AM_LINK)
 

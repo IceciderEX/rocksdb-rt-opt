@@ -9,6 +9,7 @@
 
 #include "db/arena_wrapped_db_iter.h"
 
+#include "db/amtv_local_scan_view.h"
 #include "memory/arena.h"
 #include "rocksdb/env.h"
 #include "rocksdb/iterator.h"
@@ -278,7 +279,7 @@ Status ArenaWrappedDBIter::Refresh(const Snapshot* snapshot) {
   }
 
   while (true) {
-    if (sv_number_ != cur_sv_number) {
+    if (sv_number_ != cur_sv_number || !db_iter_->status().ok()) {
       DoRefresh(snapshot, cur_sv_number);
       break;
     } else {
@@ -287,33 +288,42 @@ Status ArenaWrappedDBIter::Refresh(const Snapshot* snapshot) {
       if (!read_options_.ignore_range_deletions) {
         SuperVersion* sv = cfd->GetThreadLocalSuperVersion(db_impl);
         TEST_SYNC_POINT_CALLBACK("ArenaWrappedDBIter::Refresh:SV", nullptr);
-        auto t = sv->mem->NewRangeTombstoneIterator(
-            read_options_, read_seq, false /* immutable_memtable */);
-        if (!t || t->empty()) {
-          // If memtable_range_tombstone_iter_ points to a non-empty tombstone
-          // iterator, then it means sv->mem is not the memtable that
-          // memtable_range_tombstone_iter_ points to, so SV must have changed
-          // after the sv_number_ != cur_sv_number check above. We will fall
-          // back to re-init the InternalIterator, and the tombstone iterator
-          // will be freed during db_iter destruction there.
-          if (memtable_range_tombstone_iter_) {
-            assert(!*memtable_range_tombstone_iter_ ||
-                   sv_number_ != cfd->GetSuperVersionNumber());
-          }
-          delete t;
-        } else {  // current mutable memtable has range tombstones
+
+        std::unique_ptr<TruncatedRangeDelIterator> new_iter;
+        Status s = BuildActiveMemTableRangeDelIteratorForScan(
+            static_cast_with_check<MemTable>(sv->mem), read_options_, read_seq,
+            cfd->internal_comparator(),
+            cfd->ioptions().amtv_enable_bounded_scan_view, &new_iter);
+        if (!s.ok()) {
+          Env* env = db_iter_->env();
+          DestroyDBIterAndArena();
+          new (&arena_) Arena();
+          Init(env, read_options_, cfd->ioptions(), sv->mutable_cf_options,
+               sv->current, read_seq, cur_sv_number, read_callback_, nullptr,
+               expose_blob_index_, allow_refresh_,
+               /*active_mem=*/nullptr, db_impl, cfd);
+          SetIterUnderDBIter(NewErrorInternalIterator<Slice>(s, &arena_));
+          internal_iter_initialized_ = true;
+          db_impl->ReturnAndCleanupSuperVersion(cfd, sv);
+          return s;
+        }
+
+        TEST_SYNC_POINT("ArenaWrappedDBIter::Refresh:BeforeSlotReplacement");
+
+        if (new_iter != nullptr) {
           if (!memtable_range_tombstone_iter_) {
-            delete t;
             db_impl->ReturnAndCleanupSuperVersion(cfd, sv);
             // The memtable under DBIter did not have range tombstone before
             // refresh.
             DoRefresh(snapshot, cur_sv_number);
             break;
           } else {
-            *memtable_range_tombstone_iter_ =
-                std::make_unique<TruncatedRangeDelIterator>(
-                    std::unique_ptr<FragmentedRangeTombstoneIterator>(t),
-                    &cfd->internal_comparator(), nullptr, nullptr);
+            *memtable_range_tombstone_iter_ = std::move(new_iter);
+          }
+        } else {
+          if (memtable_range_tombstone_iter_ &&
+              *memtable_range_tombstone_iter_) {
+            memtable_range_tombstone_iter_->reset();
           }
         }
         db_impl->ReturnAndCleanupSuperVersion(cfd, sv);

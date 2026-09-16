@@ -2601,12 +2601,8 @@ InternalIterator* DBImpl::NewInternalIterator(
     active_iter_timer.Start(&g_read_path_audit_stats.active_mem_iter_construct_nanos);
 #endif
     // Collect iterator for mutable memtable
-    auto mem_iter = super_version->mem->NewIterator(
-        read_options, super_version->GetSeqnoToTimeMapping(), arena,
-        super_version->mutable_cf_options.prefix_extractor.get(),
-        /*for_flush=*/false);
+    std::unique_ptr<TruncatedRangeDelIterator> mem_tombstone_iter;
     if (!read_options.ignore_range_deletions) {
-      std::unique_ptr<TruncatedRangeDelIterator> mem_tombstone_iter;
       s = BuildActiveMemTableRangeDelIteratorForScan(
           static_cast_with_check<MemTable>(super_version->mem), read_options,
           sequence, cfd->ioptions().internal_comparator,
@@ -2616,6 +2612,12 @@ InternalIterator* DBImpl::NewInternalIterator(
         CleanupSuperVersion(super_version);
         return NewErrorInternalIterator<Slice>(s, arena);
       }
+    }
+    auto mem_iter = super_version->mem->NewIterator(
+        read_options, super_version->GetSeqnoToTimeMapping(), arena,
+        super_version->mutable_cf_options.prefix_extractor.get(),
+        /*for_flush=*/false);
+    if (!read_options.ignore_range_deletions) {
       merge_iter_builder.AddPointAndTombstoneIterator(
           mem_iter, std::move(mem_tombstone_iter));
     } else {

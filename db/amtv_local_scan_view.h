@@ -82,10 +82,13 @@ bool AMTVScanIsCandidateIntersecting(const Slice& user_start_key,
 //
 // Contract:
 // 1. Immediately executes out_iter->reset() upon entry (or returns InvalidArgument if out_iter is null).
-// 2. Caller Guarantees Active MemTable: The 'memtable' parameter must come directly from the current
-//    SuperVersion's active mutable memtable slot (super_version->mem). The factory does not read
-//    memtable->IsImmutable() in order to prevent unnecessary cross-thread shared-state reads on the hot path.
-//    Immutable memtables are handled 100% via the native path (super_version->imm->AddIterators).
+// 2. Caller Guarantees Active MemTable Slot: The 'memtable' parameter must come directly from the
+//    caller-held SuperVersion's 'mem' slot (super_version->mem). The object may have been concurrently
+//    frozen/marked immutable by concurrent threads during memtable rotation. Its lifetime is guaranteed
+//    by the caller's retained SuperVersion reference and the local view's own shared ownership.
+//    The factory does not read memtable->IsImmutable() in order to prevent unnecessary cross-thread
+//    shared-state reads and false assertion failures on the hot read path. Immutable memtables
+//    (super_version->imm) are handled 100% via the native path (super_version->imm->AddIterators).
 // 3. Returns Status::OK() + (*out_iter == nullptr) when the MemTable currently has no range tombstones
 //    (a legitimate, non-error result).
 // 4. When ineligible or when local build fails, constructs the current native full iterator inside

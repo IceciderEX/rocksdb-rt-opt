@@ -223,6 +223,11 @@ Status BuildActiveMemTableRangeDelIteratorForScan(
     return fallback_to_native(AMTVScanFallbackReason::kLocalBuildFailed);
   }
 
+#ifndef NDEBUG
+  TEST_SYNC_POINT(
+      "BuildActiveMemTableRangeDelIteratorForScan:BeforeCandidateExtraction");
+#endif
+
   // 8. Extract intersecting raw candidate tombstones from snapshot
   uint64_t total_raw_count = 0;
   std::vector<OpenDeltaEntry> candidates;
@@ -341,6 +346,8 @@ Status BuildActiveMemTableRangeDelIteratorForScan(
   const char* outcome = "LOCAL_VIEW_NONEMPTY";
   TEST_SYNC_POINT_CALLBACK(
       "BuildActiveMemTableRangeDelIteratorForScan:Outcome", &outcome);
+  TEST_SYNC_POINT(
+      "BuildActiveMemTableRangeDelIteratorForScan:BeforeReturn");
 #endif
   return Status::OK();
 }
