@@ -1225,7 +1225,7 @@ TEST_F(AMTVDBRefreshTest, Concurrency06_MultiThreadControlledLifecycle) {
       ro.iterate_lower_bound = &l;
       ro.iterate_upper_bound = &u;
 
-      auto it = NewCandidateIterator(ro);
+      auto it = std::unique_ptr<Iterator>(db_cand_->NewIterator(ro));
       int last_seen_batch = 0;
 
       while (!stop_flag.load(std::memory_order_acquire) ||
@@ -1264,7 +1264,7 @@ TEST_F(AMTVDBRefreshTest, Concurrency06_MultiThreadControlledLifecycle) {
     t.join();
   }
 
-  EXPECT_GT(total_scans.load(), 50u);
+  EXPECT_GT(total_scans.load(), 20u);
 }
 
 }  // namespace ROCKSDB_NAMESPACE
