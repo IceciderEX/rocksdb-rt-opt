@@ -502,11 +502,18 @@ TEST_F(AMTVDBRefreshTest, Scenario06_MemTableSwitchFullRebuild) {
   auto it_nat = std::unique_ptr<Iterator>(db_native_->NewIterator(ro));
   auto it_cand = NewCandidateIterator(ro);
 
+#ifndef NDEBUG
   // Explicitly switch active MemTable to immutable without flushing to L0
   ASSERT_OK(
       static_cast_with_check<DBImpl>(db_native_.get())->TEST_SwitchMemtable());
   ASSERT_OK(
       static_cast_with_check<DBImpl>(db_cand_.get())->TEST_SwitchMemtable());
+#else
+  // In release mode, trigger switch by filling write buffer outside [l, u)
+  for (int i = 0; i < 30; ++i) {
+    DualPut("fill_switch_" + std::to_string(i), std::string(256, 'x'));
+  }
+#endif
 
   // Active memtable switched! Refresh will detect sv_number_ != cur_sv_number
   // and trigger DoRefresh (Full-Rebuild).
